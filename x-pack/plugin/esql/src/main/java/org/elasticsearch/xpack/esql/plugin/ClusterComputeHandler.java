@@ -320,11 +320,12 @@ final class ClusterComputeHandler implements TransportRequestHandler<ClusterComp
                     concreteIndices,
                     originalIndices,
                     exchangeSource,
+                    null,
                     cancelQueryOnFailure,
-                    computeListener.acquireCompute().map(r -> {
+                    ActionListener.wrap(r -> {
                         finalResponse.set(r);
-                        return r.getCompletionInfo();
-                    })
+                        computeListener.acquireCompute().onResponse(r.getCompletionInfo());
+                    }, computeListener.acquireCompute()::onFailure)
                 );
             }
         }

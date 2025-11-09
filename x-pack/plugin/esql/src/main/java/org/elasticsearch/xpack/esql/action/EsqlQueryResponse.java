@@ -125,7 +125,7 @@ public class EsqlQueryResponse extends org.elasticsearch.xpack.core.esql.action.
         long documentsFound = supportsValuesLoaded(in.getTransportVersion()) ? in.readVLong() : 0;
         long valuesLoaded = supportsValuesLoaded(in.getTransportVersion()) ? in.readVLong() : 0;
         Profile profile = in.readOptionalWriteable(Profile::readFrom);
-        EsqlDag dag = in.readOptionalWriteable(EsqlDag::new);
+        EsqlDag dag = in.readOptionalWriteable(EsqlDag::from);
         boolean columnar = in.readBoolean();
         EsqlExecutionInfo executionInfo = in.readOptionalWriteable(EsqlExecutionInfo::new);
         return new EsqlQueryResponse(
@@ -277,7 +277,7 @@ public class EsqlQueryResponse extends org.elasticsearch.xpack.core.esql.action.
             content.add(ChunkedToXContentHelper.field("_clusters", executionInfo, params));
         }
         if (dag != null) {
-            content.add(ChunkedToXContentHelper.field("dag", dag, params));
+            content.add(ChunkedToXContentHelper.chunk((builder, p) -> builder.field("dag", dag, p)));
         }
         if (profile != null) {
             content.add(ChunkedToXContentHelper.startObject("profile"));

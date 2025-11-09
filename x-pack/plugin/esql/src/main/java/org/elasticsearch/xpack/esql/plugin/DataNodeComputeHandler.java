@@ -227,14 +227,16 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                                 queryPragmas.concurrentExchangeClients(),
                                 computeListener.acquireAvoid()
                             );
-                            execInfo.addDagEdge(
-                                new EsqlDagEdge(
-                                    sessionId,
-                                    transportService.getLocalNode().getId(),
-                                    childSessionId,
-                                    connection.getNode().getId()
-                                )
-                            );
+                            if (execInfo != null) {
+                                execInfo.addDagEdge(
+                                    new EsqlDagEdge(
+                                        sessionId,
+                                        transportService.getLocalNode().getId(),
+                                        childSessionId,
+                                        connection.getNode().getId()
+                                    )
+                                );
+                            }
                         }
                     })
                 );

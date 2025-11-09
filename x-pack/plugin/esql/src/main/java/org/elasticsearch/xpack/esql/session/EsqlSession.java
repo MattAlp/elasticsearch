@@ -391,7 +391,13 @@ public class EsqlSession {
                         releasingNext.delegateFailureAndWrap((finalListener, finalResult) -> {
                             completionInfoAccumulator.accumulate(finalResult.completionInfo());
                             finalListener.onResponse(
-                                new Result(finalResult.schema(), finalResult.pages(), completionInfoAccumulator.finish(), executionInfo)
+                                new Result(
+                                    finalResult.schema(),
+                                    finalResult.pages(),
+                                    completionInfoAccumulator.finish(),
+                                    executionInfo.getDag(),
+                                    executionInfo
+                                )
                             );
                         })
                     );

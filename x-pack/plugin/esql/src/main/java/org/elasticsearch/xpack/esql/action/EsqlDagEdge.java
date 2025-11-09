@@ -21,8 +21,8 @@ public record EsqlDagEdge(String sourceSessionId, String sourceNodeId, String si
         Writeable,
         ToXContentObject {
 
-    public EsqlDagEdge(StreamInput in) throws IOException {
-        this(in.readString(), in.readString(), in.readString(), in.readString());
+    public static EsqlDagEdge readFrom(StreamInput in) throws IOException {
+        return new EsqlDagEdge(in.readString(), in.readString(), in.readString(), in.readString());
     }
 
     @Override

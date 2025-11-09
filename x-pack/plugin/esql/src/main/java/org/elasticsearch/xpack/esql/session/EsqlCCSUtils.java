@@ -25,6 +25,7 @@ import org.elasticsearch.transport.NoSuchRemoteClusterException;
 import org.elasticsearch.transport.RemoteClusterAware;
 import org.elasticsearch.transport.RemoteTransportException;
 import org.elasticsearch.xpack.esql.VerificationException;
+import org.elasticsearch.xpack.esql.action.EsqlDag;
 import org.elasticsearch.xpack.esql.action.EsqlExecutionInfo;
 import org.elasticsearch.xpack.esql.action.EsqlExecutionInfo.Cluster;
 import org.elasticsearch.xpack.esql.analysis.Analyzer;
@@ -88,7 +89,9 @@ public class EsqlCCSUtils {
         public void onFailure(Exception e) {
             if (returnSuccessWithEmptyResult(executionInfo, e)) {
                 updateExecutionInfoToReturnEmptyResult(executionInfo, e);
-                listener.onResponse(new Result(Analyzer.NO_FIELDS, Collections.emptyList(), DriverCompletionInfo.EMPTY, executionInfo));
+                listener.onResponse(
+                    new Result(Analyzer.NO_FIELDS, Collections.emptyList(), DriverCompletionInfo.EMPTY, EsqlDag.EMPTY, executionInfo)
+                );
             } else {
                 listener.onFailure(e);
             }

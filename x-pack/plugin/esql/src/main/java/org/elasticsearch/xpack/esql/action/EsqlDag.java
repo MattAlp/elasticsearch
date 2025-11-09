@@ -21,13 +21,13 @@ public record EsqlDag(List<EsqlDagEdge> edges) implements Writeable, ToXContentO
 
     public static final EsqlDag EMPTY = new EsqlDag(List.of());
 
-    public EsqlDag(StreamInput in) throws IOException {
-        this(in.readList(EsqlDagEdge::new));
+    public static EsqlDag from(StreamInput in) throws IOException {
+        return new EsqlDag(in.readCollectionAsList(EsqlDagEdge::readFrom));
     }
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
-        out.writeList(edges);
+        out.writeCollection(edges);
     }
 
     @Override
