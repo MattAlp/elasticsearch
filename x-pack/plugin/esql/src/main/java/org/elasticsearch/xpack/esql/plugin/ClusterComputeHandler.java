@@ -27,6 +27,7 @@ import org.elasticsearch.transport.TransportChannel;
 import org.elasticsearch.transport.TransportRequestHandler;
 import org.elasticsearch.transport.TransportRequestOptions;
 import org.elasticsearch.transport.TransportService;
+import org.elasticsearch.xpack.esql.action.EsqlDagEdge;
 import org.elasticsearch.xpack.esql.action.EsqlExecutionInfo;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSinkExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
@@ -147,6 +148,14 @@ final class ClusterComputeHandler implements TransportRequestHandler<ClusterComp
                         () -> pagesFetched.set(true),
                         queryPragmas.concurrentExchangeClients(),
                         computeListener.acquireAvoid()
+                    );
+                    executionInfo.addDagEdge(
+                        new EsqlDagEdge(
+                            sessionId,
+                            transportService.getLocalNode().getId(),
+                            childSessionId,
+                            cluster.connection.getNode().getId()
+                        )
                     );
                 }
             })

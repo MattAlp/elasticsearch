@@ -26,6 +26,8 @@ import org.elasticsearch.xcontent.ParseField;
 import org.elasticsearch.xcontent.ToXContent;
 import org.elasticsearch.xcontent.ToXContentFragment;
 import org.elasticsearch.xcontent.XContentBuilder;
+import org.elasticsearch.xpack.esql.action.EsqlDag;
+import org.elasticsearch.xpack.esql.action.EsqlDagEdge;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -89,6 +91,8 @@ public class EsqlExecutionInfo implements ChunkedToXContentObject, Writeable {
     // Are we doing subplans? No need to serialize this because it is only relevant for the coordinator node.
     private transient boolean inSubplan = false;
 
+    private final transient List<EsqlDagEdge> dagEdges = Collections.synchronizedList(new ArrayList<>());
+
     // This is only used is tests.
     public EsqlExecutionInfo(boolean includeCCSMetadata) {
         this(Predicates.always(), includeCCSMetadata);  // default all clusters to being skippable on failure
@@ -145,6 +149,14 @@ public class EsqlExecutionInfo implements ChunkedToXContentObject, Writeable {
             out.writeOptionalWriteable(planningTimeSpan);
         }
         assert inSubplan == false : "Should not be serializing execution info while in subplans";
+    }
+
+    public void addDagEdge(EsqlDagEdge edge) {
+        this.dagEdges.add(edge);
+    }
+
+    public EsqlDag getDag() {
+        return new EsqlDag(List.copyOf(this.dagEdges));
     }
 
     public boolean includeCCSMetadata() {

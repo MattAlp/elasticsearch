@@ -27,6 +27,7 @@ import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.xcontent.ToXContent;
 import org.elasticsearch.xpack.core.esql.action.EsqlResponse;
+import org.elasticsearch.xpack.esql.action.EsqlDag;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 
 import java.io.IOException;
@@ -56,6 +57,7 @@ public class EsqlQueryResponse extends org.elasticsearch.xpack.core.esql.action.
     private final long documentsFound;
     private final long valuesLoaded;
     private final Profile profile;
+    private final EsqlDag dag;
     private final boolean columnar;
     private final String asyncExecutionId;
     private final boolean isRunning;
@@ -69,6 +71,7 @@ public class EsqlQueryResponse extends org.elasticsearch.xpack.core.esql.action.
         long documentsFound,
         long valuesLoaded,
         @Nullable Profile profile,
+        @Nullable EsqlDag dag,
         boolean columnar,
         @Nullable String asyncExecutionId,
         boolean isRunning,
@@ -80,6 +83,7 @@ public class EsqlQueryResponse extends org.elasticsearch.xpack.core.esql.action.
         this.valuesLoaded = valuesLoaded;
         this.documentsFound = documentsFound;
         this.profile = profile;
+        this.dag = dag;
         this.columnar = columnar;
         this.asyncExecutionId = asyncExecutionId;
         this.isRunning = isRunning;
@@ -93,11 +97,12 @@ public class EsqlQueryResponse extends org.elasticsearch.xpack.core.esql.action.
         long documentsFound,
         long valuesLoaded,
         @Nullable Profile profile,
+        @Nullable EsqlDag dag,
         boolean columnar,
         boolean isAsync,
         EsqlExecutionInfo executionInfo
     ) {
-        this(columns, pages, documentsFound, valuesLoaded, profile, columnar, null, false, isAsync, executionInfo);
+        this(columns, pages, documentsFound, valuesLoaded, profile, dag, columnar, null, false, isAsync, executionInfo);
     }
 
     /**
@@ -120,6 +125,7 @@ public class EsqlQueryResponse extends org.elasticsearch.xpack.core.esql.action.
         long documentsFound = supportsValuesLoaded(in.getTransportVersion()) ? in.readVLong() : 0;
         long valuesLoaded = supportsValuesLoaded(in.getTransportVersion()) ? in.readVLong() : 0;
         Profile profile = in.readOptionalWriteable(Profile::readFrom);
+        EsqlDag dag = in.readOptionalWriteable(EsqlDag::new);
         boolean columnar = in.readBoolean();
         EsqlExecutionInfo executionInfo = in.readOptionalWriteable(EsqlExecutionInfo::new);
         return new EsqlQueryResponse(
@@ -128,6 +134,7 @@ public class EsqlQueryResponse extends org.elasticsearch.xpack.core.esql.action.
             documentsFound,
             valuesLoaded,
             profile,
+            dag,
             columnar,
             asyncExecutionId,
             isRunning,
@@ -148,6 +155,7 @@ public class EsqlQueryResponse extends org.elasticsearch.xpack.core.esql.action.
             out.writeVLong(valuesLoaded);
         }
         out.writeOptionalWriteable(profile);
+        out.writeOptionalWriteable(dag);
         out.writeBoolean(columnar);
         out.writeOptionalWriteable(executionInfo);
     }
@@ -193,6 +201,10 @@ public class EsqlQueryResponse extends org.elasticsearch.xpack.core.esql.action.
 
     public Profile profile() {
         return profile;
+    }
+
+    public EsqlDag dag() {
+        return dag;
     }
 
     public boolean columnar() {
@@ -264,6 +276,9 @@ public class EsqlQueryResponse extends org.elasticsearch.xpack.core.esql.action.
         if (executionInfo != null && executionInfo.hasMetadataToReport()) {
             content.add(ChunkedToXContentHelper.field("_clusters", executionInfo, params));
         }
+        if (dag != null) {
+            content.add(ChunkedToXContentHelper.field("dag", dag, params));
+        }
         if (profile != null) {
             content.add(ChunkedToXContentHelper.startObject("profile"));
             content.add(ChunkedToXContentHelper.chunk((b, p) -> {
@@ -312,6 +327,7 @@ public class EsqlQueryResponse extends org.elasticsearch.xpack.core.esql.action.
             && documentsFound == that.documentsFound
             && valuesLoaded == that.valuesLoaded
             && Objects.equals(profile, that.profile)
+            && Objects.equals(dag, that.dag)
             && Objects.equals(executionInfo, that.executionInfo);
     }
 
@@ -326,6 +342,7 @@ public class EsqlQueryResponse extends org.elasticsearch.xpack.core.esql.action.
             documentsFound,
             valuesLoaded,
             profile,
+            dag,
             executionInfo
         );
     }

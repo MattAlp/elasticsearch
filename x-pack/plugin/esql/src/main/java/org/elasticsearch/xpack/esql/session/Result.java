@@ -11,6 +11,7 @@ import org.elasticsearch.compute.data.Block;
 import org.elasticsearch.compute.data.Page;
 import org.elasticsearch.compute.operator.DriverCompletionInfo;
 import org.elasticsearch.core.Nullable;
+import org.elasticsearch.xpack.esql.action.EsqlDag;
 import org.elasticsearch.xpack.esql.action.EsqlExecutionInfo;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
@@ -24,11 +25,13 @@ import java.util.List;
  *               attribute in this list.
  * @param pages Actual values produced by running the ESQL.
  * @param completionInfo Information collected from drivers after they've been completed.
+ * @param dag Information about the execution graph for this query.
  * @param executionInfo Metadata about the execution of this query. Used for cross cluster queries.
  */
 public record Result(
     List<Attribute> schema,
     List<Page> pages,
     DriverCompletionInfo completionInfo,
+    EsqlDag dag,
     @Nullable EsqlExecutionInfo executionInfo
 ) {}

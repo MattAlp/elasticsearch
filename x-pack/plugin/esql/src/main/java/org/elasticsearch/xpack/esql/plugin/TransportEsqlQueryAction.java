@@ -38,6 +38,7 @@ import org.elasticsearch.xpack.core.XPackPlugin;
 import org.elasticsearch.xpack.core.async.AsyncExecutionId;
 import org.elasticsearch.xpack.esql.VerificationException;
 import org.elasticsearch.xpack.esql.action.ColumnInfoImpl;
+import org.elasticsearch.xpack.esql.action.EsqlDag;
 import org.elasticsearch.xpack.esql.action.EsqlExecutionInfo;
 import org.elasticsearch.xpack.esql.action.EsqlQueryAction;
 import org.elasticsearch.xpack.esql.action.EsqlQueryRequest;
@@ -392,6 +393,7 @@ public class TransportEsqlQueryAction extends HandledTransportAction<EsqlQueryRe
                 result.completionInfo().documentsFound(),
                 result.completionInfo().valuesLoaded(),
                 profile,
+                result.dag(),
                 request.columnar(),
                 asyncExecutionId,
                 false,
@@ -405,6 +407,7 @@ public class TransportEsqlQueryAction extends HandledTransportAction<EsqlQueryRe
             result.completionInfo().documentsFound(),
             result.completionInfo().valuesLoaded(),
             profile,
+            result.dag(),
             request.columnar(),
             request.async(),
             result.executionInfo()
@@ -468,6 +471,7 @@ public class TransportEsqlQueryAction extends HandledTransportAction<EsqlQueryRe
             0,
             0,
             null,
+            EsqlDag.EMPTY,
             false,
             asyncExecutionId,
             true, // is_running

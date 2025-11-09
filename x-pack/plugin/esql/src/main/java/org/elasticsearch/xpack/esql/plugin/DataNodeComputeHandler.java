@@ -45,6 +45,8 @@ import org.elasticsearch.transport.TransportChannel;
 import org.elasticsearch.transport.TransportRequestHandler;
 import org.elasticsearch.transport.TransportRequestOptions;
 import org.elasticsearch.transport.TransportService;
+import org.elasticsearch.xpack.esql.action.EsqlDagEdge;
+import org.elasticsearch.xpack.esql.action.EsqlExecutionInfo;
 import org.elasticsearch.xpack.esql.core.expression.FoldContext;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSinkExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
@@ -114,6 +116,7 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
         Set<String> concreteIndices,
         OriginalIndices originalIndices,
         ExchangeSourceHandler exchangeSource,
+        EsqlExecutionInfo execInfo,
         Runnable runOnTaskFailure,
         ActionListener<ComputeResponse> outListener
     ) {
@@ -223,6 +226,14 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                                 pagesFetched::incrementAndGet,
                                 queryPragmas.concurrentExchangeClients(),
                                 computeListener.acquireAvoid()
+                            );
+                            execInfo.addDagEdge(
+                                new EsqlDagEdge(
+                                    sessionId,
+                                    transportService.getLocalNode().getId(),
+                                    childSessionId,
+                                    connection.getNode().getId()
+                                )
                             );
                         }
                     })

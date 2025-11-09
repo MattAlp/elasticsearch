@@ -45,6 +45,7 @@ import org.elasticsearch.transport.AbstractTransportRequest;
 import org.elasticsearch.transport.RemoteClusterAware;
 import org.elasticsearch.transport.TransportException;
 import org.elasticsearch.transport.TransportService;
+import org.elasticsearch.xpack.esql.action.EsqlDagEdge;
 import org.elasticsearch.xpack.esql.action.EsqlExecutionInfo;
 import org.elasticsearch.xpack.esql.action.EsqlQueryAction;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
@@ -252,7 +253,7 @@ public class ComputeService {
                     cancelQueryOnFailure,
                     finalListener.map(profiles -> {
                         execInfo.markEndQuery();
-                        return new Result(mainPlan.output(), collectedPages, profiles, execInfo);
+                        return new Result(mainPlan.output(), collectedPages, profiles, execInfo.getDag(), execInfo);
                     })
                 )
             ) {
@@ -264,6 +265,14 @@ public class ComputeService {
                     ExchangeSinkHandler exchangeSink = exchangeService.createSinkHandler(childSessionId, queryPragmas.exchangeBufferSize());
                     // funnel sub plan pages into the main plan exchange source
                     mainExchangeSource.addRemoteSink(exchangeSink::fetchPageAsync, true, () -> {}, 1, ActionListener.noop());
+                    execInfo.addDagEdge(
+                        new EsqlDagEdge(
+                            mainSessionId,
+                            transportService.getLocalNode().getId(),
+                            childSessionId,
+                            transportService.getLocalNode().getId()
+                        )
+                    );
                     var subPlanListener = localListener.acquireCompute();
 
                     executePlan(
@@ -353,7 +362,7 @@ public class ComputeService {
                     cancelQueryOnFailure,
                     listener.map(completionInfo -> {
                         updateExecutionInfoAfterCoordinatorOnlyQuery(execInfo);
-                        return new Result(physicalPlan.output(), collectedPages, completionInfo, execInfo);
+                        return new Result(physicalPlan.output(), collectedPages, completionInfo, execInfo.getDag(), execInfo);
                     })
                 )
             ) {
@@ -391,7 +400,7 @@ public class ComputeService {
                 listener.delegateFailureAndWrap((l, completionInfo) -> {
                     failIfAllShardsFailed(execInfo, collectedPages);
                     execInfo.markEndQuery();
-                    l.onResponse(new Result(outputAttributes, collectedPages, completionInfo, execInfo));
+                    l.onResponse(new Result(outputAttributes, collectedPages, completionInfo, execInfo.getDag(), execInfo));
                 })
             )
         ) {
@@ -454,6 +463,7 @@ public class ComputeService {
                             Set.of(localConcreteIndices.indices()),
                             localOriginalIndices,
                             exchangeSource,
+                            execInfo,
                             cancelQueryOnFailure,
                             ActionListener.wrap(r -> {
                                 localClusterWasInterrupted.set(execInfo.isStopped());
