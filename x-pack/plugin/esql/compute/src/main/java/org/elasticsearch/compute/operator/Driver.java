@@ -507,6 +507,7 @@ public class Driver implements Releasable, Describable {
             throw new IllegalStateException("can only get profile from finished driver");
         }
         return new DriverProfile(
+            sessionId(),
             status.description(),
             status.clusterName(),
             status.nodeName(),

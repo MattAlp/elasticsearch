@@ -25,6 +25,7 @@ import java.util.List;
 /**
  * Profile results from a single {@link Driver}.
  *
+ * @param sessionId The session ID of the driver.
  * @param description Description of the driver. This description should be short and meaningful as a grouping identifier.
  *                    We use the phase of the query right now: "data", "node_reduce", "final".
  * @param clusterName The name of the cluster this driver is running on.
@@ -37,6 +38,7 @@ import java.util.List;
  * @param operators Status of each {@link Operator} in the driver when it finished.
  */
 public record DriverProfile(
+    String sessionId,
     String description,
     String clusterName,
     String nodeName,
@@ -51,9 +53,11 @@ public record DriverProfile(
 
     private static final TransportVersion ESQL_DRIVER_NODE_DESCRIPTION = TransportVersion.fromName("esql_driver_node_description");
     private static final TransportVersion ESQL_DRIVER_TASK_DESCRIPTION = TransportVersion.fromName("esql_driver_task_description");
+    private static final TransportVersion ESQL_DRIVER_SESSION_ID = TransportVersion.fromName("esql_driver_session_id");
 
     public static DriverProfile readFrom(StreamInput in) throws IOException {
         return new DriverProfile(
+            in.getTransportVersion().supports(ESQL_DRIVER_SESSION_ID) ? in.readString() : "",
             in.getTransportVersion().supports(ESQL_DRIVER_TASK_DESCRIPTION) ? in.readString() : "",
             in.getTransportVersion().supports(ESQL_DRIVER_NODE_DESCRIPTION) ? in.readString() : "",
             in.getTransportVersion().supports(ESQL_DRIVER_NODE_DESCRIPTION) ? in.readString() : "",
@@ -69,6 +73,9 @@ public record DriverProfile(
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
+        if (out.getTransportVersion().supports(ESQL_DRIVER_SESSION_ID)) {
+            out.writeString(sessionId);
+        }
         if (out.getTransportVersion().supports(ESQL_DRIVER_TASK_DESCRIPTION)) {
             out.writeString(description);
         }
@@ -88,6 +95,7 @@ public record DriverProfile(
     @Override
     public Iterator<? extends ToXContent> toXContentChunked(ToXContent.Params params) {
         return Iterators.concat(ChunkedToXContentHelper.startObject(), Iterators.single((b, p) -> {
+            b.field("session_id", sessionId);
             b.field("description", description);
             b.field("cluster_name", clusterName);
             b.field("node_name", nodeName);
