@@ -75,5 +75,4 @@ public interface ESVectorUtilSupport {
     int indexOf(byte[] bytes, int offset, int length, byte marker);
 
     VectorByteUtils getVectorByteUtils();
-
 }

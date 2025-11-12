@@ -27,4 +27,19 @@ public class DefaultVectorByteUtils implements VectorByteUtils {
     public int vectorLength() {
         return 1;
     }
+
+    @Override
+    public long scanMatchingSlots(VectorizedKeySupplier keySupplier, int startSlot, int maxSlots, long targetKey) {
+        if (keySupplier == null || startSlot < 0 || maxSlots <= 0) {
+            return 0L;
+        }
+
+        // Fallback implementation for non-vectorized systems
+        // Since vectorLength() is 1, we can only check one slot at a time
+        if (maxSlots > 0 && keySupplier.getKey(startSlot) == targetKey) {
+            return 1L;
+        }
+
+        return 0L;
+    }
 }

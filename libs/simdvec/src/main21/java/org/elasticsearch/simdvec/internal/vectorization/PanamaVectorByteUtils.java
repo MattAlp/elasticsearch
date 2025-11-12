@@ -10,6 +10,7 @@
 package org.elasticsearch.simdvec.internal.vectorization;
 
 import jdk.incubator.vector.ByteVector;
+import jdk.incubator.vector.LongVector;
 import jdk.incubator.vector.VectorSpecies;
 
 import org.elasticsearch.simdvec.VectorByteUtils;
@@ -40,6 +41,7 @@ public final class PanamaVectorByteUtils implements VectorByteUtils {
 
     /** The preferred byte vector species for the current platform. */
     private static final VectorSpecies<Byte> BS = ByteVector.SPECIES_PREFERRED;
+    private static final VectorSpecies<Long> LS = LongVector.SPECIES_PREFERRED;
 
     private PanamaVectorByteUtils() {}
 
@@ -51,5 +53,38 @@ public final class PanamaVectorByteUtils implements VectorByteUtils {
     @Override
     public int vectorLength() {
         return BS.length();
+    }
+
+    @Override
+    public long scanMatchingSlots(VectorizedKeySupplier keySupplier, int startSlot, int maxSlots, long targetKey) {
+        if (keySupplier == null || startSlot < 0 || maxSlots <= 0) {
+            return 0L;
+        }
+
+        int vectorLength = LS.length();
+        int slotsToCheck = Math.min(maxSlots, vectorLength);
+
+        if (slotsToCheck == 0) {
+            return 0L;
+        }
+
+        // Load candidate keys and create vector in one go
+        long[] candidateKeys = new long[slotsToCheck];
+        for (int i = 0; i < slotsToCheck; i++) {
+            candidateKeys[i] = keySupplier.getKey(startSlot + i);
+        }
+
+        LongVector targetVector = LongVector.broadcast(LS, targetKey);
+        LongVector keysVector = LongVector.fromArray(LS, candidateKeys, 0);
+        var matches = keysVector.eq(targetVector);
+
+        long resultMask = 0L;
+        for (int i = 0; i < slotsToCheck; i++) {
+            if (matches.laneIsSet(i)) {
+                resultMask |= (1L << i);
+            }
+        }
+
+        return resultMask;
     }
 }

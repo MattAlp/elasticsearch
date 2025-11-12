@@ -458,9 +458,29 @@ public class Ordinator64 extends Ordinator implements Releasable {
             int slot = slot(hash);
             while (true) {
                 long candidateMatches = controlMatches(slot, control);
-                // TODO the double checking could be vectorized for some key types. Longs, probably.
 
+                // Vectorized comparison for long keys
                 int first;
+                // Try vectorized scan if we have potential matches
+                if (candidateMatches != 0) {
+                    long matchBitmask = VECTOR_UTILS.scanMatchingSlots(
+                        this::key,
+                        slot,
+                        Math.min(VECTOR_UTILS.vectorLength(), Long.SIZE),
+                        key
+                    );
+
+                    if (matchBitmask != 0) {
+                        // Found vectorized match
+                        first = VectorByteUtils.firstSet(matchBitmask);
+                        if (first >= 0) {
+                            int checkSlot = slot(slot + first);
+                            return id(checkSlot);
+                        }
+                    }
+                }
+
+                // Fallback to sequential search for remaining positions
                 while ((first = VectorByteUtils.firstSet(candidateMatches)) != -1) {
                     int checkSlot = slot(slot + first);
 

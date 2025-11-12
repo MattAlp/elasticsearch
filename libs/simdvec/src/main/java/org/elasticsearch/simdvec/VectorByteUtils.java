@@ -138,4 +138,23 @@ public interface VectorByteUtils {
         assert laneCount > 0 && (laneCount & (laneCount - 1)) == 0;
         return length & -laneCount;
     }
+
+    /**
+     * Simplified vectorized long comparison using a key supplier function.
+     * Returns a bitmask indicating which positions contain keys matching the target.
+     *
+     * @param keySupplier function to get keys by slot index
+     * @param startSlot starting slot index
+     * @param maxSlots maximum slots to check (limited by vector width)
+     * @param targetKey the target key to search for
+     * @return bit mask where bit i is set if keySupplier(startSlot + i) == targetKey, or 0 if no matches
+     */
+    long scanMatchingSlots(VectorizedKeySupplier keySupplier, int startSlot, int maxSlots, long targetKey);
+
+    /**
+     * Interface for supplying keys during vectorized comparison.
+     */
+    interface VectorizedKeySupplier {
+        long getKey(int slot);
+    }
 }
