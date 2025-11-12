@@ -592,12 +592,16 @@ public class Ordinator64 extends Ordinator implements Releasable {
             int slot = 0;
             while (slot < oldCapacity) {
                 long empty = controlMatches(slot, CONTROL_EMPTY);
-                // TODO iterate like in find - it's faster.
-                for (int i = 0; i < VECTOR_UTILS.vectorLength() && slot + i < oldCapacity; i++) {
-                    if ((empty & (1L << i)) != 0L) {
-                        slot++;
-                        continue;
-                    }
+                // Vectorized iteration like in find() - process multiple positions at once
+                int first;
+                while ((first = VectorByteUtils.firstSet(empty)) != -1) {
+                    slot++;
+                    empty &= ~(1L << first);
+                }
+
+                // Process non-empty positions until we find an empty one
+                // This is the vectorized equivalent of scanning for populated entries
+                while (slot < oldCapacity && controlData[slot] != CONTROL_EMPTY) {
                     long key = key(slot);
                     int hash = hash(key);
                     int id = id(slot);
