@@ -37,8 +37,8 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
 
 /**
- * Verifies that the {@link org.elasticsearch.compute.lucene.read.ValuesSourceReaderOperator}} is optimized into the reduce driver instead
- * of the data driver.
+ * Verifies that the {@link org.elasticsearch.compute.lucene.read.ValuesSourceReaderOperator}} is optimized into the
+ * late-materialization driver instead of the data driver.
  *
  * For more information on why this is important, see {@link org.elasticsearch.xpack.esql.plugin.LateMaterializationPlanner}.
  */
@@ -157,6 +157,8 @@ public abstract class EsqlReductionLateMaterializationTestCase extends AbstractE
         );
     }
 
+    protected abstract String lateMaterializationDriverName();
+
     private void testLateMaterializationAfterReduceTopN(
         String query,
         Set<String> expectedDataLoadedFields,
@@ -167,7 +169,7 @@ public abstract class EsqlReductionLateMaterializationTestCase extends AbstractE
             assertThat(result.isRunning(), equalTo(false));
             assertThat(result.isPartial(), equalTo(false));
             assertSingleKeyFieldExtracted(result, "data", expectedDataLoadedFields);
-            assertSingleKeyFieldExtracted(result, "node_reduce", expectedNodeReduceFields);
+            assertSingleKeyFieldExtracted(result, lateMaterializationDriverName(), expectedNodeReduceFields);
             var page = singleValue(result.pages());
             assertThat(page.getPositionCount(), equalTo(1));
             LongVectorBlock block = page.getBlock(0);

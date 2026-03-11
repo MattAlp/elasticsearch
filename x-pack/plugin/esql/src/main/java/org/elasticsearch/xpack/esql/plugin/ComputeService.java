@@ -13,6 +13,7 @@ import org.elasticsearch.action.OriginalIndices;
 import org.elasticsearch.action.search.SearchRequest;
 import org.elasticsearch.action.search.ShardSearchFailure;
 import org.elasticsearch.cluster.RemoteException;
+import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.cluster.project.ProjectResolver;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.util.BigArrays;
@@ -36,10 +37,14 @@ import org.elasticsearch.core.RefCounted;
 import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.core.Tuple;
+import org.elasticsearch.index.Index;
+import org.elasticsearch.index.query.QueryBuilder;
 import org.elasticsearch.index.query.SearchExecutionContext;
 import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
 import org.elasticsearch.search.SearchService;
+import org.elasticsearch.search.SearchShardTarget;
+import org.elasticsearch.search.internal.AliasFilter;
 import org.elasticsearch.tasks.CancellableTask;
 import org.elasticsearch.tasks.Task;
 import org.elasticsearch.tasks.TaskCancelledException;
@@ -50,6 +55,7 @@ import org.elasticsearch.transport.AbstractTransportRequest;
 import org.elasticsearch.transport.RemoteClusterAware;
 import org.elasticsearch.transport.TransportException;
 import org.elasticsearch.transport.TransportService;
+import org.elasticsearch.xpack.esql.action.EsqlCapabilities;
 import org.elasticsearch.xpack.esql.action.EsqlExecutionInfo;
 import org.elasticsearch.xpack.esql.action.EsqlQueryAction;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
@@ -607,6 +613,45 @@ public class ComputeService {
          * entire plan.
          */
         List<Attribute> outputAttributes = resolvedPlan.output();
+        /*
+         * In the narrow single-node case we can move the late-materialization subtree one step further, from the
+         * logical node-reduce driver into the coordinator's final driver. The data-side fragment still runs through
+         * a local exchange, but _doc-bearing pages never cross transport and final can reuse the same shard contexts.
+         */
+        ReductionPlan localReductionPlan = maybePlanLocalSingleNodeLateMaterialization(
+            flags,
+            configuration,
+            foldContext,
+            (ExchangeSinkExec) dataNodePlan,
+            localConcreteIndices,
+            localOriginalIndices,
+            clusterToConcreteIndices,
+            clusterToOriginalIndices,
+            planTimeProfile
+        );
+        if (localReductionPlan != null) {
+            executeLocalSingleNodeLateMaterialization(
+                sessionId,
+                rootTask,
+                flags,
+                configuration,
+                foldContext,
+                coordinatorPlan,
+                (ExchangeSinkExec) dataNodePlan,
+                localReductionPlan,
+                localOriginalIndices,
+                localConcreteIndices,
+                collectedPages,
+                outputAttributes,
+                execInfo,
+                profileQualifier,
+                cancelQueryOnFailure,
+                exchangeSinkSupplier,
+                planTimeProfile,
+                listener
+            );
+            return;
+        }
         var exchangeSource = new ExchangeSourceHandler(
             configuration.pragmas().exchangeBufferSize(),
             transportService.getThreadPool().executor(ThreadPool.Names.SEARCH)
@@ -835,6 +880,472 @@ public class ComputeService {
                 );
             }
         }
+    }
+
+    /**
+     * Detect the MVP case where late materialization can move all the way into the coordinator's final driver because
+     * the coordinator and data-side work stay on the same node and there is no transport boundary to cross.
+     */
+    private ReductionPlan maybePlanLocalSingleNodeLateMaterialization(
+        EsqlFlags flags,
+        Configuration configuration,
+        FoldContext foldContext,
+        ExchangeSinkExec dataNodePlan,
+        OriginalIndices localConcreteIndices,
+        OriginalIndices localOriginalIndices,
+        Map<String, OriginalIndices> remoteConcreteIndices,
+        Map<String, OriginalIndices> remoteOriginalIndices,
+        PlanTimeProfile planTimeProfile
+    ) {
+        if (configuration.pragmas().nodeLevelReduction() == false
+            || EsqlCapabilities.Cap.ENABLE_REDUCE_NODE_LATE_MATERIALIZATION.isEnabled() == false
+            || localConcreteIndices == null
+            || localConcreteIndices.indices().length == 0
+            || localOriginalIndices == null
+            || remoteConcreteIndices.isEmpty() == false
+            || remoteOriginalIndices.isEmpty() == false
+            || clusterService.state().nodes().getDataNodes().size() != 1) {
+            return null;
+        }
+        long startTime = planTimeProfile == null ? 0L : System.nanoTime();
+        ReductionPlan reductionPlan = reductionPlan(
+            plannerSettings.get(),
+            flags,
+            configuration,
+            foldContext,
+            dataNodePlan,
+            true,
+            true,
+            null
+        );
+        // The late-materialization planner preplans the reduce subtree and marks it as DISABLED so local planning
+        // will preserve it exactly as-is. Any other shape falls back to the regular coordinator/data-node flow.
+        if (reductionPlan.localPhysicalOptimization() != LocalPhysicalOptimization.DISABLED) {
+            return null;
+        }
+        if (planTimeProfile != null) {
+            planTimeProfile.addReductionPlanNanos(System.nanoTime() - startTime);
+        }
+        return reductionPlan;
+    }
+
+    /**
+     * Run the single-node late-materialization flow:
+     * - splice the old node-reduce TopN/field-loading subtree into final
+     * - execute the data-side fragment locally
+     * - share the acquired shard contexts between both sides
+     */
+    private void executeLocalSingleNodeLateMaterialization(
+        String sessionId,
+        CancellableTask rootTask,
+        EsqlFlags flags,
+        Configuration configuration,
+        FoldContext foldContext,
+        PhysicalPlan coordinatorPlan,
+        ExchangeSinkExec dataNodePlan,
+        ReductionPlan reductionPlan,
+        OriginalIndices localOriginalIndices,
+        OriginalIndices localConcreteIndices,
+        List<Page> collectedPages,
+        List<Attribute> outputAttributes,
+        EsqlExecutionInfo execInfo,
+        String profileQualifier,
+        Runnable cancelQueryOnFailure,
+        Supplier<ExchangeSink> exchangeSinkSupplier,
+        PlanTimeProfile planTimeProfile,
+        ActionListener<Result> listener
+    ) {
+        // Replace the coordinator/data-node boundary in the final plan with the subtree that used to run on
+        // node_reduce. final will still read pages from an exchange, but it now owns the global TopN and the
+        // deferred field extraction operators.
+        final PhysicalPlan finalCoordinatorPlan = coordinatorPlanWithLateMaterialization(coordinatorPlan, reductionPlan);
+        final QueryBuilder requestFilter = PlannerUtils.canMatchFilter(
+            flags,
+            configuration,
+            clusterService.state().getMinTransportVersion(),
+            dataNodePlan
+        );
+        searchLocalTargetShards(
+            rootTask,
+            localOriginalIndices,
+            requestFilter,
+            Set.of(localConcreteIndices.indices()),
+            configuration,
+            ActionListener.wrap(
+                targetShards -> executeLocalSingleNodeLateMaterializationForTargetShards(
+                    sessionId,
+                    rootTask,
+                    flags,
+                    configuration,
+                    foldContext,
+                    finalCoordinatorPlan,
+                    reductionPlan,
+                    localOriginalIndices,
+                    collectedPages,
+                    outputAttributes,
+                    execInfo,
+                    profileQualifier,
+                    cancelQueryOnFailure,
+                    exchangeSinkSupplier,
+                    planTimeProfile,
+                    listener,
+                    targetShards
+                ),
+                listener::onFailure
+            )
+        );
+    }
+
+    private void executeLocalSingleNodeLateMaterializationForTargetShards(
+        String sessionId,
+        CancellableTask rootTask,
+        EsqlFlags flags,
+        Configuration configuration,
+        FoldContext foldContext,
+        PhysicalPlan finalCoordinatorPlan,
+        ReductionPlan reductionPlan,
+        OriginalIndices localOriginalIndices,
+        List<Page> collectedPages,
+        List<Attribute> outputAttributes,
+        EsqlExecutionInfo execInfo,
+        String profileQualifier,
+        Runnable cancelQueryOnFailure,
+        Supplier<ExchangeSink> exchangeSinkSupplier,
+        PlanTimeProfile planTimeProfile,
+        ActionListener<Result> listener,
+        DataNodeRequestSender.TargetShards targetShards
+    ) {
+        // final borrows the same search contexts that the local data-side execution will populate. This is
+        // the key difference from the normal coordinator path, which gives final an EmptyIndexedByShardId.
+        final AcquiredSearchContexts searchContexts = new AcquiredSearchContexts(targetShards.shards().size());
+        ActionListener<Result> resultListener = ActionListener.releaseAfter(
+            ActionListener.runBefore(listener, () -> exchangeService.removeExchangeSourceHandler(sessionId)),
+            searchContexts
+        );
+        final ExchangeSourceHandler exchangeSource = new ExchangeSourceHandler(
+            configuration.pragmas().exchangeBufferSize(),
+            transportService.getThreadPool().executor(ThreadPool.Names.SEARCH)
+        );
+        exchangeService.addExchangeSourceHandler(sessionId, exchangeSource);
+        try (
+            // Owns the whole local-only branch and turns the collected pages into the final Result once all
+            // local-cluster work has reported completion.
+            var computeListener = new ComputeListener(
+                transportService.getThreadPool(),
+                cancelQueryOnFailure,
+                resultListener.delegateFailureAndWrap((l, completionInfo) -> {
+                    failIfAllShardsFailed(execInfo, collectedPages);
+                    execInfo.markEndQuery();
+                    l.onResponse(new Result(outputAttributes, collectedPages, configuration, completionInfo, execInfo));
+                })
+            )
+        ) {
+            // Keep final's exchange source open until we've either attached the in-process producer or
+            // determined there are no shard-backed pages to send.
+            try (Releasable ignored = exchangeSource.addEmptySink()) {
+                // Filled in by the data-side callback and consulted when final decides the terminal cluster
+                // status for the local cluster.
+                final AtomicBoolean localClusterWasInterrupted = new AtomicBoolean();
+                try (
+                    // Tracks the local-cluster subcomputations specifically: final plus, when present, the
+                    // in-process data-side fragment that feeds it.
+                    var localListener = new ComputeListener(
+                        transportService.getThreadPool(),
+                        cancelQueryOnFailure,
+                        computeListener.acquireCompute()
+                            .delegateFailure(
+                                (l, completionInfo) -> finalizeLocalSingleNodeClusterExecution(
+                                    execInfo,
+                                    localClusterWasInterrupted,
+                                    completionInfo,
+                                    l
+                                )
+                            )
+                    )
+                ) {
+                    attachLocalSingleNodeProducerOrRecordNoShards(sessionId, configuration, targetShards, exchangeSource, execInfo);
+                    runLocalSingleNodeFinal(
+                        sessionId,
+                        rootTask,
+                        flags,
+                        configuration,
+                        foldContext,
+                        finalCoordinatorPlan,
+                        profileQualifier,
+                        exchangeSource,
+                        exchangeSinkSupplier,
+                        planTimeProfile,
+                        searchContexts,
+                        localListener.acquireCompute()
+                    );
+                    if (targetShards.shards().isEmpty() == false) {
+                        startLocalSingleNodeDataSide(
+                            sessionId,
+                            rootTask,
+                            flags,
+                            configuration,
+                            reductionPlan,
+                            localOriginalIndices,
+                            targetShards,
+                            searchContexts,
+                            execInfo,
+                            localClusterWasInterrupted,
+                            localListener.acquireCompute()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    private void finalizeLocalSingleNodeClusterExecution(
+        EsqlExecutionInfo execInfo,
+        AtomicBoolean localClusterWasInterrupted,
+        DriverCompletionInfo completionInfo,
+        ActionListener<DriverCompletionInfo> listener
+    ) {
+        if (execInfo.clusterInfo.containsKey(LOCAL_CLUSTER)) {
+            execInfo.swapCluster(LOCAL_CLUSTER, (k, v) -> {
+                var tookTime = execInfo.queryProfile().total().timeSinceStarted();
+                var builder = new EsqlExecutionInfo.Cluster.Builder(v).setTook(tookTime);
+                if (execInfo.isMainPlan() && v.getStatus() == EsqlExecutionInfo.Cluster.Status.RUNNING) {
+                    final Integer failedShards = execInfo.getCluster(LOCAL_CLUSTER).getFailedShards();
+                    var status = localClusterWasInterrupted.get()
+                        || (failedShards != null && failedShards > 0)
+                        || v.getFailures().isEmpty() == false
+                            ? EsqlExecutionInfo.Cluster.Status.PARTIAL
+                            : EsqlExecutionInfo.Cluster.Status.SUCCESSFUL;
+                    builder.setStatus(status);
+                }
+                return builder.build();
+            });
+        }
+        listener.onResponse(completionInfo);
+    }
+
+    private void attachLocalSingleNodeProducerOrRecordNoShards(
+        String sessionId,
+        Configuration configuration,
+        DataNodeRequestSender.TargetShards targetShards,
+        ExchangeSourceHandler exchangeSource,
+        EsqlExecutionInfo execInfo
+    ) {
+        if (targetShards.shards().isEmpty() == false) {
+            ExchangeSinkHandler localSinkHandler = exchangeService.createSinkHandler(
+                sessionId,
+                configuration.pragmas().exchangeBufferSize()
+            );
+            // Wire the local producer into final's exchange using the same sink/source API that
+            // remote execution uses, but keep everything in-process.
+            exchangeSource.addRemoteSink(localSinkHandler::fetchPageAsync, true, () -> {}, 1, ActionListener.noop());
+            return;
+        }
+        // No shard-backed producers will run, so record the shard accounting up front.
+        execInfo.swapCluster(
+            LOCAL_CLUSTER,
+            (k, v) -> new EsqlExecutionInfo.Cluster.Builder(v).setTotalShards(targetShards.totalShards())
+                .setSuccessfulShards(targetShards.totalShards() - targetShards.skippedShards())
+                .setSkippedShards(targetShards.skippedShards())
+                .setFailedShards(0)
+                .build()
+        );
+    }
+
+    private void runLocalSingleNodeFinal(
+        String sessionId,
+        CancellableTask rootTask,
+        EsqlFlags flags,
+        Configuration configuration,
+        FoldContext foldContext,
+        PhysicalPlan finalCoordinatorPlan,
+        String profileQualifier,
+        ExchangeSourceHandler exchangeSource,
+        Supplier<ExchangeSink> exchangeSinkSupplier,
+        PlanTimeProfile planTimeProfile,
+        AcquiredSearchContexts searchContexts,
+        ActionListener<DriverCompletionInfo> listener
+    ) {
+        // Start final first so it can block on the exchange and immediately consume pages once
+        // the in-process data-side fragment starts producing them.
+        runCompute(
+            rootTask,
+            new ComputeContext(
+                sessionId,
+                profileDescription(profileQualifier, "final"),
+                LOCAL_CLUSTER,
+                flags,
+                searchContexts.globalView(),
+                configuration,
+                foldContext,
+                exchangeSource::createExchangeSource,
+                exchangeSinkSupplier
+            ),
+            finalCoordinatorPlan,
+            plannerSettings.get(),
+            LocalPhysicalOptimization.ENABLED,
+            planTimeProfile,
+            listener
+        );
+    }
+
+    private void startLocalSingleNodeDataSide(
+        String sessionId,
+        CancellableTask rootTask,
+        EsqlFlags flags,
+        Configuration configuration,
+        ReductionPlan reductionPlan,
+        OriginalIndices localOriginalIndices,
+        DataNodeRequestSender.TargetShards targetShards,
+        AcquiredSearchContexts searchContexts,
+        EsqlExecutionInfo execInfo,
+        AtomicBoolean localClusterWasInterrupted,
+        ActionListener<DriverCompletionInfo> listener
+    ) {
+        // The data-side fragment still runs separately, but entirely in-process. It emits the
+        // _doc/sort-key pages that final now consumes to perform the global TopN and only then
+        // load deferred fields.
+        // This listener mirrors the normal data-node response accounting into the local
+        // cluster bookkeeping before letting the shared local listener complete.
+        dataNodeComputeHandler.startComputeOnLocalNode(
+            sessionId,
+            LOCAL_CLUSTER,
+            rootTask,
+            flags,
+            configuration,
+            reductionPlan.dataNodePlan(),
+            localShards(targetShards),
+            localAliasFilters(targetShards),
+            localOriginalIndices,
+            searchContexts,
+            plannerSettings.get(),
+            configuration.profile() ? new PlanTimeProfile() : null,
+            ActionListener.wrap(r -> {
+                ComputeResponse response = localComputeResponse(targetShards, r);
+                localClusterWasInterrupted.set(execInfo.isStopped());
+                execInfo.swapCluster(
+                    LOCAL_CLUSTER,
+                    (k, v) -> new EsqlExecutionInfo.Cluster.Builder(v).setTotalShards(response.getTotalShards())
+                        .setSuccessfulShards(response.getSuccessfulShards())
+                        .setSkippedShards(response.getSkippedShards())
+                        .setFailedShards(response.getFailedShards())
+                        .addFailures(response.failures)
+                        .build()
+                );
+                listener.onResponse(response.getCompletionInfo());
+            }, e -> {
+                if (configuration.allowPartialResults() && EsqlCCSUtils.canAllowPartial(e)) {
+                    execInfo.swapCluster(
+                        LOCAL_CLUSTER,
+                        (k, v) -> new EsqlExecutionInfo.Cluster.Builder(v).setStatus(EsqlExecutionInfo.Cluster.Status.PARTIAL)
+                            .addFailures(List.of(new ShardSearchFailure(e)))
+                            .build()
+                    );
+                    listener.onResponse(DriverCompletionInfo.EMPTY);
+                } else {
+                    listener.onFailure(e);
+                }
+            })
+        );
+    }
+
+    private void searchLocalTargetShards(
+        CancellableTask rootTask,
+        OriginalIndices originalIndices,
+        QueryBuilder requestFilter,
+        Set<String> concreteIndices,
+        Configuration configuration,
+        ActionListener<DataNodeRequestSender.TargetShards> listener
+    ) {
+        new DataNodeRequestSender(
+            clusterService,
+            projectResolver,
+            transportService,
+            transportService.getThreadPool().executor(ThreadPool.Names.SEARCH),
+            rootTask,
+            originalIndices,
+            requestFilter,
+            LOCAL_CLUSTER,
+            configuration.allowPartialResults(),
+            -1,
+            configuration.pragmas().unavailableShardResolutionAttempts()
+        ) {
+            @Override
+            void sendRequest(
+                DiscoveryNode node,
+                List<DataNodeRequest.Shard> shards,
+                Map<Index, AliasFilter> aliasFilters,
+                NodeListener nodeListener
+            ) {
+                throw new UnsupportedOperationException("local late materialization planning should not send data node requests");
+            }
+        }.searchShards(concreteIndices, listener);
+    }
+
+    private static PhysicalPlan coordinatorPlanWithLateMaterialization(PhysicalPlan coordinatorPlan, ReductionPlan reductionPlan) {
+        final AtomicBoolean replaced = new AtomicBoolean();
+        PhysicalPlan updatedPlan = coordinatorPlan.transformUp(ExchangeSourceExec.class, exchangeSource -> {
+            if (replaced.compareAndSet(false, true)) {
+                // nodeReducePlan() is still rooted at an ExchangeSinkExec. Its child is the actual TopN/FieldExtract
+                // subtree we want final to execute directly in the single-node path.
+                return reductionPlan.nodeReducePlan().child();
+            }
+            return exchangeSource;
+        });
+        if (replaced.get() == false) {
+            throw new IllegalStateException("expected coordinator plan to contain an exchange source");
+        }
+        return updatedPlan;
+    }
+
+    private static List<DataNodeRequest.Shard> localShards(DataNodeRequestSender.TargetShards targetShards) {
+        return targetShards.shards()
+            .values()
+            .stream()
+            .map(shard -> new DataNodeRequest.Shard(shard.shardId(), shard.reshardSplitShardCountSummary()))
+            .toList();
+    }
+
+    private static Map<Index, AliasFilter> localAliasFilters(DataNodeRequestSender.TargetShards targetShards) {
+        Map<Index, AliasFilter> aliasFilters = new HashMap<>();
+        for (DataNodeRequestSender.TargetShard shard : targetShards.shards().values()) {
+            if (shard.aliasFilter() != null) {
+                aliasFilters.put(shard.shardId().getIndex(), shard.aliasFilter());
+            }
+        }
+        return aliasFilters;
+    }
+
+    private static ComputeResponse localComputeResponse(DataNodeRequestSender.TargetShards targetShards, DataNodeComputeResponse response) {
+        int failedShards = response.shardLevelFailures().size();
+        int skippedShards = targetShards.skippedShards();
+        int totalShards = targetShards.totalShards();
+        return new ComputeResponse(
+            response.completionInfo(),
+            null,
+            totalShards,
+            totalShards - skippedShards - failedShards,
+            skippedShards,
+            failedShards,
+            localShardFailures(response.shardLevelFailures())
+        );
+    }
+
+    private static List<ShardSearchFailure> localShardFailures(Map<org.elasticsearch.index.shard.ShardId, Exception> shardLevelFailures) {
+        List<ShardSearchFailure> failures = new ArrayList<>();
+        for (var entry : shardLevelFailures.entrySet()) {
+            if (ExceptionsHelper.unwrap(entry.getValue(), TaskCancelledException.class) != null) {
+                continue;
+            }
+            failures.add(new ShardSearchFailure(entry.getValue(), new SearchShardTarget(null, entry.getKey(), LOCAL_CLUSTER)));
+            if (failures.size() == 5) {
+                break;
+            }
+        }
+        if (failures.isEmpty() && shardLevelFailures.isEmpty() == false) {
+            var entry = shardLevelFailures.entrySet().iterator().next();
+            failures.add(new ShardSearchFailure(entry.getValue(), new SearchShardTarget(null, entry.getKey(), LOCAL_CLUSTER)));
+        }
+        return failures;
     }
 
     // For queries like: FROM logs* | LIMIT 0 (including cross-cluster LIMIT 0 queries)

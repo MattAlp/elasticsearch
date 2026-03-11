@@ -53,6 +53,7 @@ import org.elasticsearch.xpack.esql.action.EsqlCapabilities;
 import org.elasticsearch.xpack.esql.core.expression.FoldContext;
 import org.elasticsearch.xpack.esql.datasources.spi.ExternalSplit;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSinkExec;
+import org.elasticsearch.xpack.esql.plan.physical.ExchangeSourceExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExternalSourceExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
 import org.elasticsearch.xpack.esql.planner.PlanConcurrencyCalculator;
@@ -727,6 +728,58 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                 parentListener.onFailure(e);
             }
         }
+    }
+
+    /**
+     * Executes the data-node portion of a query locally, keeping the acquired search contexts available for another
+     * in-process consumer such as the coordinator's final driver.
+     */
+    void startComputeOnLocalNode(
+        String sessionId,
+        String clusterAlias,
+        CancellableTask task,
+        EsqlFlags flags,
+        Configuration configuration,
+        ExchangeSinkExec dataNodePlan,
+        List<DataNodeRequest.Shard> shards,
+        Map<Index, AliasFilter> aliasFilters,
+        OriginalIndices originalIndices,
+        AcquiredSearchContexts searchContexts,
+        PlannerSettings plannerSettings,
+        PlanTimeProfile planTimeProfile,
+        ActionListener<DataNodeComputeResponse> listener
+    ) {
+        final ReductionPlan passThroughReduction = new ReductionPlan(
+            dataNodePlan.replaceChild(
+                new ExchangeSourceExec(dataNodePlan.source(), dataNodePlan.output(), dataNodePlan.isIntermediateAgg())
+            ),
+            dataNodePlan,
+            LocalPhysicalOptimization.ENABLED
+        );
+        final DataNodeRequest request = new DataNodeRequest(
+            sessionId + "[n]",
+            configuration,
+            clusterAlias,
+            shards,
+            aliasFilters,
+            passThroughReduction.dataNodePlan(),
+            originalIndices.indices(),
+            originalIndices.indicesOptions(),
+            false,
+            false
+        );
+        runComputeOnDataNode(
+            task,
+            sessionId,
+            passThroughReduction.nodeReducePlan(),
+            passThroughReduction.localPhysicalOptimization(),
+            request,
+            false,
+            searchContexts,
+            plannerSettings,
+            planTimeProfile,
+            listener
+        );
     }
 
     @Override

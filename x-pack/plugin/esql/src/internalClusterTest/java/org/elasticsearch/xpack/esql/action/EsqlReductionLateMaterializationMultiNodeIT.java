@@ -14,4 +14,9 @@ public class EsqlReductionLateMaterializationMultiNodeIT extends EsqlReductionLa
     public EsqlReductionLateMaterializationMultiNodeIT(TestCase testCase) {
         super(testCase);
     }
+
+    @Override
+    protected String lateMaterializationDriverName() {
+        return "node_reduce";
+    }
 }

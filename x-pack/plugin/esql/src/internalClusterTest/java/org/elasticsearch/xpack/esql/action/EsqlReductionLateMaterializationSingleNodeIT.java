@@ -14,4 +14,9 @@ public class EsqlReductionLateMaterializationSingleNodeIT extends EsqlReductionL
     public EsqlReductionLateMaterializationSingleNodeIT(TestCase testCase) {
         super(testCase);
     }
+
+    @Override
+    protected String lateMaterializationDriverName() {
+        return "final";
+    }
 }
