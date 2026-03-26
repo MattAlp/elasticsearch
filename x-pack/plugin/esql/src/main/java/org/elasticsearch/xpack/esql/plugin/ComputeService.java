@@ -955,10 +955,7 @@ public class ComputeService {
         PlanTimeProfile planTimeProfile,
         ActionListener<Result> listener
     ) {
-        // Replace the coordinator/data-node boundary in the final plan with the subtree that used to run on
-        // node_reduce. final will still read pages from an exchange, but it now owns the global TopN and the
-        // deferred field extraction operators.
-        final PhysicalPlan finalCoordinatorPlan = coordinatorPlanWithLateMaterialization(coordinatorPlan, reductionPlan);
+        final LocalLateMaterializationPlan lateMaterializationPlan = coordinatorPlanWithLateMaterialization(coordinatorPlan, reductionPlan);
         final QueryBuilder requestFilter = PlannerUtils.canMatchFilter(
             flags,
             configuration,
@@ -978,7 +975,8 @@ public class ComputeService {
                     flags,
                     configuration,
                     foldContext,
-                    finalCoordinatorPlan,
+                    lateMaterializationPlan.plan(),
+                    lateMaterializationPlan.localPhysicalOptimization(),
                     reductionPlan,
                     localOriginalIndices,
                     collectedPages,
@@ -1003,6 +1001,7 @@ public class ComputeService {
         Configuration configuration,
         FoldContext foldContext,
         PhysicalPlan finalCoordinatorPlan,
+        LocalPhysicalOptimization finalLocalPhysicalOptimization,
         ReductionPlan reductionPlan,
         OriginalIndices localOriginalIndices,
         List<Page> collectedPages,
@@ -1015,18 +1014,21 @@ public class ComputeService {
         ActionListener<Result> listener,
         DataNodeRequestSender.TargetShards targetShards
     ) {
+        // Subplans can already use `sessionId` for their outer sink into main.final. Give the local-only
+        // data->final exchange its own child session so the in-process producer does not collide with that sink.
+        final String localExchangeSessionId = exchangeSinkSupplier == null ? sessionId : newChildSession(sessionId);
         // final borrows the same search contexts that the local data-side execution will populate. This is
         // the key difference from the normal coordinator path, which gives final an EmptyIndexedByShardId.
         final AcquiredSearchContexts searchContexts = new AcquiredSearchContexts(targetShards.shards().size());
         ActionListener<Result> resultListener = ActionListener.releaseAfter(
-            ActionListener.runBefore(listener, () -> exchangeService.removeExchangeSourceHandler(sessionId)),
+            ActionListener.runBefore(listener, () -> exchangeService.removeExchangeSourceHandler(localExchangeSessionId)),
             searchContexts
         );
         final ExchangeSourceHandler exchangeSource = new ExchangeSourceHandler(
             configuration.pragmas().exchangeBufferSize(),
             transportService.getThreadPool().executor(ThreadPool.Names.SEARCH)
         );
-        exchangeService.addExchangeSourceHandler(sessionId, exchangeSource);
+        exchangeService.addExchangeSourceHandler(localExchangeSessionId, exchangeSource);
         try (
             // Owns the whole local-only branch and turns the collected pages into the final Result once all
             // local-cluster work has reported completion.
@@ -1063,14 +1065,21 @@ public class ComputeService {
                             )
                     )
                 ) {
-                    attachLocalSingleNodeProducerOrRecordNoShards(sessionId, configuration, targetShards, exchangeSource, execInfo);
+                    attachLocalSingleNodeProducerOrRecordNoShards(
+                        localExchangeSessionId,
+                        configuration,
+                        targetShards,
+                        exchangeSource,
+                        execInfo
+                    );
                     runLocalSingleNodeFinal(
-                        sessionId,
+                        localExchangeSessionId,
                         rootTask,
                         flags,
                         configuration,
                         foldContext,
                         finalCoordinatorPlan,
+                        finalLocalPhysicalOptimization,
                         profileQualifier,
                         exchangeSource,
                         exchangeSinkSupplier,
@@ -1080,7 +1089,7 @@ public class ComputeService {
                     );
                     if (targetShards.shards().isEmpty() == false) {
                         startLocalSingleNodeDataSide(
-                            sessionId,
+                            localExchangeSessionId,
                             rootTask,
                             flags,
                             configuration,
@@ -1158,6 +1167,7 @@ public class ComputeService {
         Configuration configuration,
         FoldContext foldContext,
         PhysicalPlan finalCoordinatorPlan,
+        LocalPhysicalOptimization finalLocalPhysicalOptimization,
         String profileQualifier,
         ExchangeSourceHandler exchangeSource,
         Supplier<ExchangeSink> exchangeSinkSupplier,
@@ -1182,7 +1192,7 @@ public class ComputeService {
             ),
             finalCoordinatorPlan,
             plannerSettings.get(),
-            LocalPhysicalOptimization.ENABLED,
+            finalLocalPhysicalOptimization,
             planTimeProfile,
             listener
         );
@@ -1281,21 +1291,36 @@ public class ComputeService {
         }.searchShards(concreteIndices, listener);
     }
 
-    private static PhysicalPlan coordinatorPlanWithLateMaterialization(PhysicalPlan coordinatorPlan, ReductionPlan reductionPlan) {
+    private static LocalLateMaterializationPlan coordinatorPlanWithLateMaterialization(
+        PhysicalPlan coordinatorPlan,
+        ReductionPlan reductionPlan
+    ) {
+        final boolean keepOriginalCoordinatorPipeline = coordinatorPlan.collect(TopNExec.class::isInstance).size() > 1;
         final AtomicBoolean replaced = new AtomicBoolean();
         PhysicalPlan updatedPlan = coordinatorPlan.transformUp(ExchangeSourceExec.class, exchangeSource -> {
             if (replaced.compareAndSet(false, true)) {
-                // nodeReducePlan() is still rooted at an ExchangeSinkExec. Its child is the actual TopN/FieldExtract
-                // subtree we want final to execute directly in the single-node path.
-                return reductionPlan.nodeReducePlan().child();
+                if (keepOriginalCoordinatorPipeline == false) {
+                    // The original single-TopN path already materializes at the latest useful point. Keep splicing
+                    // the preplanned reduce subtree into final for that established behavior.
+                    return reductionPlan.nodeReducePlan().child();
+                }
+                // Keep the original coordinator pipeline, but feed it the reduced data-side shape (_doc plus
+                // ordering/ranking fields) instead of the eagerly materialized exchange rows. final's local
+                // optimizer can then insert field extraction at the latest use site while _doc is still available.
+                return new ExchangeSourceExec(exchangeSource.source(), reductionPlan.dataNodePlan().output(), exchangeSource.isIntermediateAgg());
             }
             return exchangeSource;
         });
         if (replaced.get() == false) {
             throw new IllegalStateException("expected coordinator plan to contain an exchange source");
         }
-        return updatedPlan;
+        return new LocalLateMaterializationPlan(
+            updatedPlan,
+            keepOriginalCoordinatorPipeline ? LocalPhysicalOptimization.COORDINATOR_ONLY : LocalPhysicalOptimization.ENABLED
+        );
     }
+
+    private record LocalLateMaterializationPlan(PhysicalPlan plan, LocalPhysicalOptimization localPhysicalOptimization) {}
 
     private static List<DataNodeRequest.Shard> localShards(DataNodeRequestSender.TargetShards targetShards) {
         return targetShards.shards()
@@ -1502,6 +1527,15 @@ public class ComputeService {
                         plan,
                         planTimeProfile
                     );
+                case COORDINATOR_ONLY -> PlannerUtils.localCoordinatorPlan(
+                    plannerSettings,
+                    context.flags(),
+                    localContexts,
+                    context.configuration(),
+                    context.foldCtx(),
+                    plan,
+                    planTimeProfile
+                );
                 case DISABLED -> plan;
             };
             if (coordinatorExternalSplits.isEmpty() == false) {

@@ -214,6 +214,18 @@ public class PlannerUtils {
         return localPlan(plannerSettings, flags, configuration, foldCtx, plan, SearchContextStats.from(searchContexts), planTimeProfile);
     }
 
+    public static PhysicalPlan localCoordinatorPlan(
+        PlannerSettings plannerSettings,
+        EsqlFlags flags,
+        List<SearchExecutionContext> searchContexts,
+        Configuration configuration,
+        FoldContext foldCtx,
+        PhysicalPlan plan,
+        PlanTimeProfile planTimeProfile
+    ) {
+        return localCoordinatorPlan(plannerSettings, flags, configuration, foldCtx, plan, SearchContextStats.from(searchContexts), planTimeProfile);
+    }
+
     public static PhysicalPlan localPlan(
         PlannerSettings plannerSettings,
         EsqlFlags flags,
@@ -229,6 +241,26 @@ public class PlannerUtils {
         );
 
         return localPlan(plan, logicalOptimizer, physicalOptimizer, planTimeProfile);
+    }
+
+    public static PhysicalPlan localCoordinatorPlan(
+        PlannerSettings plannerSettings,
+        EsqlFlags flags,
+        Configuration configuration,
+        FoldContext foldCtx,
+        PhysicalPlan plan,
+        SearchStats searchStats,
+        PlanTimeProfile planTimeProfile
+    ) {
+        var physicalOptimizer = new LocalPhysicalPlanOptimizer(
+            new LocalPhysicalOptimizerContext(plannerSettings, flags, configuration, foldCtx, searchStats)
+        );
+        long physicalStartNanos = planTimeProfile == null ? 0 : System.nanoTime();
+        PhysicalPlan localOptimized = physicalOptimizer.localOptimize(plan);
+        if (planTimeProfile != null) {
+            planTimeProfile.addPhysicalOptimizationPlanTime(System.nanoTime() - physicalStartNanos);
+        }
+        return localOptimized;
     }
 
     public static PhysicalPlan localPlan(

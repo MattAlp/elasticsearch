@@ -10,5 +10,6 @@ package org.elasticsearch.xpack.esql.plugin;
 /** This class is {@code public} for testing. */
 public enum LocalPhysicalOptimization {
     ENABLED,
+    COORDINATOR_ONLY,
     DISABLED
 }

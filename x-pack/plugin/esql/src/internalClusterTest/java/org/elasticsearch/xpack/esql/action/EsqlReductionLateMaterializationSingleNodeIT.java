@@ -9,7 +9,7 @@ package org.elasticsearch.xpack.esql.action;
 
 import org.elasticsearch.test.ESIntegTestCase;
 
-@ESIntegTestCase.ClusterScope(numDataNodes = 1)
+@ESIntegTestCase.ClusterScope(numDataNodes = 1, numClientNodes = 0, supportsDedicatedMasters = false)
 public class EsqlReductionLateMaterializationSingleNodeIT extends EsqlReductionLateMaterializationTestCase {
     public EsqlReductionLateMaterializationSingleNodeIT(TestCase testCase) {
         super(testCase);
