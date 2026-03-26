@@ -12,6 +12,9 @@ import org.elasticsearch.core.Tuple;
 import org.elasticsearch.index.IndexMode;
 import org.elasticsearch.xpack.esql.EsqlTestUtils;
 import org.elasticsearch.xpack.esql.analysis.Analyzer;
+import org.elasticsearch.xpack.esql.analysis.AnalyzerTestUtils;
+import org.elasticsearch.xpack.esql.analysis.EnrichResolution;
+import org.elasticsearch.xpack.esql.core.expression.Alias;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
 import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
@@ -33,6 +36,7 @@ import org.elasticsearch.xpack.esql.plan.physical.FieldExtractExec;
 import org.elasticsearch.xpack.esql.plan.physical.FuseScoreEvalExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
 import org.elasticsearch.xpack.esql.plan.physical.TopNExec;
+import org.elasticsearch.xpack.esql.plan.physical.inference.RerankExec;
 import org.elasticsearch.xpack.esql.planner.PlannerSettings;
 import org.elasticsearch.xpack.esql.planner.PlannerUtils;
 import org.elasticsearch.xpack.esql.planner.mapper.Mapper;
@@ -142,7 +146,11 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         ReductionPlan reductionPlan = reductionPlan((ExchangeSinkExec) coordinatorAndDataPlan.v2());
         Attribute docAttribute = reductionPlan.dataNodePlan().output().stream().filter(EsQueryExec::isDocAttribute).findFirst().orElseThrow();
 
-        PhysicalPlan rewrittenMainPlan = mainPlanWithDocPassthrough(subplansAndMainPlan.v2(), docAttribute, lateFieldAttributes(reductionPlan));
+        PhysicalPlan rewrittenMainPlan = mainPlanWithDocPassthrough(
+            subplansAndMainPlan.v2(),
+            docAttribute,
+            lateFieldAttributes((ExchangeSinkExec) coordinatorAndDataPlan.v2(), reductionPlan)
+        );
         PhysicalPlan optimizedMainPlan = PlannerUtils.localCoordinatorPlan(
             PlannerSettings.DEFAULTS,
             new EsqlFlags(false),
@@ -165,15 +173,155 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         assertThat(extracts.getFirst().child(), instanceOf(TopNExec.class));
     }
 
+    public void testFuseMainPlanRerankLateMaterializesFieldAfterFuseLimit() {
+        Analyzer analyzer = booksAnalyzer();
+        PhysicalPlan plan = physicalPlan(
+            """
+                FROM books METADATA _score, _id, _index
+                | FORK
+                  ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
+                  ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
+                | FUSE
+                | SORT _score DESC, _id, _index
+                | LIMIT 4
+                | RERANK "Tolkien" ON title WITH { "inference_id" : "reranking-inference-id" }
+                | SORT _score DESC, _id, _index
+                | LIMIT 2
+                | KEEP _score, _id, title
+                """,
+            analyzer
+        );
+        Tuple<List<PhysicalPlan>, PhysicalPlan> subplansAndMainPlan = PlannerUtils.breakPlanIntoSubPlansAndMainPlan(plan);
+        PhysicalPlan subplan = subplansAndMainPlan.v1().getFirst();
+        Tuple<PhysicalPlan, PhysicalPlan> coordinatorAndDataPlan = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(subplan, config);
+        ReductionPlan reductionPlan = reductionPlan((ExchangeSinkExec) coordinatorAndDataPlan.v2());
+        Attribute docAttribute = reductionPlan.dataNodePlan().output().stream().filter(EsQueryExec::isDocAttribute).findFirst().orElseThrow();
+
+        Map<String, FieldAttribute> mainLateFields = new java.util.HashMap<>(lateFieldAttributes(subplansAndMainPlan.v2()));
+        mainLateFields.putAll(lateFieldAttributes(subplan));
+        mainLateFields.putAll(lateFieldAttributes((ExchangeSinkExec) coordinatorAndDataPlan.v2(), reductionPlan));
+        assertThat(mainLateFields.keySet(), equalTo(Set.of("title")));
+
+        PhysicalPlan rewrittenMainPlan = mainPlanWithDocPassthrough(subplansAndMainPlan.v2(), docAttribute, mainLateFields);
+        PhysicalPlan optimizedMainPlan = PlannerUtils.localCoordinatorPlan(
+            PlannerSettings.DEFAULTS,
+            new EsqlFlags(false),
+            List.of(),
+            config,
+            FoldContext.small(),
+            rewrittenMainPlan,
+            new PlanTimeProfile()
+        );
+
+        AggregateExec fuseAggregate = optimizedMainPlan.collect(
+            node -> node instanceof AggregateExec aggregate && aggregate.child() instanceof FuseScoreEvalExec
+        ).stream().map(AggregateExec.class::cast).findFirst().orElseThrow();
+        assertThat(attributeNames(fuseAggregate.output()), hasItem("_doc"));
+        assertThat(attributeNames(fuseAggregate.output()), not(hasItem("title")));
+
+        RerankExec rerank = optimizedMainPlan.collect(node -> node instanceof RerankExec)
+            .stream()
+            .map(RerankExec.class::cast)
+            .findFirst()
+            .orElseThrow();
+        assertThat(rerank.child(), instanceOf(FieldExtractExec.class));
+        FieldExtractExec rerankExtract = (FieldExtractExec) rerank.child();
+        assertThat(attributeNames(rerankExtract.attributesToExtract()), equalTo(Set.of("title")));
+
+        List<FieldExtractExec> extracts = fieldExtracts(optimizedMainPlan);
+        assertThat(extracts, hasSize(1));
+        assertThat(attributeNames(extracts.getFirst().attributesToExtract()), equalTo(Set.of("title")));
+        assertThat(extracts.getFirst().child(), instanceOf(TopNExec.class));
+    }
+
+    public void testFuseMainPlanRerankLateMaterializesSecondFieldAfterPostRerankLimit() {
+        Analyzer analyzer = booksAnalyzer();
+        PhysicalPlan plan = physicalPlan(
+            """
+                FROM books METADATA _score, _id, _index
+                | FORK
+                  ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
+                  ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
+                | FUSE
+                | SORT _score DESC, _id, _index
+                | LIMIT 4
+                | RERANK "Tolkien" ON title WITH { "inference_id" : "reranking-inference-id" }
+                | SORT _score DESC, _id, _index
+                | LIMIT 2
+                | STATS total = SUM(LENGTH(author))
+                """,
+            analyzer
+        );
+        Tuple<List<PhysicalPlan>, PhysicalPlan> subplansAndMainPlan = PlannerUtils.breakPlanIntoSubPlansAndMainPlan(plan);
+        PhysicalPlan subplan = subplansAndMainPlan.v1().getFirst();
+        Tuple<PhysicalPlan, PhysicalPlan> coordinatorAndDataPlan = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(subplan, config);
+        ReductionPlan reductionPlan = reductionPlan((ExchangeSinkExec) coordinatorAndDataPlan.v2());
+        Attribute docAttribute = reductionPlan.dataNodePlan().output().stream().filter(EsQueryExec::isDocAttribute).findFirst().orElseThrow();
+
+        Map<String, FieldAttribute> mainLateFields = parentFinalLateFieldAttributes(
+            subplansAndMainPlan.v2(),
+            subplan,
+            (ExchangeSinkExec) coordinatorAndDataPlan.v2(),
+            reductionPlan
+        );
+        assertThat(mainLateFields.keySet(), equalTo(Set.of("title", "author")));
+
+        PhysicalPlan rewrittenMainPlan = mainPlanWithDocPassthrough(subplansAndMainPlan.v2(), docAttribute, mainLateFields);
+        PhysicalPlan optimizedMainPlan = PlannerUtils.localCoordinatorPlan(
+            PlannerSettings.DEFAULTS,
+            new EsqlFlags(false),
+            List.of(),
+            config,
+            FoldContext.small(),
+            rewrittenMainPlan,
+            new PlanTimeProfile()
+        );
+
+        AggregateExec fuseAggregate = optimizedMainPlan.collect(
+            node -> node instanceof AggregateExec aggregate && aggregate.child() instanceof FuseScoreEvalExec
+        ).stream().map(AggregateExec.class::cast).findFirst().orElseThrow();
+        assertThat(attributeNames(fuseAggregate.output()), hasItem("_doc"));
+        assertThat(attributeNames(fuseAggregate.output()), not(hasItem("title")));
+        assertThat(attributeNames(fuseAggregate.output()), not(hasItem("author")));
+
+        RerankExec rerank = optimizedMainPlan.collect(node -> node instanceof RerankExec)
+            .stream()
+            .map(RerankExec.class::cast)
+            .findFirst()
+            .orElseThrow();
+        assertThat(rerank.child(), instanceOf(FieldExtractExec.class));
+        FieldExtractExec rerankExtract = (FieldExtractExec) rerank.child();
+        assertThat(attributeNames(rerankExtract.attributesToExtract()), equalTo(Set.of("title")));
+        assertThat(rerankExtract.child(), instanceOf(TopNExec.class));
+
+        List<FieldExtractExec> extracts = fieldExtracts(optimizedMainPlan);
+        assertThat(extracts, hasSize(2));
+        assertThat(
+            extracts.stream().map(extract -> attributeNames(extract.attributesToExtract())).collect(Collectors.toSet()),
+            equalTo(Set.of(Set.of("title"), Set.of("author")))
+        );
+        FieldExtractExec authorExtract = extracts.stream()
+            .filter(extract -> attributeNames(extract.attributesToExtract()).equals(Set.of("author")))
+            .findFirst()
+            .orElseThrow();
+        assertThat(authorExtract.child(), instanceOf(TopNExec.class));
+        assertTrue("author extract should stay above rerank", authorExtract.child().anyMatch(RerankExec.class::isInstance));
+    }
+
     private Analyzer booksAnalyzer() {
-        return makeAnalyzer(
-            IndexResolution.valid(
-                EsIndexGenerator.esIndex(
-                    "books",
-                    EsqlTestUtils.loadMapping("mapping-books.json"),
-                    Map.of("books", IndexMode.STANDARD)
-                )
+        IndexResolution indexResolution = IndexResolution.valid(
+            EsIndexGenerator.esIndex(
+                "books",
+                EsqlTestUtils.loadMapping("mapping-books.json"),
+                Map.of("books", IndexMode.STANDARD)
             )
+        );
+        return AnalyzerTestUtils.analyzer(
+            AnalyzerTestUtils.indexResolutions(indexResolution),
+            AnalyzerTestUtils.defaultLookupResolution(),
+            new EnrichResolution(),
+            EsqlTestUtils.TEST_VERIFIER,
+            config
         );
     }
 
@@ -223,6 +371,102 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
             .filter(FieldAttribute.class::isInstance)
             .map(FieldAttribute.class::cast)
             .collect(Collectors.toMap(FieldAttribute::name, field -> field, (left, right) -> left));
+    }
+
+    private static Map<String, FieldAttribute> lateFieldAttributes(PhysicalPlan plan) {
+        return plan.collect(node -> node instanceof FieldExtractExec)
+            .stream()
+            .map(FieldExtractExec.class::cast)
+            .flatMap(fieldExtract -> fieldExtract.attributesToExtract().stream())
+            .filter(FieldAttribute.class::isInstance)
+            .map(FieldAttribute.class::cast)
+            .collect(Collectors.toMap(FieldAttribute::name, field -> field, (left, right) -> left));
+    }
+
+    private static Map<String, FieldAttribute> lateFieldAttributes(ExchangeSinkExec originalDataNodePlan, ReductionPlan reductionPlan) {
+        Map<String, FieldAttribute> lateFieldAttributes = new java.util.HashMap<>(lateFieldAttributes(reductionPlan));
+        Set<String> passthroughNames = attributeNames(reductionPlan.dataNodePlan().output());
+        PhysicalPlan dataNodeChild = originalDataNodePlan.child();
+        if (dataNodeChild instanceof org.elasticsearch.xpack.esql.plan.physical.FragmentExec fragmentExec
+            && fragmentExec.fragment() instanceof org.elasticsearch.xpack.esql.plan.logical.Project project) {
+            Map<String, FieldAttribute> fragmentFieldAttributes = new java.util.HashMap<>();
+            fragmentExec.fragment().forEachExpressionDown(FieldAttribute.class, field -> fragmentFieldAttributes.putIfAbsent(field.name(), field));
+            fragmentExec.fragment()
+                .collect(org.elasticsearch.xpack.esql.plan.logical.EsRelation.class)
+                .forEach(relation -> relation.output()
+                    .stream()
+                    .filter(FieldAttribute.class::isInstance)
+                    .map(FieldAttribute.class::cast)
+                    .forEach(field -> fragmentFieldAttributes.putIfAbsent(field.name(), field)));
+            for (var projection : project.projections()) {
+                if (passthroughNames.contains(projection.name())) {
+                    continue;
+                }
+                FieldAttribute fieldAttribute = null;
+                if (projection instanceof FieldAttribute field) {
+                    fieldAttribute = field;
+                } else if (projection instanceof Alias alias && alias.child() instanceof FieldAttribute field) {
+                    fieldAttribute = (FieldAttribute) field.withName(alias.name()).withId(alias.id());
+                }
+                if (fieldAttribute == null) {
+                    fieldAttribute = fragmentFieldAttributes.get(projection.name());
+                }
+                if (fieldAttribute != null) {
+                    lateFieldAttributes.putIfAbsent(projection.name(), fieldAttribute);
+                }
+            }
+        }
+        return lateFieldAttributes;
+    }
+
+    private static Map<String, FieldAttribute> parentFinalLateFieldAttributes(
+        PhysicalPlan mainPlan,
+        PhysicalPlan subplan,
+        ExchangeSinkExec originalDataNodePlan,
+        ReductionPlan reductionPlan
+    ) {
+        Map<String, FieldAttribute> lateFieldAttributes = new java.util.HashMap<>(lateFieldAttributes(subplan));
+        lateFieldAttributes.putAll(lateFieldAttributes(originalDataNodePlan, reductionPlan));
+        lateFieldAttributes.putAll(lateFieldAttributes(originalDataNodePlan, mainPlan));
+        lateFieldAttributes.putAll(lateFieldAttributes(mainPlan));
+        return lateFieldAttributes;
+    }
+
+    private static Map<String, FieldAttribute> lateFieldAttributes(ExchangeSinkExec originalDataNodePlan, PhysicalPlan parentPlan) {
+        Set<String> parentAttributeNames = new java.util.HashSet<>();
+        parentPlan.forEachExpressionDown(Attribute.class, attribute -> parentAttributeNames.add(attribute.name()));
+        Map<String, FieldAttribute> lateFieldAttributes = new java.util.HashMap<>();
+        PhysicalPlan dataNodeChild = originalDataNodePlan.child();
+        if (dataNodeChild instanceof org.elasticsearch.xpack.esql.plan.physical.FragmentExec fragmentExec
+            && fragmentExec.fragment() instanceof org.elasticsearch.xpack.esql.plan.logical.Project project) {
+            Map<String, FieldAttribute> fragmentFieldAttributes = new java.util.HashMap<>();
+            fragmentExec.fragment().forEachExpressionDown(FieldAttribute.class, field -> fragmentFieldAttributes.putIfAbsent(field.name(), field));
+            fragmentExec.fragment()
+                .collect(org.elasticsearch.xpack.esql.plan.logical.EsRelation.class)
+                .forEach(relation -> relation.output()
+                    .stream()
+                    .filter(FieldAttribute.class::isInstance)
+                    .map(FieldAttribute.class::cast)
+                    .forEach(field -> fragmentFieldAttributes.putIfAbsent(field.name(), field)));
+            for (var projection : project.projections()) {
+                if (parentAttributeNames.contains(projection.name()) == false) {
+                    continue;
+                }
+                FieldAttribute fieldAttribute = null;
+                if (projection instanceof FieldAttribute field) {
+                    fieldAttribute = field;
+                } else if (projection instanceof Alias alias && alias.child() instanceof FieldAttribute field) {
+                    fieldAttribute = (FieldAttribute) field.withName(alias.name()).withId(alias.id());
+                }
+                if (fieldAttribute == null) {
+                    fieldAttribute = fragmentFieldAttributes.get(projection.name());
+                }
+                if (fieldAttribute != null) {
+                    lateFieldAttributes.putIfAbsent(projection.name(), fieldAttribute);
+                }
+            }
+        }
+        return lateFieldAttributes;
     }
 
     private static PhysicalPlan mainPlanWithDocPassthrough(

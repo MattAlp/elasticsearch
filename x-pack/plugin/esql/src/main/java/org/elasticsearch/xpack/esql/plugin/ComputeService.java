@@ -59,6 +59,7 @@ import org.elasticsearch.transport.TransportService;
 import org.elasticsearch.xpack.esql.action.EsqlCapabilities;
 import org.elasticsearch.xpack.esql.action.EsqlExecutionInfo;
 import org.elasticsearch.xpack.esql.action.EsqlQueryAction;
+import org.elasticsearch.xpack.esql.core.expression.Alias;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
 import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
@@ -85,6 +86,7 @@ import org.elasticsearch.xpack.esql.plan.logical.TsInfo;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSinkExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSourceExec;
+import org.elasticsearch.xpack.esql.plan.physical.EsQueryExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExternalSourceExec;
 import org.elasticsearch.xpack.esql.plan.physical.FragmentExec;
 import org.elasticsearch.xpack.esql.plan.physical.FuseScoreEvalExec;
@@ -104,6 +106,7 @@ import org.elasticsearch.xpack.esql.stats.SearchContextStats;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -680,7 +683,8 @@ public class ComputeService {
                 planTimeProfile,
                 listener,
                 null,
-                LateMaterializationTarget.CURRENT_FINAL
+                LateMaterializationTarget.CURRENT_FINAL,
+                Map.of()
             );
             return;
         }
@@ -959,11 +963,17 @@ public class ComputeService {
             if (reductionPlan == null) {
                 return null;
             }
-            reductionPlan = reductionPlanForParentFinal(dataNodePlan, reductionPlan);
+            Map<String, FieldAttribute> subplanLateFieldAttributes = parentFinalLateFieldAttributes(
+                mainPlan,
+                subplan,
+                dataNodePlan,
+                reductionPlan
+            );
+            reductionPlan = reductionPlanForParentFinal(dataNodePlan, reductionPlan, subplanLateFieldAttributes);
             if (docAttribute == null) {
                 docAttribute = firstDocAttribute(reductionPlan.dataNodePlan().output());
             }
-            lateFieldAttributes.putAll(lateFieldAttributes(reductionPlan));
+            lateFieldAttributes.putAll(subplanLateFieldAttributes);
             plannedSubplans.add(
                 new ForkSubplanLateMaterializationPlan(
                     coordinatorAndDataNodePlan.v1(),
@@ -971,13 +981,15 @@ public class ComputeService {
                     reductionPlan,
                     localOriginalIndices,
                     localConcreteIndices,
-                    subplan.output()
+                    subplan.output(),
+                    subplanLateFieldAttributes
                 )
             );
         }
         if (docAttribute == null || lateFieldAttributes.isEmpty()) {
             return null;
         }
+        lateFieldAttributes.putAll(lateFieldAttributes(mainPlan));
         return new ForkLateMaterializationPlan(plannedSubplans, mainPlanWithLateMaterialization(mainPlan, docAttribute, lateFieldAttributes));
     }
 
@@ -1074,7 +1086,8 @@ public class ComputeService {
                             subPlanListener.onFailure(e);
                         }),
                         sharedSearchContexts,
-                        LateMaterializationTarget.PARENT_FINAL
+                        LateMaterializationTarget.PARENT_FINAL,
+                        subplan.lateFieldAttributes()
                     );
                 }
             }
@@ -1154,12 +1167,14 @@ public class ComputeService {
         PlanTimeProfile planTimeProfile,
         ActionListener<Result> listener,
         AcquiredSearchContexts sharedSearchContexts,
-        LateMaterializationTarget lateMaterializationTarget
+        LateMaterializationTarget lateMaterializationTarget,
+        Map<String, FieldAttribute> lateFieldAttributes
     ) {
         final LocalLateMaterializationPlan lateMaterializationPlan = coordinatorPlanWithLateMaterialization(
             coordinatorPlan,
             reductionPlan,
-            lateMaterializationTarget
+            lateMaterializationTarget,
+            lateFieldAttributes
         );
         final QueryBuilder requestFilter = PlannerUtils.canMatchFilter(
             flags,
@@ -1505,10 +1520,11 @@ public class ComputeService {
     private static LocalLateMaterializationPlan coordinatorPlanWithLateMaterialization(
         PhysicalPlan coordinatorPlan,
         ReductionPlan reductionPlan,
-        LateMaterializationTarget lateMaterializationTarget
+        LateMaterializationTarget lateMaterializationTarget,
+        Map<String, FieldAttribute> lateFieldAttributes
     ) {
         if (lateMaterializationTarget == LateMaterializationTarget.PARENT_FINAL) {
-            return coordinatorPlanForParentFinal(coordinatorPlan, reductionPlan);
+            return coordinatorPlanForParentFinal(coordinatorPlan, reductionPlan, lateFieldAttributes);
         }
         final boolean keepOriginalCoordinatorPipeline = coordinatorPlan.collect(TopNExec.class::isInstance).size() > 1;
         final AtomicBoolean replaced = new AtomicBoolean();
@@ -1535,9 +1551,12 @@ public class ComputeService {
         );
     }
 
-    private static LocalLateMaterializationPlan coordinatorPlanForParentFinal(PhysicalPlan coordinatorPlan, ReductionPlan reductionPlan) {
+    private static LocalLateMaterializationPlan coordinatorPlanForParentFinal(
+        PhysicalPlan coordinatorPlan,
+        ReductionPlan reductionPlan,
+        Map<String, FieldAttribute> lateFieldAttributes
+    ) {
         Attribute docAttribute = firstDocAttribute(reductionPlan.dataNodePlan().output());
-        Map<String, FieldAttribute> lateFieldAttributes = lateFieldAttributes(reductionPlan);
         final AtomicBoolean replaced = new AtomicBoolean();
         PhysicalPlan updatedPlan = coordinatorPlan.transformUp(ExchangeSourceExec.class, exchangeSource -> {
             if (replaced.compareAndSet(false, true)) {
@@ -1565,7 +1584,11 @@ public class ComputeService {
         return new LocalLateMaterializationPlan(updatedPlan, LocalPhysicalOptimization.ENABLED);
     }
 
-    private static ReductionPlan reductionPlanForParentFinal(ExchangeSinkExec originalDataNodePlan, ReductionPlan reductionPlan) {
+    private static ReductionPlan reductionPlanForParentFinal(
+        ExchangeSinkExec originalDataNodePlan,
+        ReductionPlan reductionPlan,
+        Map<String, FieldAttribute> lateFieldAttributes
+    ) {
         Attribute docAttribute = firstDocAttribute(reductionPlan.dataNodePlan().output());
         if (docAttribute == null) {
             return reductionPlan;
@@ -1582,7 +1605,6 @@ public class ComputeService {
         org.elasticsearch.xpack.esql.plan.logical.Project project =
             (org.elasticsearch.xpack.esql.plan.logical.Project) fragment;
 
-        Map<String, FieldAttribute> lateFieldAttributes = lateFieldAttributes(reductionPlan);
         List<NamedExpression> passthroughProjections = project.projections()
             .stream()
             .filter(projection -> lateFieldAttributes.containsKey(projection.name()) == false)
@@ -1613,7 +1635,8 @@ public class ComputeService {
         ReductionPlan reductionPlan,
         OriginalIndices localOriginalIndices,
         OriginalIndices localConcreteIndices,
-        List<Attribute> outputAttributes
+        List<Attribute> outputAttributes,
+        Map<String, FieldAttribute> lateFieldAttributes
     ) {}
 
     private enum LateMaterializationTarget {
@@ -1653,6 +1676,106 @@ public class ComputeService {
             .filter(FieldAttribute.class::isInstance)
             .map(FieldAttribute.class::cast)
             .collect(Collectors.toMap(FieldAttribute::name, field -> field, (left, right) -> left));
+    }
+
+    private static Map<String, FieldAttribute> lateFieldAttributes(PhysicalPlan plan) {
+        return plan.collect(node -> node instanceof org.elasticsearch.xpack.esql.plan.physical.FieldExtractExec)
+            .stream()
+            .map(org.elasticsearch.xpack.esql.plan.physical.FieldExtractExec.class::cast)
+            .flatMap(fieldExtract -> fieldExtract.attributesToExtract().stream())
+            .filter(FieldAttribute.class::isInstance)
+            .map(FieldAttribute.class::cast)
+            .collect(Collectors.toMap(FieldAttribute::name, field -> field, (left, right) -> left));
+    }
+
+    private static Map<String, FieldAttribute> parentFinalLateFieldAttributes(
+        PhysicalPlan mainPlan,
+        PhysicalPlan subplan,
+        ExchangeSinkExec originalDataNodePlan,
+        ReductionPlan reductionPlan
+    ) {
+        Map<String, FieldAttribute> lateFieldAttributes = new HashMap<>(lateFieldAttributes(subplan));
+        lateFieldAttributes.putAll(lateFieldAttributes(originalDataNodePlan, reductionPlan));
+        lateFieldAttributes.putAll(lateFieldAttributes(originalDataNodePlan, mainPlan));
+        lateFieldAttributes.putAll(lateFieldAttributes(mainPlan));
+        return lateFieldAttributes;
+    }
+
+    private static Map<String, FieldAttribute> lateFieldAttributes(ExchangeSinkExec originalDataNodePlan, PhysicalPlan parentPlan) {
+        Set<String> parentAttributeNames = new HashSet<>();
+        parentPlan.forEachExpressionDown(Attribute.class, attribute -> parentAttributeNames.add(attribute.name()));
+        Map<String, FieldAttribute> lateFieldAttributes = new HashMap<>();
+        PhysicalPlan dataNodeChild = originalDataNodePlan.child();
+        if (dataNodeChild instanceof FragmentExec fragmentExec
+            && fragmentExec.fragment() instanceof org.elasticsearch.xpack.esql.plan.logical.Project project) {
+            Map<String, FieldAttribute> fragmentFieldAttributes = new HashMap<>();
+            fragmentExec.fragment().forEachExpressionDown(FieldAttribute.class, field -> fragmentFieldAttributes.putIfAbsent(field.name(), field));
+            fragmentExec.fragment()
+                .collect(EsRelation.class)
+                .forEach(relation -> relation.output()
+                    .stream()
+                    .filter(FieldAttribute.class::isInstance)
+                    .map(FieldAttribute.class::cast)
+                    .forEach(field -> fragmentFieldAttributes.putIfAbsent(field.name(), field)));
+            for (NamedExpression projection : project.projections()) {
+                if (parentAttributeNames.contains(projection.name()) == false) {
+                    continue;
+                }
+                FieldAttribute fieldAttribute = null;
+                if (projection instanceof FieldAttribute field) {
+                    fieldAttribute = field;
+                } else if (projection instanceof Alias alias && alias.child() instanceof FieldAttribute field) {
+                    fieldAttribute = (FieldAttribute) field.withName(alias.name()).withId(alias.id());
+                }
+                if (fieldAttribute == null) {
+                    fieldAttribute = fragmentFieldAttributes.get(projection.name());
+                }
+                if (fieldAttribute != null) {
+                    lateFieldAttributes.putIfAbsent(projection.name(), fieldAttribute);
+                }
+            }
+        }
+        return lateFieldAttributes;
+    }
+
+    private static Map<String, FieldAttribute> lateFieldAttributes(ExchangeSinkExec originalDataNodePlan, ReductionPlan reductionPlan) {
+        Map<String, FieldAttribute> lateFieldAttributes = new HashMap<>(lateFieldAttributes(reductionPlan));
+        Set<String> passthroughNames = reductionPlan.dataNodePlan()
+            .output()
+            .stream()
+            .map(Attribute::name)
+            .collect(Collectors.toSet());
+        PhysicalPlan dataNodeChild = originalDataNodePlan.child();
+        if (dataNodeChild instanceof FragmentExec fragmentExec
+            && fragmentExec.fragment() instanceof org.elasticsearch.xpack.esql.plan.logical.Project project) {
+            Map<String, FieldAttribute> fragmentFieldAttributes = new HashMap<>();
+            fragmentExec.fragment().forEachExpressionDown(FieldAttribute.class, field -> fragmentFieldAttributes.putIfAbsent(field.name(), field));
+            fragmentExec.fragment()
+                .collect(EsRelation.class)
+                .forEach(relation -> relation.output()
+                    .stream()
+                    .filter(FieldAttribute.class::isInstance)
+                    .map(FieldAttribute.class::cast)
+                    .forEach(field -> fragmentFieldAttributes.putIfAbsent(field.name(), field)));
+            for (NamedExpression projection : project.projections()) {
+                if (passthroughNames.contains(projection.name())) {
+                    continue;
+                }
+                FieldAttribute fieldAttribute = null;
+                if (projection instanceof FieldAttribute field) {
+                    fieldAttribute = field;
+                } else if (projection instanceof Alias alias && alias.child() instanceof FieldAttribute field) {
+                    fieldAttribute = (FieldAttribute) field.withName(alias.name()).withId(alias.id());
+                }
+                if (fieldAttribute == null) {
+                    fieldAttribute = fragmentFieldAttributes.get(projection.name());
+                }
+                if (fieldAttribute != null) {
+                    lateFieldAttributes.putIfAbsent(projection.name(), fieldAttribute);
+                }
+            }
+        }
+        return lateFieldAttributes;
     }
 
     private static Attribute firstDocAttribute(List<Attribute> output) {
