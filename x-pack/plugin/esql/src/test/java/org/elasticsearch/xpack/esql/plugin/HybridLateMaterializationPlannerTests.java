@@ -309,6 +309,82 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         assertTrue("author extract should stay above rerank", authorExtract.child().anyMatch(RerankExec.class::isInstance));
     }
 
+    public void testFuseMainPlanRerankScoreFilterPrunesBeforeSecondFetch() {
+        Analyzer analyzer = booksAnalyzer();
+        PhysicalPlan plan = physicalPlan(
+            """
+                FROM books METADATA _score, _id, _index
+                | FORK
+                  ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
+                  ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
+                | FUSE
+                | SORT _score DESC, _id, _index
+                | LIMIT 4
+                | RERANK "Tolkien" ON title WITH { "inference_id" : "reranking-inference-id" }
+                | WHERE _score > 3.5
+                | SORT _score DESC, _id, _index
+                | LIMIT 1
+                | KEEP _score, _id, author
+                """,
+            analyzer
+        );
+        Tuple<List<PhysicalPlan>, PhysicalPlan> subplansAndMainPlan = PlannerUtils.breakPlanIntoSubPlansAndMainPlan(plan);
+        PhysicalPlan subplan = subplansAndMainPlan.v1().getFirst();
+        Tuple<PhysicalPlan, PhysicalPlan> coordinatorAndDataPlan = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(subplan, config);
+        ReductionPlan reductionPlan = reductionPlan((ExchangeSinkExec) coordinatorAndDataPlan.v2());
+        Attribute docAttribute = reductionPlan.dataNodePlan().output().stream().filter(EsQueryExec::isDocAttribute).findFirst().orElseThrow();
+
+        Map<String, FieldAttribute> mainLateFields = parentFinalLateFieldAttributes(
+            subplansAndMainPlan.v2(),
+            subplan,
+            (ExchangeSinkExec) coordinatorAndDataPlan.v2(),
+            reductionPlan
+        );
+        assertThat(mainLateFields.keySet(), equalTo(Set.of("title", "author")));
+
+        PhysicalPlan rewrittenMainPlan = mainPlanWithDocPassthrough(subplansAndMainPlan.v2(), docAttribute, mainLateFields);
+        PhysicalPlan optimizedMainPlan = PlannerUtils.localCoordinatorPlan(
+            PlannerSettings.DEFAULTS,
+            new EsqlFlags(false),
+            List.of(),
+            config,
+            FoldContext.small(),
+            rewrittenMainPlan,
+            new PlanTimeProfile()
+        );
+
+        AggregateExec fuseAggregate = optimizedMainPlan.collect(
+            node -> node instanceof AggregateExec aggregate && aggregate.child() instanceof FuseScoreEvalExec
+        ).stream().map(AggregateExec.class::cast).findFirst().orElseThrow();
+        assertThat(attributeNames(fuseAggregate.output()), hasItem("_doc"));
+        assertThat(attributeNames(fuseAggregate.output()), not(hasItem("title")));
+        assertThat(attributeNames(fuseAggregate.output()), not(hasItem("author")));
+
+        RerankExec rerank = optimizedMainPlan.collect(node -> node instanceof RerankExec)
+            .stream()
+            .map(RerankExec.class::cast)
+            .findFirst()
+            .orElseThrow();
+        assertThat(rerank.child(), instanceOf(FieldExtractExec.class));
+        FieldExtractExec rerankExtract = (FieldExtractExec) rerank.child();
+        assertThat(attributeNames(rerankExtract.attributesToExtract()), equalTo(Set.of("title")));
+        assertThat(rerankExtract.child(), instanceOf(TopNExec.class));
+
+        List<FieldExtractExec> extracts = fieldExtracts(optimizedMainPlan);
+        assertThat(extracts, hasSize(2));
+        assertThat(
+            extracts.stream().map(extract -> attributeNames(extract.attributesToExtract())).collect(Collectors.toSet()),
+            equalTo(Set.of(Set.of("title"), Set.of("author")))
+        );
+        FieldExtractExec authorExtract = extracts.stream()
+            .filter(extract -> attributeNames(extract.attributesToExtract()).equals(Set.of("author")))
+            .findFirst()
+            .orElseThrow();
+        assertThat(authorExtract.child(), instanceOf(TopNExec.class));
+        assertTrue("author extract should stay above the score filter", authorExtract.child().anyMatch(FilterExec.class::isInstance));
+        assertTrue("author extract should stay above rerank", authorExtract.child().anyMatch(RerankExec.class::isInstance));
+    }
+
     public void testFuseMainPlanFilterLateMaterializesDifferentFieldsAtTwoUseSites() {
         Analyzer analyzer = booksAnalyzer();
         PhysicalPlan plan = physicalPlan(

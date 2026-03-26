@@ -9,11 +9,14 @@ package org.elasticsearch.xpack.esql.action;
 
 import org.elasticsearch.action.index.IndexRequest;
 import org.elasticsearch.action.support.WriteRequest;
+import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.compute.lucene.read.ValuesSourceReaderOperatorStatus;
 import org.elasticsearch.compute.operator.OperatorStatus;
 import org.elasticsearch.inference.TaskType;
 import org.elasticsearch.test.ESIntegTestCase;
+import org.elasticsearch.xcontent.XContentType;
+import org.elasticsearch.xpack.core.inference.action.PutInferenceModelAction;
 import org.elasticsearch.xpack.esql.planner.PlannerSettings;
 import org.elasticsearch.xpack.esql.plugin.InferenceCommandIntegTestCase;
 import org.elasticsearch.xpack.esql.plugin.QueryPragmas;
@@ -21,23 +24,29 @@ import org.junit.After;
 import org.junit.Before;
 
 import java.io.IOException;
+import java.util.List;
+import java.util.Locale;
 
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
+import static org.elasticsearch.xpack.esql.EsqlTestUtils.getValuesList;
 import static org.elasticsearch.xpack.esql.action.EsqlQueryRequest.syncEsqlQueryRequest;
 import static org.hamcrest.Matchers.equalTo;
 
 @ESIntegTestCase.ClusterScope(numDataNodes = 1, numClientNodes = 0, supportsDedicatedMasters = false)
 public class EsqlHybridRerankLateMaterializationSingleNodeIT extends InferenceCommandIntegTestCase {
     private static final String RERANK_MODEL_ID = "test-hybrid-rerank-model";
+    private static final String RERANK_PRUNING_MODEL_ID = "test-hybrid-rerank-pruning-model";
 
     @Before
     public void setupRerankEndpoint() throws IOException {
         createTestInferenceEndpoint(RERANK_MODEL_ID, TaskType.RERANK, "test_reranking_service");
+        createDeterministicRerankEndpoint(RERANK_PRUNING_MODEL_ID);
     }
 
     @After
     public void cleanupRerankEndpoint() {
         deleteTestInferenceEndpoint(RERANK_MODEL_ID, TaskType.RERANK);
+        deleteTestInferenceEndpoint(RERANK_PRUNING_MODEL_ID, TaskType.RERANK);
     }
 
     @Override
@@ -116,6 +125,41 @@ public class EsqlHybridRerankLateMaterializationSingleNodeIT extends InferenceCo
         }
     }
 
+    public void testMainFinalScoreFilterPrunesBeforeSecondFetch() throws Exception {
+        String index = createAndPopulateBooksIndex();
+        String query = """
+            FROM %s METADATA _score, _id, _index
+            | FORK
+              ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
+              ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
+            | FUSE
+            | SORT _score DESC, _id, _index
+            | LIMIT 4
+            | RERANK "ignored" ON title WITH { "inference_id" : "%s" }
+            | WHERE _score > 3.5
+            | SORT _score DESC, _id, _index
+            | LIMIT 1
+            | KEEP _score, _id, author
+            """.formatted(index, RERANK_PRUNING_MODEL_ID);
+
+        try (var response = run(syncEsqlQueryRequest(query).pragmas(getPragmas()).profile(true))) {
+            assertThat(response.isPartial(), equalTo(false));
+            assertNotNull(response.profile());
+            List<List<Object>> values = getValuesList(response);
+            assertThat(values.size(), equalTo(1));
+            assertThat(values.getFirst().get(0), equalTo(4.0));
+            assertThat(values.getFirst().get(2), equalTo("William Faulkner"));
+            assertThat("data should not materialize title", driverFieldValuesLoaded(response, "data", "title"), equalTo(0L));
+            assertThat("data should not materialize author", driverFieldValuesLoaded(response, "data", "author"), equalTo(0L));
+            assertThat("subplan 0 final should not materialize title", driverFieldValuesLoaded(response, "subplan-0.final", "title"), equalTo(0L));
+            assertThat("subplan 0 final should not materialize author", driverFieldValuesLoaded(response, "subplan-0.final", "author"), equalTo(0L));
+            assertThat("subplan 1 final should not materialize title", driverFieldValuesLoaded(response, "subplan-1.final", "title"), equalTo(0L));
+            assertThat("subplan 1 final should not materialize author", driverFieldValuesLoaded(response, "subplan-1.final", "author"), equalTo(0L));
+            assertThat("main.final should materialize rerank title for the pre-rerank limit", driverFieldValuesLoaded(response, "main.final", "title"), equalTo(4L));
+            assertThat("main.final should materialize author only after score pruning and final limit", driverFieldValuesLoaded(response, "main.final", "author"), equalTo(1L));
+        }
+    }
+
     private String createAndPopulateBooksIndex() {
         String index = "books-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         assertAcked(
@@ -136,6 +180,34 @@ public class EsqlHybridRerankLateMaterializationSingleNodeIT extends InferenceCo
             .get();
         ensureYellow(index);
         return index;
+    }
+
+    private void createDeterministicRerankEndpoint(String modelId) throws IOException {
+        String config = String.format(
+            Locale.ROOT,
+            """
+                {
+                  "service": "test_reranking_service",
+                  "service_settings": {
+                    "model_id": "test-rerank",
+                    "api_key": "test-key"
+                  },
+                  "task_settings": {
+                    "min_score": 0.0,
+                    "result_diff": 1.0
+                  }
+                }
+                """
+        );
+
+        try {
+            client().execute(
+                PutInferenceModelAction.INSTANCE,
+                new PutInferenceModelAction.Request(TaskType.RERANK, modelId, new BytesArray(config), XContentType.JSON, TEST_REQUEST_TIMEOUT)
+            ).actionGet();
+        } catch (Exception e) {
+            logger.warn("Could not create deterministic rerank inference endpoint: {}", e.getMessage());
+        }
     }
 
     private static long driverFieldValuesLoaded(EsqlQueryResponse response, String driverName, String fieldName) {
