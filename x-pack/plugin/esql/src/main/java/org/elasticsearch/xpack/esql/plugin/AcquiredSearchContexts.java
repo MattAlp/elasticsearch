@@ -12,7 +12,7 @@ import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.search.internal.SearchContext;
 
-import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Function;
 import java.util.stream.IntStream;
@@ -23,12 +23,12 @@ import java.util.stream.IntStream;
  * via {@link #newSubRangeView(List)}, which also returns an {@link IndexedByShardId} of the slice.
  */
 class AcquiredSearchContexts implements Releasable {
-    private final ComputeSearchContext[] allContexts;
+    private final List<ComputeSearchContext> allContexts;
     private int nextAddIndex = 0;
     private boolean isClosed = false;
 
     AcquiredSearchContexts(int size) {
-        this.allContexts = new ComputeSearchContext[size];
+        this.allContexts = new ArrayList<>(size);
     }
 
     public synchronized boolean isEmpty() {
@@ -53,7 +53,7 @@ class AcquiredSearchContexts implements Releasable {
         checkNotClosed();
         var startingIndex = nextAddIndex;
         for (var cse : searchContexts) {
-            allContexts[nextAddIndex] = new ComputeSearchContext(nextAddIndex, cse);
+            allContexts.add(new ComputeSearchContext(nextAddIndex, cse));
             nextAddIndex++;
         }
         return new SubRanged<>(allContexts, startingIndex, nextAddIndex);
@@ -69,11 +69,10 @@ class AcquiredSearchContexts implements Releasable {
         public ComputeSearchContext get(int shardId) {
             synchronized (AcquiredSearchContexts.this) {
                 checkNotClosed();
-                var result = allContexts[shardId];
-                if (result == null) {
+                if (shardId < 0 || shardId >= nextAddIndex) {
                     throw new IndexOutOfBoundsException("shardId " + shardId + " out of bounds [0, " + nextAddIndex + ")");
                 }
-                return result;
+                return allContexts.get(shardId);
             }
         }
 
@@ -81,7 +80,7 @@ class AcquiredSearchContexts implements Releasable {
         public Iterable<ComputeSearchContext> iterable() {
             synchronized (AcquiredSearchContexts.this) {
                 checkNotClosed();
-                return Arrays.asList(allContexts).subList(0, nextAddIndex);
+                return allContexts.subList(0, nextAddIndex);
             }
         }
 
@@ -89,7 +88,7 @@ class AcquiredSearchContexts implements Releasable {
         public <S> IndexedByShardId<S> map(Function<ComputeSearchContext, S> mapper) {
             synchronized (AcquiredSearchContexts.this) {
                 checkNotClosed();
-                return new Mapped<>(this, allContexts.length, 0, mapper);
+                return new Mapped<>(this, allContexts.size(), 0, mapper);
             }
         }
 
@@ -122,12 +121,12 @@ class AcquiredSearchContexts implements Releasable {
      * it doesn't read past its initial bounds, so it's safe to read from the global array.
      */
     private static class SubRanged<T> implements IndexedByShardId<T> {
-        private final T[] array;
+        private final List<T> list;
         private final int from;
         private final int to;
 
-        SubRanged(T[] array, int from, int to) {
-            this.array = array;
+        SubRanged(List<T> list, int from, int to) {
+            this.list = list;
             this.from = from;
             this.to = to;
         }
@@ -138,12 +137,12 @@ class AcquiredSearchContexts implements Releasable {
                 throw new IndexOutOfBoundsException("shardId " + shardId + " out of bounds [" + from + ", " + to + ")");
             }
 
-            return array[shardId];
+            return list.get(shardId);
         }
 
         @Override
         public Iterable<? extends T> iterable() {
-            return Arrays.asList(array).subList(from, to);
+            return list.subList(from, to);
         }
 
         @Override
@@ -160,29 +159,33 @@ class AcquiredSearchContexts implements Releasable {
     // This class doesn't need to be synchronized since it delegates to the underlying IndexedByShardId, which is assumed to be thread-safe.
     private static class Mapped<T, S> implements IndexedByShardId<S> {
         private final IndexedByShardId<T> original;
-        private final S[] cache;
+        private final List<S> cache;
         private final int offset;
         private final Function<T, S> mapper;
 
-        @SuppressWarnings("unchecked")
         Mapped(IndexedByShardId<T> original, int size, int offset, Function<T, S> mapper) {
             this.original = original;
             this.mapper = mapper;
-            this.cache = (S[]) new Object[size];
+            this.cache = new ArrayList<>(size);
+            for (int i = 0; i < size; i++) {
+                cache.add(null);
+            }
             this.offset = offset;
         }
 
         @Override
         public S get(int shardId) {
             var fixedShardId = shardId - offset;
-            if (cache[fixedShardId] == null) {
+            ensureCacheCapacity(fixedShardId + 1);
+            if (cache.get(fixedShardId) == null) {
                 synchronized (this) {
-                    if (cache[fixedShardId] == null) {
-                        cache[fixedShardId] = mapper.apply(original.get(shardId));
+                    ensureCacheCapacity(fixedShardId + 1);
+                    if (cache.get(fixedShardId) == null) {
+                        cache.set(fixedShardId, mapper.apply(original.get(shardId)));
                     }
                 }
             }
-            return cache[fixedShardId];
+            return cache.get(fixedShardId);
         }
 
         @Override
@@ -197,7 +200,13 @@ class AcquiredSearchContexts implements Releasable {
 
         @Override
         public <U> IndexedByShardId<U> map(Function<S, U> anotherMapper) {
-            return new Mapped<>(this, cache.length, offset, anotherMapper);
+            return new Mapped<>(this, cache.size(), offset, anotherMapper);
+        }
+
+        private void ensureCacheCapacity(int size) {
+            while (cache.size() < size) {
+                cache.add(null);
+            }
         }
     }
 }

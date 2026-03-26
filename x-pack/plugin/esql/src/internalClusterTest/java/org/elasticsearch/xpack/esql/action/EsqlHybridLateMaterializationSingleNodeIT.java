@@ -65,7 +65,7 @@ public class EsqlHybridLateMaterializationSingleNodeIT extends AbstractEsqlInteg
         }
     }
 
-    public void testFuseSubplansLateMaterializeProjectionField() throws Exception {
+    public void testFuseMainFinalMaterializesProjectionField() throws Exception {
         String index = createAndPopulateBooksIndex();
         String query = """
             FROM %s METADATA _score, _id, _index
@@ -80,9 +80,10 @@ public class EsqlHybridLateMaterializationSingleNodeIT extends AbstractEsqlInteg
         try (var response = run(syncEsqlQueryRequest(query).pragmas(getPragmas()).profile(true))) {
             assertThat(response.isPartial(), equalTo(false));
             assertNotNull(response.profile());
-            assertTrue("first subplan final should materialize title", driverReadsField(response, "subplan-0.final", "title"));
-            assertTrue("second subplan final should materialize title", driverReadsField(response, "subplan-1.final", "title"));
-            assertFalse("data should not materialize title", driverReadsField(response, "data", "title"));
+            assertThat("data should not materialize title", driverFieldValuesLoaded(response, "data", "title"), equalTo(0L));
+            assertThat("subplan 0 final should not materialize title", driverFieldValuesLoaded(response, "subplan-0.final", "title"), equalTo(0L));
+            assertThat("subplan 1 final should not materialize title", driverFieldValuesLoaded(response, "subplan-1.final", "title"), equalTo(0L));
+            assertThat("main.final should materialize every fused title", driverFieldValuesLoaded(response, "main.final", "title"), equalTo(6L));
         }
     }
 
@@ -103,6 +104,29 @@ public class EsqlHybridLateMaterializationSingleNodeIT extends AbstractEsqlInteg
             assertNotNull(response.profile());
             assertThat("data should not materialize title", driverFieldValuesLoaded(response, "data", "title"), equalTo(0L));
             assertThat("final should only materialize the final two titles", driverFieldValuesLoaded(response, "final", "title"), equalTo(2L));
+        }
+    }
+
+    public void testMainFinalLateMaterializesSourceFieldAfterFuseLimit() throws Exception {
+        String index = createAndPopulateBooksIndex();
+        String query = """
+            FROM %s METADATA _score, _id, _index
+            | FORK
+              ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
+              ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
+            | FUSE
+            | SORT _score DESC, _id, _index
+            | LIMIT 2
+            | STATS total = SUM(LENGTH(title))
+            """.formatted(index);
+
+        try (var response = run(syncEsqlQueryRequest(query).pragmas(getPragmas()).profile(true))) {
+            assertThat(response.isPartial(), equalTo(false));
+            assertNotNull(response.profile());
+            assertThat("data should not materialize title", driverFieldValuesLoaded(response, "data", "title"), equalTo(0L));
+            assertThat("subplan 0 final should not materialize title", driverFieldValuesLoaded(response, "subplan-0.final", "title"), equalTo(0L));
+            assertThat("subplan 1 final should not materialize title", driverFieldValuesLoaded(response, "subplan-1.final", "title"), equalTo(0L));
+            assertThat("main.final should only materialize the fused top two titles", driverFieldValuesLoaded(response, "main.final", "title"), equalTo(2L));
         }
     }
 

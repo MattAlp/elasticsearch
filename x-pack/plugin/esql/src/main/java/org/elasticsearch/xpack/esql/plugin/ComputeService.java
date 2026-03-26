@@ -38,6 +38,7 @@ import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.index.Index;
+import org.elasticsearch.index.IndexMode;
 import org.elasticsearch.index.query.QueryBuilder;
 import org.elasticsearch.index.query.SearchExecutionContext;
 import org.elasticsearch.logging.LogManager;
@@ -59,8 +60,12 @@ import org.elasticsearch.xpack.esql.action.EsqlCapabilities;
 import org.elasticsearch.xpack.esql.action.EsqlExecutionInfo;
 import org.elasticsearch.xpack.esql.action.EsqlQueryAction;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
+import org.elasticsearch.xpack.esql.core.expression.Expression;
+import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
 import org.elasticsearch.xpack.esql.core.expression.FoldContext;
+import org.elasticsearch.xpack.esql.core.expression.NamedExpression;
 import org.elasticsearch.xpack.esql.core.util.Holder;
+import org.elasticsearch.xpack.esql.core.util.CollectionUtils;
 import org.elasticsearch.xpack.esql.datasources.FilterPushdownRegistry;
 import org.elasticsearch.xpack.esql.datasources.OperatorFactoryRegistry;
 import org.elasticsearch.xpack.esql.datasources.SplitCoalescer;
@@ -82,8 +87,10 @@ import org.elasticsearch.xpack.esql.plan.physical.ExchangeSinkExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSourceExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExternalSourceExec;
 import org.elasticsearch.xpack.esql.plan.physical.FragmentExec;
+import org.elasticsearch.xpack.esql.plan.physical.FuseScoreEvalExec;
 import org.elasticsearch.xpack.esql.plan.physical.OutputExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
+import org.elasticsearch.xpack.esql.plan.physical.ProjectExec;
 import org.elasticsearch.xpack.esql.plan.physical.TopNExec;
 import org.elasticsearch.xpack.esql.planner.EsPhysicalOperationProviders;
 import org.elasticsearch.xpack.esql.planner.LocalExecutionPlanner;
@@ -104,6 +111,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 import static org.elasticsearch.xpack.esql.action.EsqlExecutionInfo.IncludeExecutionMetadata.ALWAYS;
 import static org.elasticsearch.xpack.esql.plugin.EsqlPlugin.ESQL_WORKER_THREAD_POOL_NAME;
@@ -399,6 +407,28 @@ public class ComputeService {
             return;
         }
 
+        ForkLateMaterializationPlan forkLateMaterializationPlan = maybePlanForkLateMaterialization(
+            flags,
+            configuration,
+            foldContext,
+            subplans,
+            subplansAndMainPlan.v2(),
+            planTimeProfile
+        );
+        if (forkLateMaterializationPlan != null) {
+            executeForkLateMaterialization(
+                sessionId,
+                rootTask,
+                flags,
+                configuration,
+                foldContext,
+                execInfo,
+                listener,
+                forkLateMaterializationPlan
+            );
+            return;
+        }
+
         final List<Page> collectedPages = Collections.synchronizedList(new ArrayList<>());
         PhysicalPlan mainPlan = new OutputExec(subplansAndMainPlan.v2(), collectedPages::add);
 
@@ -648,7 +678,9 @@ public class ComputeService {
                 cancelQueryOnFailure,
                 exchangeSinkSupplier,
                 planTimeProfile,
-                listener
+                listener,
+                null,
+                LateMaterializationTarget.CURRENT_FINAL
             );
             return;
         }
@@ -882,6 +914,173 @@ public class ComputeService {
         }
     }
 
+    private ForkLateMaterializationPlan maybePlanForkLateMaterialization(
+        EsqlFlags flags,
+        Configuration configuration,
+        FoldContext foldContext,
+        List<PhysicalPlan> subplans,
+        PhysicalPlan mainPlan,
+        PlanTimeProfile planTimeProfile
+    ) {
+        if (subplans.isEmpty()
+            || configuration.pragmas().nodeLevelReduction() == false
+            || EsqlCapabilities.Cap.ENABLE_REDUCE_NODE_LATE_MATERIALIZATION.isEnabled() == false
+            || clusterService.state().nodes().getDataNodes().size() != 1
+            || mainPlan.anyMatch(FuseScoreEvalExec.class::isInstance) == false
+            || mainPlan.anyMatch(TopNExec.class::isInstance) == false) {
+            return null;
+        }
+
+        List<ForkSubplanLateMaterializationPlan> plannedSubplans = new ArrayList<>(subplans.size());
+        Map<String, FieldAttribute> lateFieldAttributes = new HashMap<>();
+        Attribute docAttribute = null;
+        for (PhysicalPlan subplan : subplans) {
+            Tuple<PhysicalPlan, PhysicalPlan> coordinatorAndDataNodePlan = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(subplan, configuration);
+            PhysicalPlan dataNodePhysicalPlan = coordinatorAndDataNodePlan.v2();
+            if (dataNodePhysicalPlan instanceof ExchangeSinkExec == false) {
+                return null;
+            }
+            ExchangeSinkExec dataNodePlan = (ExchangeSinkExec) dataNodePhysicalPlan;
+            Map<String, OriginalIndices> clusterToOriginalIndices = getIndices(subplan, EsRelation::originalIndices);
+            Map<String, OriginalIndices> clusterToConcreteIndices = getIndices(subplan, EsRelation::concreteIndices);
+            OriginalIndices localOriginalIndices = clusterToOriginalIndices.remove(LOCAL_CLUSTER);
+            OriginalIndices localConcreteIndices = clusterToConcreteIndices.remove(LOCAL_CLUSTER);
+            ReductionPlan reductionPlan = maybePlanLocalSingleNodeLateMaterialization(
+                flags,
+                configuration,
+                foldContext,
+                dataNodePlan,
+                localConcreteIndices,
+                localOriginalIndices,
+                clusterToConcreteIndices,
+                clusterToOriginalIndices,
+                planTimeProfile
+            );
+            if (reductionPlan == null) {
+                return null;
+            }
+            reductionPlan = reductionPlanForParentFinal(dataNodePlan, reductionPlan);
+            if (docAttribute == null) {
+                docAttribute = firstDocAttribute(reductionPlan.dataNodePlan().output());
+            }
+            lateFieldAttributes.putAll(lateFieldAttributes(reductionPlan));
+            plannedSubplans.add(
+                new ForkSubplanLateMaterializationPlan(
+                    coordinatorAndDataNodePlan.v1(),
+                    dataNodePlan,
+                    reductionPlan,
+                    localOriginalIndices,
+                    localConcreteIndices,
+                    subplan.output()
+                )
+            );
+        }
+        if (docAttribute == null || lateFieldAttributes.isEmpty()) {
+            return null;
+        }
+        return new ForkLateMaterializationPlan(plannedSubplans, mainPlanWithLateMaterialization(mainPlan, docAttribute, lateFieldAttributes));
+    }
+
+    private void executeForkLateMaterialization(
+        String sessionId,
+        CancellableTask rootTask,
+        EsqlFlags flags,
+        Configuration configuration,
+        FoldContext foldContext,
+        EsqlExecutionInfo execInfo,
+        ActionListener<Result> listener,
+        ForkLateMaterializationPlan forkLateMaterializationPlan
+    ) {
+        final List<Page> collectedPages = Collections.synchronizedList(new ArrayList<>());
+        PhysicalPlan mainPlan = new OutputExec(forkLateMaterializationPlan.mainPlan(), collectedPages::add);
+        listener = listener.delegateResponse((l, e) -> {
+            collectedPages.forEach(p -> Releasables.closeExpectNoException(p::releaseBlocks));
+            l.onFailure(e);
+        });
+
+        AcquiredSearchContexts sharedSearchContexts = new AcquiredSearchContexts(0);
+        listener = ActionListener.releaseAfter(listener, sharedSearchContexts);
+
+        var mainSessionId = newChildSession(sessionId);
+        QueryPragmas queryPragmas = configuration.pragmas();
+        ExchangeSourceHandler mainExchangeSource = new ExchangeSourceHandler(
+            queryPragmas.exchangeBufferSize(),
+            transportService.getThreadPool().executor(ThreadPool.Names.SEARCH)
+        );
+        exchangeService.addExchangeSourceHandler(mainSessionId, mainExchangeSource);
+        try (var ignored = mainExchangeSource.addEmptySink()) {
+            var finalListener = ActionListener.runBefore(listener, () -> exchangeService.removeExchangeSourceHandler(mainSessionId));
+            Runnable cancelQueryOnFailure = cancelQueryOnFailure(rootTask);
+            try (
+                ComputeListener localListener = new ComputeListener(
+                    transportService.getThreadPool(),
+                    cancelQueryOnFailure,
+                    finalListener.map(profiles -> {
+                        execInfo.markEndQuery();
+                        return new Result(mainPlan.output(), collectedPages, configuration, profiles, execInfo);
+                    })
+                )
+            ) {
+                runCompute(
+                    rootTask,
+                    new ComputeContext(
+                        mainSessionId,
+                        "main.final",
+                        LOCAL_CLUSTER,
+                        flags,
+                        sharedSearchContexts.globalView(),
+                        configuration,
+                        foldContext,
+                        mainExchangeSource::createExchangeSource,
+                        null
+                    ),
+                    mainPlan,
+                    plannerSettings.get(),
+                    LocalPhysicalOptimization.COORDINATOR_ONLY,
+                    null,
+                    localListener.acquireCompute()
+                );
+                for (int i = 0; i < forkLateMaterializationPlan.subplans().size(); i++) {
+                    ForkSubplanLateMaterializationPlan subplan = forkLateMaterializationPlan.subplans().get(i);
+                    var childSessionId = newChildSession(sessionId);
+                    ExchangeSinkHandler exchangeSink = exchangeService.createSinkHandler(childSessionId, queryPragmas.exchangeBufferSize());
+                    mainExchangeSource.addRemoteSink(exchangeSink::fetchPageAsync, true, () -> {}, 1, ActionListener.noop());
+                    var subPlanListener = localListener.acquireCompute();
+                    executeLocalSingleNodeLateMaterialization(
+                        childSessionId,
+                        rootTask,
+                        flags,
+                        configuration,
+                        foldContext,
+                        subplan.coordinatorPlan(),
+                        subplan.dataNodePlan(),
+                        subplan.reductionPlan(),
+                        subplan.localOriginalIndices(),
+                        subplan.localConcreteIndices(),
+                        Collections.synchronizedList(new ArrayList<>()),
+                        subplan.outputAttributes(),
+                        execInfo,
+                        "subplan-" + i,
+                        cancelQueryOnFailure,
+                        () -> exchangeSink.createExchangeSink(() -> {}),
+                        configuration.profile() ? new PlanTimeProfile() : null,
+                        ActionListener.wrap(result -> {
+                            exchangeSink.addCompletionListener(
+                                ActionListener.running(() -> { exchangeService.finishSinkHandler(childSessionId, null); })
+                            );
+                            subPlanListener.onResponse(result.completionInfo());
+                        }, e -> {
+                            exchangeService.finishSinkHandler(childSessionId, e);
+                            subPlanListener.onFailure(e);
+                        }),
+                        sharedSearchContexts,
+                        LateMaterializationTarget.PARENT_FINAL
+                    );
+                }
+            }
+        }
+    }
+
     /**
      * Detect the MVP case where late materialization can move all the way into the coordinator's final driver because
      * the coordinator and data-side work stay on the same node and there is no transport boundary to cross.
@@ -953,9 +1152,15 @@ public class ComputeService {
         Runnable cancelQueryOnFailure,
         Supplier<ExchangeSink> exchangeSinkSupplier,
         PlanTimeProfile planTimeProfile,
-        ActionListener<Result> listener
+        ActionListener<Result> listener,
+        AcquiredSearchContexts sharedSearchContexts,
+        LateMaterializationTarget lateMaterializationTarget
     ) {
-        final LocalLateMaterializationPlan lateMaterializationPlan = coordinatorPlanWithLateMaterialization(coordinatorPlan, reductionPlan);
+        final LocalLateMaterializationPlan lateMaterializationPlan = coordinatorPlanWithLateMaterialization(
+            coordinatorPlan,
+            reductionPlan,
+            lateMaterializationTarget
+        );
         final QueryBuilder requestFilter = PlannerUtils.canMatchFilter(
             flags,
             configuration,
@@ -987,7 +1192,8 @@ public class ComputeService {
                     exchangeSinkSupplier,
                     planTimeProfile,
                     listener,
-                    targetShards
+                    targetShards,
+                    sharedSearchContexts
                 ),
                 listener::onFailure
             )
@@ -1012,18 +1218,23 @@ public class ComputeService {
         Supplier<ExchangeSink> exchangeSinkSupplier,
         PlanTimeProfile planTimeProfile,
         ActionListener<Result> listener,
-        DataNodeRequestSender.TargetShards targetShards
+        DataNodeRequestSender.TargetShards targetShards,
+        AcquiredSearchContexts sharedSearchContexts
     ) {
         // Subplans can already use `sessionId` for their outer sink into main.final. Give the local-only
         // data->final exchange its own child session so the in-process producer does not collide with that sink.
         final String localExchangeSessionId = exchangeSinkSupplier == null ? sessionId : newChildSession(sessionId);
         // final borrows the same search contexts that the local data-side execution will populate. This is
         // the key difference from the normal coordinator path, which gives final an EmptyIndexedByShardId.
-        final AcquiredSearchContexts searchContexts = new AcquiredSearchContexts(targetShards.shards().size());
-        ActionListener<Result> resultListener = ActionListener.releaseAfter(
-            ActionListener.runBefore(listener, () -> exchangeService.removeExchangeSourceHandler(localExchangeSessionId)),
-            searchContexts
-        );
+        final AcquiredSearchContexts searchContexts = sharedSearchContexts == null
+            ? new AcquiredSearchContexts(targetShards.shards().size())
+            : sharedSearchContexts;
+        ActionListener<Result> resultListener = sharedSearchContexts == null
+            ? ActionListener.releaseAfter(
+                ActionListener.runBefore(listener, () -> exchangeService.removeExchangeSourceHandler(localExchangeSessionId)),
+                searchContexts
+            )
+            : ActionListener.runBefore(listener, () -> exchangeService.removeExchangeSourceHandler(localExchangeSessionId));
         final ExchangeSourceHandler exchangeSource = new ExchangeSourceHandler(
             configuration.pragmas().exchangeBufferSize(),
             transportService.getThreadPool().executor(ThreadPool.Names.SEARCH)
@@ -1293,8 +1504,12 @@ public class ComputeService {
 
     private static LocalLateMaterializationPlan coordinatorPlanWithLateMaterialization(
         PhysicalPlan coordinatorPlan,
-        ReductionPlan reductionPlan
+        ReductionPlan reductionPlan,
+        LateMaterializationTarget lateMaterializationTarget
     ) {
+        if (lateMaterializationTarget == LateMaterializationTarget.PARENT_FINAL) {
+            return coordinatorPlanForParentFinal(coordinatorPlan, reductionPlan);
+        }
         final boolean keepOriginalCoordinatorPipeline = coordinatorPlan.collect(TopNExec.class::isInstance).size() > 1;
         final AtomicBoolean replaced = new AtomicBoolean();
         PhysicalPlan updatedPlan = coordinatorPlan.transformUp(ExchangeSourceExec.class, exchangeSource -> {
@@ -1320,7 +1535,129 @@ public class ComputeService {
         );
     }
 
+    private static LocalLateMaterializationPlan coordinatorPlanForParentFinal(PhysicalPlan coordinatorPlan, ReductionPlan reductionPlan) {
+        Attribute docAttribute = firstDocAttribute(reductionPlan.dataNodePlan().output());
+        Map<String, FieldAttribute> lateFieldAttributes = lateFieldAttributes(reductionPlan);
+        final AtomicBoolean replaced = new AtomicBoolean();
+        PhysicalPlan updatedPlan = coordinatorPlan.transformUp(ExchangeSourceExec.class, exchangeSource -> {
+            if (replaced.compareAndSet(false, true)) {
+                List<Attribute> passthroughOutput = exchangeSource.output()
+                    .stream()
+                    .filter(attr -> lateFieldAttributes.containsKey(attr.name()) == false)
+                    .collect(Collectors.toCollection(ArrayList::new));
+                if (docAttribute != null) {
+                    passthroughOutput.add(0, docAttribute);
+                }
+                return new ExchangeSourceExec(exchangeSource.source(), passthroughOutput, exchangeSource.isIntermediateAgg());
+            }
+            return exchangeSource;
+        });
+        if (replaced.get() == false) {
+            throw new IllegalStateException("expected coordinator plan to contain an exchange source");
+        }
+        if (updatedPlan instanceof ExchangeSinkExec sink) {
+            PhysicalPlan sinkChild = sink.child();
+            if (sinkChild instanceof ProjectExec project) {
+                sinkChild = project.child();
+            }
+            updatedPlan = sink.replaceChildAndUpdateOutput(sinkChild);
+        }
+        return new LocalLateMaterializationPlan(updatedPlan, LocalPhysicalOptimization.ENABLED);
+    }
+
+    private static ReductionPlan reductionPlanForParentFinal(ExchangeSinkExec originalDataNodePlan, ReductionPlan reductionPlan) {
+        Attribute docAttribute = firstDocAttribute(reductionPlan.dataNodePlan().output());
+        if (docAttribute == null) {
+            return reductionPlan;
+        }
+        PhysicalPlan dataNodeChild = originalDataNodePlan.child();
+        if (dataNodeChild instanceof FragmentExec == false) {
+            return reductionPlan;
+        }
+        FragmentExec fragmentExec = (FragmentExec) dataNodeChild;
+        LogicalPlan fragment = fragmentExec.fragment();
+        if (fragment instanceof org.elasticsearch.xpack.esql.plan.logical.Project == false) {
+            return reductionPlan;
+        }
+        org.elasticsearch.xpack.esql.plan.logical.Project project =
+            (org.elasticsearch.xpack.esql.plan.logical.Project) fragment;
+
+        Map<String, FieldAttribute> lateFieldAttributes = lateFieldAttributes(reductionPlan);
+        List<NamedExpression> passthroughProjections = project.projections()
+            .stream()
+            .filter(projection -> lateFieldAttributes.containsKey(projection.name()) == false)
+            .map(NamedExpression.class::cast)
+            .collect(Collectors.toCollection(ArrayList::new));
+        passthroughProjections.add(0, docAttribute);
+
+        LogicalPlan withDocToRelation = project.child().transformUp(EsRelation.class, relation -> {
+            if (relation.indexMode() == IndexMode.LOOKUP) {
+                return relation;
+            }
+            return relation.withAttributes(CollectionUtils.prependToCopy(docAttribute, relation.output()));
+        });
+        FragmentExec updatedFragment = fragmentExec.withFragment(
+            new org.elasticsearch.xpack.esql.plan.logical.Project(project.source(), withDocToRelation, passthroughProjections)
+        );
+        ExchangeSinkExec updatedDataNodePlan = originalDataNodePlan.replaceChildAndUpdateOutput(updatedFragment);
+        return new ReductionPlan(reductionPlan.nodeReducePlan(), updatedDataNodePlan, reductionPlan.localPhysicalOptimization());
+    }
+
     private record LocalLateMaterializationPlan(PhysicalPlan plan, LocalPhysicalOptimization localPhysicalOptimization) {}
+
+    private record ForkLateMaterializationPlan(List<ForkSubplanLateMaterializationPlan> subplans, PhysicalPlan mainPlan) {}
+
+    private record ForkSubplanLateMaterializationPlan(
+        PhysicalPlan coordinatorPlan,
+        ExchangeSinkExec dataNodePlan,
+        ReductionPlan reductionPlan,
+        OriginalIndices localOriginalIndices,
+        OriginalIndices localConcreteIndices,
+        List<Attribute> outputAttributes
+    ) {}
+
+    private enum LateMaterializationTarget {
+        CURRENT_FINAL,
+        PARENT_FINAL
+    }
+
+    private static PhysicalPlan mainPlanWithLateMaterialization(
+        PhysicalPlan mainPlan,
+        Attribute docAttribute,
+        Map<String, FieldAttribute> lateFieldAttributes
+    ) {
+        return mainPlan.transformExpressionsDown(Expression.class, expression -> {
+            if (expression instanceof Attribute attribute) {
+                FieldAttribute lateField = lateFieldAttributes.get(attribute.name());
+                if (lateField != null) {
+                    return lateField.withId(attribute.id());
+                }
+            }
+            return expression;
+        }).transformUp(ExchangeSourceExec.class, exchangeSource -> {
+            List<Attribute> passthroughOutput = exchangeSource.output()
+                .stream()
+                .filter(attr -> lateFieldAttributes.containsKey(attr.name()) == false)
+                .collect(Collectors.toCollection(ArrayList::new));
+            passthroughOutput.add(0, docAttribute);
+            return new ExchangeSourceExec(exchangeSource.source(), passthroughOutput, exchangeSource.isIntermediateAgg());
+        });
+    }
+
+    private static Map<String, FieldAttribute> lateFieldAttributes(ReductionPlan reductionPlan) {
+        return reductionPlan.nodeReducePlan()
+            .collect(node -> node instanceof org.elasticsearch.xpack.esql.plan.physical.FieldExtractExec)
+            .stream()
+            .map(org.elasticsearch.xpack.esql.plan.physical.FieldExtractExec.class::cast)
+            .flatMap(fieldExtract -> fieldExtract.attributesToExtract().stream())
+            .filter(FieldAttribute.class::isInstance)
+            .map(FieldAttribute.class::cast)
+            .collect(Collectors.toMap(FieldAttribute::name, field -> field, (left, right) -> left));
+    }
+
+    private static Attribute firstDocAttribute(List<Attribute> output) {
+        return output.stream().filter(org.elasticsearch.xpack.esql.plan.physical.EsQueryExec::isDocAttribute).findFirst().orElse(null);
+    }
 
     private static List<DataNodeRequest.Shard> localShards(DataNodeRequestSender.TargetShards targetShards) {
         return targetShards.shards()

@@ -13,6 +13,8 @@ import org.elasticsearch.index.IndexMode;
 import org.elasticsearch.xpack.esql.EsqlTestUtils;
 import org.elasticsearch.xpack.esql.analysis.Analyzer;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
+import org.elasticsearch.xpack.esql.core.expression.Expression;
+import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
 import org.elasticsearch.xpack.esql.core.expression.FoldContext;
 import org.elasticsearch.xpack.esql.index.EsIndexGenerator;
 import org.elasticsearch.xpack.esql.index.IndexResolution;
@@ -23,9 +25,14 @@ import org.elasticsearch.xpack.esql.optimizer.PhysicalOptimizerContext;
 import org.elasticsearch.xpack.esql.optimizer.PhysicalPlanOptimizer;
 import org.elasticsearch.xpack.esql.parser.EsqlParser;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
+import org.elasticsearch.xpack.esql.plan.physical.AggregateExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSinkExec;
+import org.elasticsearch.xpack.esql.plan.physical.ExchangeSourceExec;
+import org.elasticsearch.xpack.esql.plan.physical.EsQueryExec;
 import org.elasticsearch.xpack.esql.plan.physical.FieldExtractExec;
+import org.elasticsearch.xpack.esql.plan.physical.FuseScoreEvalExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
+import org.elasticsearch.xpack.esql.plan.physical.TopNExec;
 import org.elasticsearch.xpack.esql.planner.PlannerSettings;
 import org.elasticsearch.xpack.esql.planner.PlannerUtils;
 import org.elasticsearch.xpack.esql.planner.mapper.Mapper;
@@ -41,6 +48,7 @@ import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.not;
 
 public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysicalPlanOptimizerTests {
@@ -113,6 +121,50 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         }
     }
 
+    public void testFuseMainPlanLateMaterializesFieldAfterGlobalLimit() {
+        Analyzer analyzer = booksAnalyzer();
+        PhysicalPlan plan = physicalPlan(
+            """
+                FROM books METADATA _score, _id, _index
+                | FORK
+                  ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
+                  ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
+                | FUSE
+                | SORT _score DESC, _id, _index
+                | LIMIT 2
+                | STATS total = SUM(LENGTH(title))
+                """,
+            analyzer
+        );
+        Tuple<List<PhysicalPlan>, PhysicalPlan> subplansAndMainPlan = PlannerUtils.breakPlanIntoSubPlansAndMainPlan(plan);
+        PhysicalPlan subplan = subplansAndMainPlan.v1().getFirst();
+        Tuple<PhysicalPlan, PhysicalPlan> coordinatorAndDataPlan = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(subplan, config);
+        ReductionPlan reductionPlan = reductionPlan((ExchangeSinkExec) coordinatorAndDataPlan.v2());
+        Attribute docAttribute = reductionPlan.dataNodePlan().output().stream().filter(EsQueryExec::isDocAttribute).findFirst().orElseThrow();
+
+        PhysicalPlan rewrittenMainPlan = mainPlanWithDocPassthrough(subplansAndMainPlan.v2(), docAttribute, lateFieldAttributes(reductionPlan));
+        PhysicalPlan optimizedMainPlan = PlannerUtils.localCoordinatorPlan(
+            PlannerSettings.DEFAULTS,
+            new EsqlFlags(false),
+            List.of(),
+            config,
+            FoldContext.small(),
+            rewrittenMainPlan,
+            new PlanTimeProfile()
+        );
+
+        AggregateExec fuseAggregate = optimizedMainPlan.collect(
+            node -> node instanceof AggregateExec aggregate && aggregate.child() instanceof FuseScoreEvalExec
+        ).stream().map(AggregateExec.class::cast).findFirst().orElseThrow();
+        assertThat(attributeNames(fuseAggregate.output()), hasItem("_doc"));
+        assertThat(attributeNames(fuseAggregate.output()), not(hasItem("title")));
+
+        List<FieldExtractExec> extracts = fieldExtracts(optimizedMainPlan);
+        assertThat(extracts, hasSize(1));
+        assertThat(attributeNames(extracts.getFirst().attributesToExtract()), equalTo(Set.of("title")));
+        assertThat(extracts.getFirst().child(), instanceOf(TopNExec.class));
+    }
+
     private Analyzer booksAnalyzer() {
         return makeAnalyzer(
             IndexResolution.valid(
@@ -160,5 +212,39 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
 
     private static Set<String> attributeNames(List<Attribute> attributes) {
         return attributes.stream().map(Attribute::name).collect(Collectors.toSet());
+    }
+
+    private static Map<String, FieldAttribute> lateFieldAttributes(ReductionPlan reductionPlan) {
+        return reductionPlan.nodeReducePlan()
+            .collect(node -> node instanceof FieldExtractExec)
+            .stream()
+            .map(FieldExtractExec.class::cast)
+            .flatMap(fieldExtract -> fieldExtract.attributesToExtract().stream())
+            .filter(FieldAttribute.class::isInstance)
+            .map(FieldAttribute.class::cast)
+            .collect(Collectors.toMap(FieldAttribute::name, field -> field, (left, right) -> left));
+    }
+
+    private static PhysicalPlan mainPlanWithDocPassthrough(
+        PhysicalPlan mainPlan,
+        Attribute docAttribute,
+        Map<String, FieldAttribute> lateFieldAttributes
+    ) {
+        return mainPlan.transformExpressionsDown(Expression.class, expression -> {
+            if (expression instanceof Attribute attribute) {
+                FieldAttribute lateField = lateFieldAttributes.get(attribute.name());
+                if (lateField != null) {
+                    return lateField.withId(attribute.id());
+                }
+            }
+            return expression;
+        }).transformUp(ExchangeSourceExec.class, exchangeSource -> {
+            List<Attribute> passthroughOutput = exchangeSource.output()
+                .stream()
+                .filter(attr -> lateFieldAttributes.containsKey(attr.name()) == false)
+                .collect(Collectors.toCollection(java.util.ArrayList::new));
+            passthroughOutput.add(0, docAttribute);
+            return new ExchangeSourceExec(exchangeSource.source(), passthroughOutput, exchangeSource.isIntermediateAgg());
+        });
     }
 }
