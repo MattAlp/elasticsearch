@@ -130,6 +130,36 @@ public class EsqlHybridLateMaterializationSingleNodeIT extends AbstractEsqlInteg
         }
     }
 
+    public void testMainFinalLateFilterMaterializesDifferentFieldsAtTwoUseSites() throws Exception {
+        String index = createAndPopulateBooksIndex();
+        String query = """
+            FROM %s METADATA _score, _id, _index
+            | FORK
+              ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
+              ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
+            | FUSE
+            | SORT _score DESC, _id, _index
+            | LIMIT 4
+            | WHERE LENGTH(author) > 3
+            | SORT _score DESC, _id, _index
+            | LIMIT 2
+            | KEEP _score, _id, title
+            """.formatted(index);
+
+        try (var response = run(syncEsqlQueryRequest(query).pragmas(getPragmas()).profile(true))) {
+            assertThat(response.isPartial(), equalTo(false));
+            assertNotNull(response.profile());
+            assertThat("data should not materialize author", driverFieldValuesLoaded(response, "data", "author"), equalTo(0L));
+            assertThat("data should not materialize title", driverFieldValuesLoaded(response, "data", "title"), equalTo(0L));
+            assertThat("subplan 0 final should not materialize author", driverFieldValuesLoaded(response, "subplan-0.final", "author"), equalTo(0L));
+            assertThat("subplan 0 final should not materialize title", driverFieldValuesLoaded(response, "subplan-0.final", "title"), equalTo(0L));
+            assertThat("subplan 1 final should not materialize author", driverFieldValuesLoaded(response, "subplan-1.final", "author"), equalTo(0L));
+            assertThat("subplan 1 final should not materialize title", driverFieldValuesLoaded(response, "subplan-1.final", "title"), equalTo(0L));
+            assertThat("main.final should materialize author only for the post-fuse limit", driverFieldValuesLoaded(response, "main.final", "author"), equalTo(4L));
+            assertThat("main.final should materialize title only for the final limit", driverFieldValuesLoaded(response, "main.final", "title"), equalTo(2L));
+        }
+    }
+
     private String createAndPopulateBooksIndex() {
         String index = "books-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
         assertAcked(
