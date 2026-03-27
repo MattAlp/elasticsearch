@@ -71,11 +71,43 @@ public class ComputeSearchContextByShardIdTests extends ESTestCase {
         }
     }
 
+    public void testSubrangeIterableStaysStableAfterLaterAdds() {
+        IndexedByShardId<ComputeSearchContext> firstRange = contexts.newSubRangeView(mockSearchContexts(CHUNK_SIZE));
+        contexts.newSubRangeView(mockSearchContexts(CHUNK_SIZE));
+
+        assertFalse(firstRange.isEmpty());
+        List<Integer> indices = new ArrayList<>();
+        firstRange.iterable().forEach(context -> indices.add(context.index()));
+        assertThat(indices, equalTo(IntStream.range(0, CHUNK_SIZE).boxed().toList()));
+    }
+
+    public void testSubrangeIterableStaysStableDuringConcurrentAdds() throws Exception {
+        IndexedByShardId<ComputeSearchContext> firstRange = contexts.newSubRangeView(mockSearchContexts(CHUNK_SIZE));
+        CountDownLatch start = new CountDownLatch(1);
+        Future<?> writer = executorService.submit(() -> {
+            try {
+                start.await();
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+            for (int i = 0; i < 200; i++) {
+                contexts.newSubRangeView(mockSearchContexts(CHUNK_SIZE));
+            }
+        });
+
+        start.countDown();
+        for (int i = 0; i < 500; i++) {
+            assertFalse(firstRange.isEmpty());
+            List<Integer> indices = new ArrayList<>();
+            firstRange.iterable().forEach(context -> indices.add(context.index()));
+            assertThat(indices, equalTo(IntStream.range(0, CHUNK_SIZE).boxed().toList()));
+        }
+        writer.get();
+    }
+
     private Runnable newWriter(ConcurrentHashMap<Integer, ComputeSearchContext> expected, CountDownLatch cdl) {
         return () -> {
-            List<SearchContext> newContexts = IntStream.range(0, CHUNK_SIZE)
-                .mapToObj(i -> Mockito.mock(SearchContext.class, Mockito.withSettings().stubOnly()))
-                .toList();
+            List<SearchContext> newContexts = mockSearchContexts(CHUNK_SIZE);
             contexts.newSubRangeView(newContexts).iterable().forEach(e -> expected.put(e.index(), e));
             try {
                 Thread.sleep(randomInt(10));
@@ -84,6 +116,10 @@ public class ComputeSearchContextByShardIdTests extends ESTestCase {
             }
             cdl.countDown();
         };
+    }
+
+    private static List<SearchContext> mockSearchContexts(int size) {
+        return IntStream.range(0, size).mapToObj(i -> Mockito.mock(SearchContext.class, Mockito.withSettings().stubOnly())).toList();
     }
 
     private static Runnable newReader(AtomicBoolean shouldContinue, IndexedByShardId<ComputeSearchContext> globalContexts) {

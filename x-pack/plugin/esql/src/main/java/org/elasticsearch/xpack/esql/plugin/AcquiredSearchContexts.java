@@ -80,7 +80,7 @@ class AcquiredSearchContexts implements Releasable {
         public Iterable<ComputeSearchContext> iterable() {
             synchronized (AcquiredSearchContexts.this) {
                 checkNotClosed();
-                return allContexts.subList(0, nextAddIndex);
+                return snapshotRange(allContexts, 0, nextAddIndex);
             }
         }
 
@@ -142,7 +142,7 @@ class AcquiredSearchContexts implements Releasable {
 
         @Override
         public Iterable<? extends T> iterable() {
-            return list.subList(from, to);
+            return snapshotRange(list, from, to);
         }
 
         @Override
@@ -154,6 +154,14 @@ class AcquiredSearchContexts implements Releasable {
         public <S> IndexedByShardId<S> map(Function<T, S> mapper) {
             return new Mapped<>(this, to - from, from, mapper);
         }
+    }
+
+    private static <T> List<T> snapshotRange(List<T> list, int from, int to) {
+        List<T> snapshot = new ArrayList<>(to - from);
+        for (int i = from; i < to; i++) {
+            snapshot.add(list.get(i));
+        }
+        return snapshot;
     }
 
     // This class doesn't need to be synchronized since it delegates to the underlying IndexedByShardId, which is assumed to be thread-safe.

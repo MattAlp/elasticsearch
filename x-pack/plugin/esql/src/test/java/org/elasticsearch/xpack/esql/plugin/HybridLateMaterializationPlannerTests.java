@@ -19,6 +19,7 @@ import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
 import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
 import org.elasticsearch.xpack.esql.core.expression.FoldContext;
+import org.elasticsearch.xpack.esql.core.expression.NamedExpression;
 import org.elasticsearch.xpack.esql.index.EsIndexGenerator;
 import org.elasticsearch.xpack.esql.index.IndexResolution;
 import org.elasticsearch.xpack.esql.optimizer.AbstractLocalPhysicalPlanOptimizerTests;
@@ -28,6 +29,7 @@ import org.elasticsearch.xpack.esql.optimizer.LogicalPlanOptimizer;
 import org.elasticsearch.xpack.esql.optimizer.PhysicalOptimizerContext;
 import org.elasticsearch.xpack.esql.optimizer.PhysicalPlanOptimizer;
 import org.elasticsearch.xpack.esql.parser.EsqlParser;
+import org.elasticsearch.xpack.esql.plan.logical.EsRelation;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.Materialize;
 import org.elasticsearch.xpack.esql.plan.logical.Project;
@@ -44,6 +46,7 @@ import org.elasticsearch.xpack.esql.plan.physical.FragmentExec;
 import org.elasticsearch.xpack.esql.plan.physical.FuseScoreEvalExec;
 import org.elasticsearch.xpack.esql.plan.physical.MaterializeExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
+import org.elasticsearch.xpack.esql.plan.physical.ProjectExec;
 import org.elasticsearch.xpack.esql.plan.physical.TopNExec;
 import org.elasticsearch.xpack.esql.plan.physical.inference.RerankExec;
 import org.elasticsearch.xpack.esql.planner.PlannerSettings;
@@ -111,10 +114,12 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         ExchangeSinkExec dataNodePlan = (ExchangeSinkExec) plans.v2();
         FragmentExec fragmentExec = (FragmentExec) dataNodePlan.child();
 
-        LogicalPlan materializedFragment = LateMaterializationPlanner.insertMaterializeBoundary(
+        LateMaterializationPlanner.MaterializeBoundaryFragment boundary = LateMaterializationPlanner.materializeBoundaryFragment(
             stats -> new LocalPhysicalOptimizerContext(PlannerSettings.DEFAULTS, new EsqlFlags(false), config, FoldContext.small(), stats),
-            fragmentExec.fragment()
+            fragmentExec.fragment(),
+            MaterializeTarget.CURRENT_FINAL
         ).orElseThrow();
+        LogicalPlan materializedFragment = boundary.project();
         assertThat(materializedFragment, instanceOf(Project.class));
 
         TopN topN = (TopN) ((Project) materializedFragment).child();
@@ -126,6 +131,114 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         assertThat(attributeNames(materialize.deferredAttributes()), equalTo(Set.of("salary")));
         assertThat(materialize.target(), equalTo(MaterializeTarget.CURRENT_FINAL));
         assertThat(materialize.mode(), equalTo(MaterializeMode.LOCAL));
+        assertThat(attributeNames(boundary.passthroughOutput()), equalTo(Set.of("_doc", "emp_no")));
+    }
+
+    public void testParentFinalReductionFragmentUsesMaterializeBoundaryMetadata() {
+        Analyzer analyzer = booksAnalyzer();
+        PhysicalPlan plan = physicalPlan("""
+            FROM books METADATA _score, _id, _index
+            | FORK
+              ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
+              ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
+            | FUSE
+            | SORT _score DESC, _id, _index
+            | LIMIT 4
+            | RERANK "Tolkien" ON title WITH { "inference_id" : "reranking-inference-id" }
+            | SORT _score DESC, _id, _index
+            | LIMIT 2
+            | STATS total = SUM(LENGTH(author))
+            """, analyzer);
+        Tuple<List<PhysicalPlan>, PhysicalPlan> subplansAndMainPlan = PlannerUtils.breakPlanIntoSubPlansAndMainPlan(plan);
+        PhysicalPlan subplan = subplansAndMainPlan.v1().getFirst();
+        Tuple<PhysicalPlan, PhysicalPlan> coordinatorAndDataPlan = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(subplan, config);
+        ExchangeSinkExec dataNodePlan = (ExchangeSinkExec) coordinatorAndDataPlan.v2();
+        ReductionPlan reductionPlan = reductionPlan(dataNodePlan);
+        Map<String, FieldAttribute> lateFields = parentFinalLateFieldAttributes(
+            subplansAndMainPlan.v2(),
+            subplan,
+            dataNodePlan,
+            reductionPlan
+        );
+        FragmentExec fragmentExec = (FragmentExec) dataNodePlan.child();
+
+        LateMaterializationPlanner.MaterializeBoundaryFragment boundary = LateMaterializationPlanner.materializeBoundaryFragment(
+            fragmentExec.fragment(),
+            lateFields.values().stream().sorted(java.util.Comparator.comparing(Attribute::name)).map(Attribute.class::cast).toList(),
+            MaterializeTarget.PARENT_FINAL
+        ).orElseThrow();
+        LogicalPlan materializedFragment = boundary.project();
+        assertThat(materializedFragment, instanceOf(Project.class));
+
+        TopN topN = (TopN) ((Project) materializedFragment).child();
+        assertThat(topN.child(), instanceOf(Materialize.class));
+        Materialize materialize = boundary.materialize();
+        assertThat(attributeNames(materialize.carryAttributes()), equalTo(Set.of("_score", "_id", "_index")));
+        assertThat(attributeNames(materialize.deferredAttributes()), equalTo(Set.of("title", "author")));
+        assertThat(materialize.target(), equalTo(MaterializeTarget.PARENT_FINAL));
+        assertThat(materialize.mode(), equalTo(MaterializeMode.LOCAL));
+        assertThat(attributeNames(boundary.passthroughOutput()), equalTo(Set.of("_doc", "_score", "_id", "_index")));
+
+        ExchangeSinkExec rewrittenDataPlan = dataNodePlanWithParentFinalBoundary(dataNodePlan, lateFields);
+        assertThat(attributeNames(rewrittenDataPlan.output()), equalTo(Set.of("_doc", "_score", "_id", "_index")));
+        FragmentExec rewrittenFragment = (FragmentExec) rewrittenDataPlan.child();
+        Project rewrittenProject = (Project) rewrittenFragment.fragment();
+        assertThat(
+            rewrittenProject.projections().stream().map(NamedExpression::name).collect(Collectors.toSet()),
+            equalTo(Set.of("_doc", "_score", "_id", "_index"))
+        );
+    }
+
+    public void testSupportedParentFinalReductionShapesAllExposeMaterializeBoundary() {
+        assertParentFinalReductionBoundary("""
+            FROM books METADATA _score, _id, _index
+            | FORK
+              ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
+              ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
+            | FUSE
+            | SORT _score DESC, _id, _index
+            | LIMIT 2
+            | STATS total = SUM(LENGTH(title))
+            """, Set.of("title"));
+        assertParentFinalReductionBoundary("""
+            FROM books METADATA _score, _id, _index
+            | FORK
+              ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
+              ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
+            | FUSE
+            | SORT _score DESC, _id, _index
+            | LIMIT 4
+            | RERANK "Tolkien" ON title WITH { "inference_id" : "reranking-inference-id" }
+            | SORT _score DESC, _id, _index
+            | LIMIT 2
+            | STATS total = SUM(LENGTH(author))
+            """, Set.of("title", "author"));
+        assertParentFinalReductionBoundary("""
+            FROM books METADATA _score, _id, _index
+            | FORK
+              ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
+              ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
+            | FUSE
+            | SORT _score DESC, _id, _index
+            | LIMIT 4
+            | WHERE LENGTH(author) > 3
+            | SORT _score DESC, _id, _index
+            | LIMIT 2
+            | KEEP _score, _id, title
+            """, Set.of("author", "title"));
+    }
+
+    public void testNonTopNReductionPlanStaysLocallyOptimizable() {
+        PhysicalPlan plan = physicalPlan("""
+            FROM books
+            | STATS total = COUNT(*)
+            """, booksAnalyzer());
+        Tuple<PhysicalPlan, PhysicalPlan> plans = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(plan, config);
+        assertThat(plans.v2(), instanceOf(ExchangeSinkExec.class));
+
+        ReductionPlan reductionPlan = reductionPlan((ExchangeSinkExec) plans.v2());
+        assertThat(reductionPlan.localPhysicalOptimization(), equalTo(LocalPhysicalOptimization.ENABLED));
+        assertThat(materializeExecs(reductionPlan.nodeReducePlan()), empty());
     }
 
     public void testFuseSubplansLateMaterializeBranchFields() {
@@ -361,6 +474,62 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
             .orElseThrow();
         assertThat(authorExtract.child(), instanceOf(TopNExec.class));
         assertTrue("author extract should stay above rerank", authorExtract.child().anyMatch(RerankExec.class::isInstance));
+    }
+
+    public void testParentFinalCoordinatorBoundaryLowersDeferredFieldsLocally() {
+        Analyzer analyzer = booksAnalyzer();
+        PhysicalPlan plan = physicalPlan("""
+            FROM books METADATA _score, _id, _index
+            | FORK
+              ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
+              ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
+            | FUSE
+            | SORT _score DESC, _id, _index
+            | LIMIT 4
+            | RERANK "Tolkien" ON title WITH { "inference_id" : "reranking-inference-id" }
+            | SORT _score DESC, _id, _index
+            | LIMIT 2
+            | STATS total = SUM(LENGTH(author))
+            """, analyzer);
+        Tuple<List<PhysicalPlan>, PhysicalPlan> subplansAndMainPlan = PlannerUtils.breakPlanIntoSubPlansAndMainPlan(plan);
+        PhysicalPlan subplan = subplansAndMainPlan.v1().getFirst();
+        Tuple<PhysicalPlan, PhysicalPlan> coordinatorAndDataPlan = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(subplan, config);
+        ReductionPlan reductionPlan = reductionPlan((ExchangeSinkExec) coordinatorAndDataPlan.v2());
+        Map<String, FieldAttribute> lateFields = parentFinalLateFieldAttributes(
+            subplansAndMainPlan.v2(),
+            subplan,
+            (ExchangeSinkExec) coordinatorAndDataPlan.v2(),
+            reductionPlan
+        );
+
+        PhysicalPlan rewrittenCoordinatorPlan = coordinatorPlanWithParentFinalBoundary(
+            coordinatorAndDataPlan.v1(),
+            reductionPlan,
+            lateFields
+        );
+        List<MaterializeExec> beforeLowering = materializeExecs(rewrittenCoordinatorPlan);
+        assertThat(beforeLowering, hasSize(1));
+        assertThat(attributeNames(beforeLowering.getFirst().deferredAttributes()), equalTo(Set.of("title", "author")));
+        assertThat(beforeLowering.getFirst().target(), equalTo(MaterializeTarget.PARENT_FINAL));
+        assertThat(attributeNames(beforeLowering.getFirst().child().output()), hasItem("title"));
+        assertThat(attributeNames(beforeLowering.getFirst().child().output()), hasItem("author"));
+
+        PhysicalPlan optimizedCoordinatorPlan = PlannerUtils.localCoordinatorPlan(
+            PlannerSettings.DEFAULTS,
+            new EsqlFlags(false),
+            List.of(),
+            config,
+            FoldContext.small(),
+            rewrittenCoordinatorPlan,
+            new PlanTimeProfile()
+        );
+        List<MaterializeExec> afterLowering = materializeExecs(optimizedCoordinatorPlan);
+        assertThat(afterLowering, hasSize(1));
+        assertThat(attributeNames(afterLowering.getFirst().deferredAttributes()), equalTo(Set.of("title", "author")));
+        assertThat(afterLowering.getFirst().target(), equalTo(MaterializeTarget.PARENT_FINAL));
+        assertThat(attributeNames(afterLowering.getFirst().child().output()), not(hasItem("title")));
+        assertThat(attributeNames(afterLowering.getFirst().child().output()), not(hasItem("author")));
+        assertThat(fieldExtracts(optimizedCoordinatorPlan), empty());
     }
 
     public void testFuseMainPlanRerankScoreFilterPrunesBeforeSecondFetch() {
@@ -727,6 +896,96 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
                 MaterializeMode.LOCAL
             );
         });
+    }
+
+    private static PhysicalPlan coordinatorPlanWithParentFinalBoundary(
+        PhysicalPlan coordinatorPlan,
+        ReductionPlan reductionPlan,
+        Map<String, FieldAttribute> lateFieldAttributes
+    ) {
+        Attribute docAttribute = reductionPlan.dataNodePlan().output().stream().filter(EsQueryExec::isDocAttribute).findFirst().orElseThrow();
+        var replaced = new java.util.concurrent.atomic.AtomicBoolean();
+        PhysicalPlan updatedPlan = coordinatorPlan.transformUp(ExchangeSourceExec.class, exchangeSource -> {
+            if (replaced.compareAndSet(false, true)) {
+                ExchangeSourceExec exchangeSourceWithDoc = exchangeSourceWithDoc(exchangeSource, docAttribute);
+                List<Attribute> deferredAttributes = lateFieldAttributes.values()
+                    .stream()
+                    .sorted(java.util.Comparator.comparing(Attribute::name))
+                    .map(Attribute.class::cast)
+                    .toList();
+                Set<String> deferredNames = deferredAttributes.stream().map(Attribute::name).collect(Collectors.toSet());
+                List<Attribute> carryAttributes = exchangeSourceWithDoc.output()
+                    .stream()
+                    .filter(attr -> EsQueryExec.isDocAttribute(attr) == false)
+                    .filter(attr -> deferredNames.contains(attr.name()) == false)
+                    .toList();
+                return new MaterializeExec(
+                    exchangeSource.source(),
+                    exchangeSourceWithDoc,
+                    docAttribute,
+                    carryAttributes,
+                    deferredAttributes,
+                    MaterializeTarget.PARENT_FINAL,
+                    MaterializeMode.LOCAL
+                );
+            }
+            return exchangeSource;
+        });
+        if (updatedPlan instanceof ExchangeSinkExec sink) {
+            PhysicalPlan sinkChild = sink.child();
+            if (sinkChild instanceof ProjectExec project) {
+                sinkChild = project.child();
+            }
+            List<Attribute> sinkOutput = sinkChild.output().stream().filter(attr -> lateFieldAttributes.containsKey(attr.name()) == false).toList();
+            updatedPlan = new ExchangeSinkExec(sink.source(), sinkOutput, sink.isIntermediateAgg(), sinkChild);
+        }
+        return updatedPlan;
+    }
+
+    private static ExchangeSinkExec dataNodePlanWithParentFinalBoundary(ExchangeSinkExec dataNodePlan, Map<String, FieldAttribute> lateFieldAttributes) {
+        FragmentExec fragmentExec = (FragmentExec) dataNodePlan.child();
+        Project project = (Project) fragmentExec.fragment();
+        LateMaterializationPlanner.MaterializeBoundaryFragment boundary = parentFinalReductionBoundary(dataNodePlan, lateFieldAttributes).orElseThrow();
+        FragmentExec updatedFragment = fragmentExec.withFragment(
+            new Project(project.source(), boundary.loweredTopN(), boundary.passthroughProjections(project.projections()))
+        );
+        return dataNodePlan.replaceChildAndUpdateOutput(updatedFragment);
+    }
+
+    private void assertParentFinalReductionBoundary(String query, Set<String> expectedDeferred) {
+        Analyzer analyzer = booksAnalyzer();
+        PhysicalPlan plan = physicalPlan(query, analyzer);
+        Tuple<List<PhysicalPlan>, PhysicalPlan> subplansAndMainPlan = PlannerUtils.breakPlanIntoSubPlansAndMainPlan(plan);
+        PhysicalPlan subplan = subplansAndMainPlan.v1().getFirst();
+        Tuple<PhysicalPlan, PhysicalPlan> coordinatorAndDataPlan = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(subplan, config);
+        ExchangeSinkExec dataNodePlan = (ExchangeSinkExec) coordinatorAndDataPlan.v2();
+        ReductionPlan reductionPlan = reductionPlan(dataNodePlan);
+        Map<String, FieldAttribute> lateFields = parentFinalLateFieldAttributes(
+            subplansAndMainPlan.v2(),
+            subplan,
+            dataNodePlan,
+            reductionPlan
+        );
+        LateMaterializationPlanner.MaterializeBoundaryFragment boundary = parentFinalReductionBoundary(dataNodePlan, lateFields).orElseThrow();
+        assertThat(attributeNames(boundary.materialize().deferredAttributes()), equalTo(expectedDeferred));
+        assertThat(boundary.materialize().target(), equalTo(MaterializeTarget.PARENT_FINAL));
+        assertThat(attributeNames(boundary.passthroughOutput()), equalTo(Set.of("_doc", "_score", "_id", "_index")));
+
+        ExchangeSinkExec rewrittenDataPlan = dataNodePlanWithParentFinalBoundary(dataNodePlan, lateFields);
+        assertThat(attributeNames(rewrittenDataPlan.output()), equalTo(attributeNames(boundary.passthroughOutput())));
+    }
+
+    private static java.util.Optional<LateMaterializationPlanner.MaterializeBoundaryFragment> parentFinalReductionBoundary(
+        ExchangeSinkExec dataNodePlan,
+        Map<String, FieldAttribute> lateFieldAttributes
+    ) {
+        FragmentExec fragmentExec = (FragmentExec) dataNodePlan.child();
+        Project project = (Project) fragmentExec.fragment();
+        return LateMaterializationPlanner.materializeBoundaryFragment(
+            project,
+            lateFieldAttributes.values().stream().sorted(java.util.Comparator.comparing(Attribute::name)).map(Attribute.class::cast).toList(),
+            MaterializeTarget.PARENT_FINAL
+        );
     }
 
     private static ExchangeSourceExec exchangeSourceWithDoc(ExchangeSourceExec exchangeSource, Attribute docAttribute) {

@@ -38,7 +38,6 @@ import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.index.Index;
-import org.elasticsearch.index.IndexMode;
 import org.elasticsearch.index.query.QueryBuilder;
 import org.elasticsearch.index.query.SearchExecutionContext;
 import org.elasticsearch.logging.LogManager;
@@ -65,7 +64,6 @@ import org.elasticsearch.xpack.esql.core.expression.Expression;
 import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
 import org.elasticsearch.xpack.esql.core.expression.FoldContext;
 import org.elasticsearch.xpack.esql.core.expression.NamedExpression;
-import org.elasticsearch.xpack.esql.core.util.CollectionUtils;
 import org.elasticsearch.xpack.esql.core.util.Holder;
 import org.elasticsearch.xpack.esql.datasources.FilterPushdownRegistry;
 import org.elasticsearch.xpack.esql.datasources.OperatorFactoryRegistry;
@@ -1551,9 +1549,12 @@ public class ComputeService {
                     reductionPlan.dataNodePlan().output(),
                     exchangeSource.isIntermediateAgg()
                 );
-                return docAttribute == null
-                    ? passthroughSource
-                    : withMaterializeBoundary(passthroughSource, docAttribute, lateFieldAttributes, MaterializeTarget.CURRENT_FINAL);
+                return exchangeSourceWithMaterializeBoundary(
+                    passthroughSource,
+                    docAttribute,
+                    lateFieldAttributes,
+                    MaterializeTarget.CURRENT_FINAL
+                );
             }
             return exchangeSource;
         });
@@ -1575,21 +1576,12 @@ public class ComputeService {
         final AtomicBoolean replaced = new AtomicBoolean();
         PhysicalPlan updatedPlan = coordinatorPlan.transformUp(ExchangeSourceExec.class, exchangeSource -> {
             if (replaced.compareAndSet(false, true)) {
-                List<Attribute> passthroughOutput = exchangeSource.output()
-                    .stream()
-                    .filter(attr -> lateFieldAttributes.containsKey(attr.name()) == false)
-                    .collect(Collectors.toCollection(ArrayList::new));
-                if (docAttribute != null) {
-                    passthroughOutput.add(0, docAttribute);
-                }
-                ExchangeSourceExec passthroughSource = new ExchangeSourceExec(
-                    exchangeSource.source(),
-                    passthroughOutput,
-                    exchangeSource.isIntermediateAgg()
+                return exchangeSourceWithMaterializeBoundary(
+                    exchangeSource,
+                    docAttribute,
+                    lateFieldAttributes,
+                    MaterializeTarget.PARENT_FINAL
                 );
-                return docAttribute == null
-                    ? passthroughSource
-                    : withMaterializeBoundary(passthroughSource, docAttribute, lateFieldAttributes, MaterializeTarget.PARENT_FINAL);
             }
             return exchangeSource;
         });
@@ -1601,9 +1593,13 @@ public class ComputeService {
             if (sinkChild instanceof ProjectExec project) {
                 sinkChild = project.child();
             }
-            updatedPlan = sink.replaceChildAndUpdateOutput(sinkChild);
+            List<Attribute> sinkOutput = sinkChild.output()
+                .stream()
+                .filter(attr -> lateFieldAttributes.containsKey(attr.name()) == false)
+                .toList();
+            updatedPlan = new ExchangeSinkExec(sink.source(), sinkOutput, sink.isIntermediateAgg(), sinkChild);
         }
-        return new LocalLateMaterializationPlan(updatedPlan, LocalPhysicalOptimization.ENABLED);
+        return new LocalLateMaterializationPlan(updatedPlan, LocalPhysicalOptimization.COORDINATOR_ONLY);
     }
 
     private static ReductionPlan reductionPlanForParentFinal(
@@ -1625,25 +1621,51 @@ public class ComputeService {
             return reductionPlan;
         }
         org.elasticsearch.xpack.esql.plan.logical.Project project = (org.elasticsearch.xpack.esql.plan.logical.Project) fragment;
+        java.util.Optional<ReductionPlan> boundaryDrivenReductionPlan = reductionPlanForParentFinalWithMaterializeBoundary(
+            originalDataNodePlan,
+            reductionPlan,
+            fragmentExec,
+            project,
+            lateFieldAttributes
+        );
+        if (boundaryDrivenReductionPlan.isPresent()) {
+            return boundaryDrivenReductionPlan.get();
+        }
+        // maybePlanLocalSingleNodeLateMaterialization only admits DISABLED reduction plans, and ComputeService.reductionPlan
+        // only produces DISABLED for the preplanned TopN late-materialization path. Non-TopN fragments therefore never
+        // reach this helper in the current single-node experiment surface.
+        return reductionPlan;
+    }
 
-        List<NamedExpression> passthroughProjections = project.projections()
+    private static java.util.Optional<ReductionPlan> reductionPlanForParentFinalWithMaterializeBoundary(
+        ExchangeSinkExec originalDataNodePlan,
+        ReductionPlan reductionPlan,
+        FragmentExec fragmentExec,
+        org.elasticsearch.xpack.esql.plan.logical.Project project,
+        Map<String, FieldAttribute> lateFieldAttributes
+    ) {
+        List<Attribute> deferredAttributes = lateFieldAttributes.values()
             .stream()
-            .filter(projection -> lateFieldAttributes.containsKey(projection.name()) == false)
-            .map(NamedExpression.class::cast)
-            .collect(Collectors.toCollection(ArrayList::new));
-        passthroughProjections.add(0, docAttribute);
-
-        LogicalPlan withDocToRelation = project.child().transformUp(EsRelation.class, relation -> {
-            if (relation.indexMode() == IndexMode.LOOKUP) {
-                return relation;
-            }
-            return relation.withAttributes(CollectionUtils.prependToCopy(docAttribute, relation.output()));
-        });
+            .sorted(java.util.Comparator.comparing(Attribute::name))
+            .map(Attribute.class::cast)
+            .toList();
+        LateMaterializationPlanner.MaterializeBoundaryFragment boundary = LateMaterializationPlanner.materializeBoundaryFragment(
+            project,
+            deferredAttributes,
+            MaterializeTarget.PARENT_FINAL
+        ).orElse(null);
+        if (boundary == null) {
+            return java.util.Optional.empty();
+        }
         FragmentExec updatedFragment = fragmentExec.withFragment(
-            new org.elasticsearch.xpack.esql.plan.logical.Project(project.source(), withDocToRelation, passthroughProjections)
+            new org.elasticsearch.xpack.esql.plan.logical.Project(
+                project.source(),
+                boundary.loweredTopN(),
+                boundary.passthroughProjections(project.projections())
+            )
         );
         ExchangeSinkExec updatedDataNodePlan = originalDataNodePlan.replaceChildAndUpdateOutput(updatedFragment);
-        return new ReductionPlan(reductionPlan.nodeReducePlan(), updatedDataNodePlan, reductionPlan.localPhysicalOptimization());
+        return java.util.Optional.of(new ReductionPlan(reductionPlan.nodeReducePlan(), updatedDataNodePlan, reductionPlan.localPhysicalOptimization()));
     }
 
     private record LocalLateMaterializationPlan(PhysicalPlan plan, LocalPhysicalOptimization localPhysicalOptimization) {}
@@ -1674,8 +1696,12 @@ public class ComputeService {
             }
             return expression;
         }).transformUp(ExchangeSourceExec.class, exchangeSource -> {
-            ExchangeSourceExec exchangeSourceWithDoc = exchangeSourceWithDoc(exchangeSource, docAttribute);
-            return withMaterializeBoundary(exchangeSourceWithDoc, docAttribute, lateFieldAttributes, MaterializeTarget.CURRENT_FINAL);
+            return exchangeSourceWithMaterializeBoundary(
+                exchangeSource,
+                docAttribute,
+                lateFieldAttributes,
+                MaterializeTarget.CURRENT_FINAL
+            );
         });
     }
 
@@ -1729,6 +1755,18 @@ public class ComputeService {
             .filter(attr -> deferredNames.contains(attr.name()) == false)
             .toList();
         return MaterializeExec.local(exchangeSource.source(), exchangeSource, docAttribute, carryAttributes, deferredAttributes, target);
+    }
+
+    private static PhysicalPlan exchangeSourceWithMaterializeBoundary(
+        ExchangeSourceExec exchangeSource,
+        Attribute docAttribute,
+        Map<String, FieldAttribute> lateFieldAttributes,
+        MaterializeTarget target
+    ) {
+        if (docAttribute == null) {
+            return exchangeSource;
+        }
+        return withMaterializeBoundary(exchangeSourceWithDoc(exchangeSource, docAttribute), docAttribute, lateFieldAttributes, target);
     }
 
     private static ExchangeSourceExec exchangeSourceWithDoc(ExchangeSourceExec exchangeSource, Attribute docAttribute) {
