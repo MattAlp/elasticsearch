@@ -88,6 +88,7 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         assertThat(materializeExecs, hasSize(1));
         assertThat(attributeNames(materializeExecs.getFirst().deferredAttributes()), equalTo(Set.of("salary")));
         assertThat(materializeExecs.getFirst().target(), equalTo(MaterializeTarget.CURRENT_FINAL));
+        assertThat(lateFieldAttributes(reductionPlan).keySet(), equalTo(Set.of("salary")));
     }
 
     public void testFuseSubplansLateMaterializeBranchFields() {
@@ -533,7 +534,10 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
     }
 
     private static Map<String, FieldAttribute> lateFieldAttributes(ReductionPlan reductionPlan) {
-        return lateFieldAttributes(reductionPlan.nodeReducePlan());
+        Map<String, FieldAttribute> materializedLateFieldAttributes = lateFieldAttributesFromMaterializeBoundary(
+            reductionPlan.nodeReducePlan()
+        );
+        return materializedLateFieldAttributes.isEmpty() ? lateFieldAttributes(reductionPlan.nodeReducePlan()) : materializedLateFieldAttributes;
     }
 
     private static Map<String, FieldAttribute> lateFieldAttributes(PhysicalPlan plan) {
@@ -541,6 +545,16 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
             .stream()
             .map(FieldExtractExec.class::cast)
             .flatMap(fieldExtract -> fieldExtract.attributesToExtract().stream())
+            .filter(FieldAttribute.class::isInstance)
+            .map(FieldAttribute.class::cast)
+            .collect(Collectors.toMap(FieldAttribute::name, field -> field, (left, right) -> left));
+    }
+
+    private static Map<String, FieldAttribute> lateFieldAttributesFromMaterializeBoundary(PhysicalPlan plan) {
+        return plan.collect(MaterializeExec.class::isInstance)
+            .stream()
+            .map(MaterializeExec.class::cast)
+            .flatMap(materialize -> materialize.deferredAttributes().stream())
             .filter(FieldAttribute.class::isInstance)
             .map(FieldAttribute.class::cast)
             .collect(Collectors.toMap(FieldAttribute::name, field -> field, (left, right) -> left));
