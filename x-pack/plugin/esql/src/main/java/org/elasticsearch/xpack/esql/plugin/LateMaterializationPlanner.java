@@ -24,7 +24,6 @@ import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.Materialize;
 import org.elasticsearch.xpack.esql.plan.logical.Project;
 import org.elasticsearch.xpack.esql.plan.logical.TopN;
-import org.elasticsearch.xpack.esql.plan.materialize.MaterializeMode;
 import org.elasticsearch.xpack.esql.plan.materialize.MaterializeTarget;
 import org.elasticsearch.xpack.esql.plan.physical.EsQueryExec;
 import org.elasticsearch.xpack.esql.plan.physical.EstimatesRowSize;
@@ -106,26 +105,19 @@ class LateMaterializationPlanner {
         }
 
         LocalPhysicalOptimizerContext context = contextFactory.apply(SEARCH_STATS_TOP_N_REPLACEMENT);
-        PhysicalPlan mappedReductionPlan = toPhysical(fragmentExec.fragment(), context);
-        List<Attribute> deferredAttributes = lateMaterializeAttributes(mappedReductionPlan);
-
-        MaterializeBoundaryFragment boundary = materializeBoundaryFragment(
-            fragmentExec.fragment(),
-            deferredAttributes,
-            MaterializeTarget.CURRENT_FINAL
-        ).orElse(null);
-        LogicalPlan reductionFragment = boundary == null ? fragmentExec.fragment() : boundary.project();
+        LogicalPlan reductionFragment = InsertMaterializePhase.apply(context, fragmentExec.fragment(), MaterializeTarget.CURRENT_FINAL)
+            .orElse(fragmentExec.fragment());
+        MaterializeBoundaryFragment boundary = InsertMaterializePhase.materializeBoundaryFragment(reductionFragment).orElse(null);
+        PhysicalPlan mappedReductionPlan = toPhysical(reductionFragment, context);
+        List<Attribute> deferredAttributes = boundary == null ? lateMaterializeAttributes(mappedReductionPlan) : boundary.materialize()
+            .deferredAttributes();
         Project reductionProject = reductionFragment instanceof Project p ? p : null;
         if (reductionProject == null || (reductionProject.child() instanceof TopN) == false) {
             return Optional.empty();
         }
         topLevelProject = reductionProject;
         topN = (TopN) reductionProject.child();
-        Materialize materialize = topN.child() instanceof Materialize m ? m : null;
-        if (boundary != null) {
-            mappedReductionPlan = toPhysical(reductionFragment, context);
-            deferredAttributes = boundary.materialize().deferredAttributes();
-        }
+        Materialize materialize = boundary == null ? null : boundary.materialize();
 
         Attribute doc;
         List<Attribute> expectedDataOutput;
@@ -199,7 +191,7 @@ class LateMaterializationPlanner {
         return Optional.of(new ReductionPlan(reductionPlanWithSize, updatedDataPlan, LocalPhysicalOptimization.DISABLED));
     }
 
-    private static PhysicalPlan toPhysical(LogicalPlan plan, LocalPhysicalOptimizerContext context) {
+    static PhysicalPlan toPhysical(LogicalPlan plan, LocalPhysicalOptimizerContext context) {
         PhysicalPlan mapped = new ReplaceSourceAttributes().apply(LocalMapper.INSTANCE.map(plan));
         mapped = new LowerLocalMaterialize().apply(mapped, context);
         return new InsertFieldExtraction().apply(mapped, context);
@@ -209,7 +201,8 @@ class LateMaterializationPlanner {
         Function<SearchStats, LocalPhysicalOptimizerContext> contextFactory,
         LogicalPlan fragment
     ) {
-        return materializeBoundaryFragment(contextFactory, fragment, MaterializeTarget.CURRENT_FINAL).map(MaterializeBoundaryFragment::project);
+        LocalPhysicalOptimizerContext context = contextFactory.apply(SEARCH_STATS_TOP_N_REPLACEMENT);
+        return InsertMaterializePhase.apply(context, fragment, MaterializeTarget.CURRENT_FINAL);
     }
 
     static Optional<MaterializeBoundaryFragment> materializeBoundaryFragment(
@@ -218,8 +211,7 @@ class LateMaterializationPlanner {
         MaterializeTarget target
     ) {
         LocalPhysicalOptimizerContext context = contextFactory.apply(SEARCH_STATS_TOP_N_REPLACEMENT);
-        List<Attribute> deferredAttributes = lateMaterializeAttributes(toPhysical(fragment, context));
-        return materializeBoundaryFragment(fragment, deferredAttributes, target);
+        return InsertMaterializePhase.materializeBoundaryFragment(context, fragment, target);
     }
 
     static Optional<MaterializeBoundaryFragment> materializeBoundaryFragment(
@@ -227,7 +219,7 @@ class LateMaterializationPlanner {
         List<? extends Attribute> lateAttributes,
         MaterializeTarget target
     ) {
-        return insertMaterializeBoundary(fragment, lateAttributes, target).flatMap(LateMaterializationPlanner::materializeBoundaryFragment);
+        return InsertMaterializePhase.materializeBoundaryFragment(fragment, lateAttributes, target);
     }
 
     static Optional<LogicalPlan> insertMaterializeBoundary(
@@ -235,84 +227,7 @@ class LateMaterializationPlanner {
         List<? extends Attribute> lateAttributes,
         MaterializeTarget target
     ) {
-        Project topLevelProject = fragment instanceof Project p ? p : null;
-        if (topLevelProject == null) {
-            return Optional.empty();
-        }
-        TopN topN = topLevelProject.child() instanceof TopN tn ? tn : null;
-        if (topN == null) {
-            return Optional.empty();
-        }
-        if (topN.child() instanceof Materialize) {
-            return Optional.of(fragment);
-        }
-        if (lateAttributes.isEmpty()) {
-            return Optional.empty();
-        }
-
-        AttributeSet orderRefsSet = AttributeSet.of(topN.order().stream().flatMap(o -> o.references().stream()).toList());
-        Attribute doc = new FieldAttribute(topN.source(), null, null, EsQueryExec.DOC_ID_FIELD.getName(), EsQueryExec.DOC_ID_FIELD);
-        LogicalPlan childWithDoc = topN.child().transformUp(EsRelation.class, r -> {
-            if (r.indexMode() == IndexMode.LOOKUP || r.output().stream().anyMatch(EsQueryExec::isDocAttribute)) {
-                return r;
-            }
-            return r.withAttributes(CollectionUtils.prependToCopy(doc, r.output()));
-        });
-        TopN topNWithDoc = topN.replaceChild(childWithDoc);
-        if (topNWithDoc.output().stream().noneMatch(EsQueryExec::isDocAttribute)) {
-            return Optional.empty();
-        }
-
-        List<Attribute> outputAttributes = new ArrayList<>();
-        for (Attribute attribute : topNWithDoc.output()) {
-            if (EsQueryExec.isDocAttribute(attribute)
-                || topLevelProject.outputSet().contains(attribute)
-                || orderRefsSet.contains(attribute)) {
-                outputAttributes.add(attribute);
-            }
-        }
-
-        java.util.Set<String> deferredNames = lateAttributes.stream().map(Attribute::name).collect(Collectors.toSet());
-        List<Attribute> materializeDeferredAttributes = outputAttributes.stream()
-            .filter(attr -> EsQueryExec.isDocAttribute(attr) == false)
-            .filter(attr -> deferredNames.contains(attr.name()))
-            .toList();
-        if (materializeDeferredAttributes.isEmpty()) {
-            return Optional.empty();
-        }
-
-        AttributeSet deferredOutputSet = AttributeSet.of(materializeDeferredAttributes);
-        List<Attribute> carryAttributes = outputAttributes.stream()
-            .filter(attr -> EsQueryExec.isDocAttribute(attr) == false)
-            .filter(attr -> deferredOutputSet.contains(attr) == false)
-            .toList();
-        Materialize materialize = new Materialize(
-            topN.source(),
-            topNWithDoc.child(),
-            outputAttributes,
-            doc,
-            carryAttributes,
-            materializeDeferredAttributes,
-            target,
-            MaterializeMode.LOCAL
-        );
-        return Optional.of(topLevelProject.replaceChild(topNWithDoc.replaceChild(materialize)));
-    }
-
-    private static Optional<MaterializeBoundaryFragment> materializeBoundaryFragment(LogicalPlan fragment) {
-        if (fragment instanceof Project == false) {
-            return Optional.empty();
-        }
-        Project project = (Project) fragment;
-        if (project.child() instanceof TopN == false) {
-            return Optional.empty();
-        }
-        TopN topN = (TopN) project.child();
-        if (topN.child() instanceof Materialize == false) {
-            return Optional.empty();
-        }
-        Materialize materialize = (Materialize) topN.child();
-        return Optional.of(new MaterializeBoundaryFragment(project, topN, materialize));
+        return InsertMaterializePhase.apply(fragment, lateAttributes, target);
     }
 
     record MaterializeBoundaryFragment(Project project, TopN topN, Materialize materialize) {
@@ -343,7 +258,7 @@ class LateMaterializationPlanner {
         }
     }
 
-    private static List<Attribute> lateMaterializeAttributes(PhysicalPlan plan) {
+    static List<Attribute> lateMaterializeAttributes(PhysicalPlan plan) {
         return new ArrayList<>(
             plan.collect(FieldExtractExec.class::isInstance)
                 .stream()

@@ -114,12 +114,12 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         ExchangeSinkExec dataNodePlan = (ExchangeSinkExec) plans.v2();
         FragmentExec fragmentExec = (FragmentExec) dataNodePlan.child();
 
-        LateMaterializationPlanner.MaterializeBoundaryFragment boundary = LateMaterializationPlanner.materializeBoundaryFragment(
+        LogicalPlan materializedFragment = LateMaterializationPlanner.insertMaterializeBoundary(
             stats -> new LocalPhysicalOptimizerContext(PlannerSettings.DEFAULTS, new EsqlFlags(false), config, FoldContext.small(), stats),
-            fragmentExec.fragment(),
-            MaterializeTarget.CURRENT_FINAL
+            fragmentExec.fragment()
         ).orElseThrow();
-        LogicalPlan materializedFragment = boundary.project();
+        LateMaterializationPlanner.MaterializeBoundaryFragment boundary = InsertMaterializePhase.materializeBoundaryFragment(materializedFragment)
+            .orElseThrow();
         assertThat(materializedFragment, instanceOf(Project.class));
 
         TopN topN = (TopN) ((Project) materializedFragment).child();
@@ -162,7 +162,7 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         );
         FragmentExec fragmentExec = (FragmentExec) dataNodePlan.child();
 
-        LateMaterializationPlanner.MaterializeBoundaryFragment boundary = LateMaterializationPlanner.materializeBoundaryFragment(
+        LateMaterializationPlanner.MaterializeBoundaryFragment boundary = InsertMaterializePhase.materializeBoundaryFragment(
             fragmentExec.fragment(),
             lateFields.values().stream().sorted(java.util.Comparator.comparing(Attribute::name)).map(Attribute.class::cast).toList(),
             MaterializeTarget.PARENT_FINAL
@@ -981,7 +981,7 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
     ) {
         FragmentExec fragmentExec = (FragmentExec) dataNodePlan.child();
         Project project = (Project) fragmentExec.fragment();
-        return LateMaterializationPlanner.materializeBoundaryFragment(
+        return InsertMaterializePhase.materializeBoundaryFragment(
             project,
             lateFieldAttributes.values().stream().sorted(java.util.Comparator.comparing(Attribute::name)).map(Attribute.class::cast).toList(),
             MaterializeTarget.PARENT_FINAL
