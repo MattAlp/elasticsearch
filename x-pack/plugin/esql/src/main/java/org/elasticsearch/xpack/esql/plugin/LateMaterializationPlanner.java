@@ -21,20 +21,25 @@ import org.elasticsearch.xpack.esql.plan.logical.EsRelation;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.Project;
 import org.elasticsearch.xpack.esql.plan.logical.TopN;
+import org.elasticsearch.xpack.esql.plan.materialize.MaterializeTarget;
 import org.elasticsearch.xpack.esql.plan.physical.EsQueryExec;
 import org.elasticsearch.xpack.esql.plan.physical.EstimatesRowSize;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSinkExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSourceExec;
+import org.elasticsearch.xpack.esql.plan.physical.FieldExtractExec;
 import org.elasticsearch.xpack.esql.plan.physical.FragmentExec;
+import org.elasticsearch.xpack.esql.plan.physical.MaterializeExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
 import org.elasticsearch.xpack.esql.plan.physical.TopNExec;
 import org.elasticsearch.xpack.esql.planner.mapper.LocalMapper;
 import org.elasticsearch.xpack.esql.stats.SearchStats;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
 * Modify a {@link Project} that follows a {@link TopN} such that it tries to minimize field extraction on the data driver.
@@ -131,8 +136,13 @@ class LateMaterializationPlanner {
         ExchangeSinkExec updatedDataPlan = originalPlan.replaceChildAndUpdateOutput(updatedFragmentExec);
 
         // Replace the TopN child with the data driver as the source.
-        PhysicalPlan reductionPlan = toPhysical(fragmentExec.fragment(), context).transformDown(TopNExec.class, t -> {
+        PhysicalPlan mappedReductionPlan = toPhysical(fragmentExec.fragment(), context);
+        List<Attribute> deferredAttributes = lateMaterializeAttributes(mappedReductionPlan);
+        PhysicalPlan reductionPlan = mappedReductionPlan.transformDown(TopNExec.class, t -> {
             PhysicalPlan exchangeExec = new ExchangeSourceExec(topN.source(), expectedDataOutput, false /* isIntermediateAgg */);
+            if (deferredAttributes.isEmpty() == false) {
+                exchangeExec = MaterializeExec.local(topN.source(), exchangeExec, doc, deferredAttributes, MaterializeTarget.CURRENT_FINAL);
+            }
             // If the fragment is already sorted, tell the node-reduce TopN that its input will be sorted already
             boolean fragmentIsSorted = updatedFragment.child() instanceof TopN;
             return fragmentIsSorted ? t.replaceChild(exchangeExec).withSortedInput() : t.replaceChild(exchangeExec);
@@ -147,6 +157,18 @@ class LateMaterializationPlanner {
 
     private static PhysicalPlan toPhysical(LogicalPlan plan, LocalPhysicalOptimizerContext context) {
         return new InsertFieldExtraction().apply(new ReplaceSourceAttributes().apply(LocalMapper.INSTANCE.map(plan)), context);
+    }
+
+    private static List<Attribute> lateMaterializeAttributes(PhysicalPlan plan) {
+        return new ArrayList<>(
+            plan.collect(FieldExtractExec.class::isInstance)
+                .stream()
+                .map(FieldExtractExec.class::cast)
+                .filter(fieldExtract -> fieldExtract.child().anyMatch(TopNExec.class::isInstance))
+                .flatMap(fieldExtract -> fieldExtract.attributesToExtract().stream())
+                .collect(Collectors.toMap(Attribute::name, attribute -> attribute, (left, right) -> left, LinkedHashMap::new))
+                .values()
+        );
     }
 
     private LateMaterializationPlanner() { /* static class */ }

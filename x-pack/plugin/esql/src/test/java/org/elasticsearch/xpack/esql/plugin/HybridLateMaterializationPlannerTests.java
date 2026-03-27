@@ -28,13 +28,15 @@ import org.elasticsearch.xpack.esql.optimizer.PhysicalOptimizerContext;
 import org.elasticsearch.xpack.esql.optimizer.PhysicalPlanOptimizer;
 import org.elasticsearch.xpack.esql.parser.EsqlParser;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
+import org.elasticsearch.xpack.esql.plan.materialize.MaterializeTarget;
 import org.elasticsearch.xpack.esql.plan.physical.AggregateExec;
+import org.elasticsearch.xpack.esql.plan.physical.EsQueryExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSinkExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSourceExec;
-import org.elasticsearch.xpack.esql.plan.physical.EsQueryExec;
 import org.elasticsearch.xpack.esql.plan.physical.FieldExtractExec;
 import org.elasticsearch.xpack.esql.plan.physical.FilterExec;
 import org.elasticsearch.xpack.esql.plan.physical.FuseScoreEvalExec;
+import org.elasticsearch.xpack.esql.plan.physical.MaterializeExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
 import org.elasticsearch.xpack.esql.plan.physical.TopNExec;
 import org.elasticsearch.xpack.esql.plan.physical.inference.RerankExec;
@@ -63,18 +65,15 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
     }
 
     public void testEvalBetweenTopNsLateMaterializesScoringField() {
-        ReductionPlan reductionPlan = reductionPlan(
-            """
-                FROM test
-                | KEEP emp_no, salary
-                | SORT emp_no
-                | LIMIT 20
-                | EVAL my_score = salary + 1
-                | SORT my_score
-                | LIMIT 5
-                """,
-            makeAnalyzer("mapping-basic.json")
-        );
+        ReductionPlan reductionPlan = reductionPlan("""
+            FROM test
+            | KEEP emp_no, salary
+            | SORT emp_no
+            | LIMIT 20
+            | EVAL my_score = salary + 1
+            | SORT my_score
+            | LIMIT 5
+            """, makeAnalyzer("mapping-basic.json"));
 
         assertThat(reductionPlan.localPhysicalOptimization(), equalTo(LocalPhysicalOptimization.DISABLED));
         assertThat(fieldExtracts(reductionPlan.dataNodePlan()), empty());
@@ -85,22 +84,23 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         List<FieldExtractExec> reductionExtracts = fieldExtracts(reductionPlan.nodeReducePlan());
         assertThat(reductionExtracts, hasSize(1));
         assertThat(attributeNames(reductionExtracts.getFirst().attributesToExtract()), equalTo(Set.of("salary")));
+        List<MaterializeExec> materializeExecs = materializeExecs(reductionPlan.nodeReducePlan());
+        assertThat(materializeExecs, hasSize(1));
+        assertThat(attributeNames(materializeExecs.getFirst().deferredAttributes()), equalTo(Set.of("salary")));
+        assertThat(materializeExecs.getFirst().target(), equalTo(MaterializeTarget.CURRENT_FINAL));
     }
 
     public void testFuseSubplansLateMaterializeBranchFields() {
         Analyzer analyzer = booksAnalyzer();
-        PhysicalPlan plan = physicalPlan(
-            """
-                FROM books METADATA _id, _index, _score
-                | FORK
-                  ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
-                  ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
-                | FUSE
-                | SORT _score DESC, _id, _index
-                | KEEP _score, _id, title
-                """,
-            analyzer
-        );
+        PhysicalPlan plan = physicalPlan("""
+            FROM books METADATA _id, _index, _score
+            | FORK
+              ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
+              ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
+            | FUSE
+            | SORT _score DESC, _id, _index
+            | KEEP _score, _id, title
+            """, analyzer);
 
         Tuple<List<PhysicalPlan>, PhysicalPlan> subplansAndMainPlan = PlannerUtils.breakPlanIntoSubPlansAndMainPlan(plan);
         assertThat(subplansAndMainPlan.v1(), hasSize(2));
@@ -128,24 +128,26 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
 
     public void testFuseMainPlanLateMaterializesFieldAfterGlobalLimit() {
         Analyzer analyzer = booksAnalyzer();
-        PhysicalPlan plan = physicalPlan(
-            """
-                FROM books METADATA _score, _id, _index
-                | FORK
-                  ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
-                  ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
-                | FUSE
-                | SORT _score DESC, _id, _index
-                | LIMIT 2
-                | STATS total = SUM(LENGTH(title))
-                """,
-            analyzer
-        );
+        PhysicalPlan plan = physicalPlan("""
+            FROM books METADATA _score, _id, _index
+            | FORK
+              ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
+              ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
+            | FUSE
+            | SORT _score DESC, _id, _index
+            | LIMIT 2
+            | STATS total = SUM(LENGTH(title))
+            """, analyzer);
         Tuple<List<PhysicalPlan>, PhysicalPlan> subplansAndMainPlan = PlannerUtils.breakPlanIntoSubPlansAndMainPlan(plan);
         PhysicalPlan subplan = subplansAndMainPlan.v1().getFirst();
         Tuple<PhysicalPlan, PhysicalPlan> coordinatorAndDataPlan = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(subplan, config);
         ReductionPlan reductionPlan = reductionPlan((ExchangeSinkExec) coordinatorAndDataPlan.v2());
-        Attribute docAttribute = reductionPlan.dataNodePlan().output().stream().filter(EsQueryExec::isDocAttribute).findFirst().orElseThrow();
+        Attribute docAttribute = reductionPlan.dataNodePlan()
+            .output()
+            .stream()
+            .filter(EsQueryExec::isDocAttribute)
+            .findFirst()
+            .orElseThrow();
 
         PhysicalPlan rewrittenMainPlan = mainPlanWithDocPassthrough(
             subplansAndMainPlan.v2(),
@@ -168,6 +170,11 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         assertThat(attributeNames(fuseAggregate.output()), hasItem("_doc"));
         assertThat(attributeNames(fuseAggregate.output()), not(hasItem("title")));
 
+        List<MaterializeExec> materializeExecs = materializeExecs(optimizedMainPlan);
+        assertThat(materializeExecs, hasSize(1));
+        assertThat(attributeNames(materializeExecs.getFirst().deferredAttributes()), equalTo(Set.of("title")));
+        assertThat(materializeExecs.getFirst().target(), equalTo(MaterializeTarget.CURRENT_FINAL));
+
         List<FieldExtractExec> extracts = fieldExtracts(optimizedMainPlan);
         assertThat(extracts, hasSize(1));
         assertThat(attributeNames(extracts.getFirst().attributesToExtract()), equalTo(Set.of("title")));
@@ -176,27 +183,29 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
 
     public void testFuseMainPlanRerankLateMaterializesFieldAfterFuseLimit() {
         Analyzer analyzer = booksAnalyzer();
-        PhysicalPlan plan = physicalPlan(
-            """
-                FROM books METADATA _score, _id, _index
-                | FORK
-                  ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
-                  ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
-                | FUSE
-                | SORT _score DESC, _id, _index
-                | LIMIT 4
-                | RERANK "Tolkien" ON title WITH { "inference_id" : "reranking-inference-id" }
-                | SORT _score DESC, _id, _index
-                | LIMIT 2
-                | KEEP _score, _id, title
-                """,
-            analyzer
-        );
+        PhysicalPlan plan = physicalPlan("""
+            FROM books METADATA _score, _id, _index
+            | FORK
+              ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
+              ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
+            | FUSE
+            | SORT _score DESC, _id, _index
+            | LIMIT 4
+            | RERANK "Tolkien" ON title WITH { "inference_id" : "reranking-inference-id" }
+            | SORT _score DESC, _id, _index
+            | LIMIT 2
+            | KEEP _score, _id, title
+            """, analyzer);
         Tuple<List<PhysicalPlan>, PhysicalPlan> subplansAndMainPlan = PlannerUtils.breakPlanIntoSubPlansAndMainPlan(plan);
         PhysicalPlan subplan = subplansAndMainPlan.v1().getFirst();
         Tuple<PhysicalPlan, PhysicalPlan> coordinatorAndDataPlan = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(subplan, config);
         ReductionPlan reductionPlan = reductionPlan((ExchangeSinkExec) coordinatorAndDataPlan.v2());
-        Attribute docAttribute = reductionPlan.dataNodePlan().output().stream().filter(EsQueryExec::isDocAttribute).findFirst().orElseThrow();
+        Attribute docAttribute = reductionPlan.dataNodePlan()
+            .output()
+            .stream()
+            .filter(EsQueryExec::isDocAttribute)
+            .findFirst()
+            .orElseThrow();
 
         Map<String, FieldAttribute> mainLateFields = new java.util.HashMap<>(lateFieldAttributes(subplansAndMainPlan.v2()));
         mainLateFields.putAll(lateFieldAttributes(subplan));
@@ -237,27 +246,29 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
 
     public void testFuseMainPlanRerankLateMaterializesSecondFieldAfterPostRerankLimit() {
         Analyzer analyzer = booksAnalyzer();
-        PhysicalPlan plan = physicalPlan(
-            """
-                FROM books METADATA _score, _id, _index
-                | FORK
-                  ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
-                  ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
-                | FUSE
-                | SORT _score DESC, _id, _index
-                | LIMIT 4
-                | RERANK "Tolkien" ON title WITH { "inference_id" : "reranking-inference-id" }
-                | SORT _score DESC, _id, _index
-                | LIMIT 2
-                | STATS total = SUM(LENGTH(author))
-                """,
-            analyzer
-        );
+        PhysicalPlan plan = physicalPlan("""
+            FROM books METADATA _score, _id, _index
+            | FORK
+              ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
+              ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
+            | FUSE
+            | SORT _score DESC, _id, _index
+            | LIMIT 4
+            | RERANK "Tolkien" ON title WITH { "inference_id" : "reranking-inference-id" }
+            | SORT _score DESC, _id, _index
+            | LIMIT 2
+            | STATS total = SUM(LENGTH(author))
+            """, analyzer);
         Tuple<List<PhysicalPlan>, PhysicalPlan> subplansAndMainPlan = PlannerUtils.breakPlanIntoSubPlansAndMainPlan(plan);
         PhysicalPlan subplan = subplansAndMainPlan.v1().getFirst();
         Tuple<PhysicalPlan, PhysicalPlan> coordinatorAndDataPlan = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(subplan, config);
         ReductionPlan reductionPlan = reductionPlan((ExchangeSinkExec) coordinatorAndDataPlan.v2());
-        Attribute docAttribute = reductionPlan.dataNodePlan().output().stream().filter(EsQueryExec::isDocAttribute).findFirst().orElseThrow();
+        Attribute docAttribute = reductionPlan.dataNodePlan()
+            .output()
+            .stream()
+            .filter(EsQueryExec::isDocAttribute)
+            .findFirst()
+            .orElseThrow();
 
         Map<String, FieldAttribute> mainLateFields = parentFinalLateFieldAttributes(
             subplansAndMainPlan.v2(),
@@ -285,6 +296,11 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         assertThat(attributeNames(fuseAggregate.output()), not(hasItem("title")));
         assertThat(attributeNames(fuseAggregate.output()), not(hasItem("author")));
 
+        List<MaterializeExec> materializeExecs = materializeExecs(optimizedMainPlan);
+        assertThat(materializeExecs, hasSize(1));
+        assertThat(attributeNames(materializeExecs.getFirst().deferredAttributes()), equalTo(Set.of("title", "author")));
+        assertThat(materializeExecs.getFirst().target(), equalTo(MaterializeTarget.CURRENT_FINAL));
+
         RerankExec rerank = optimizedMainPlan.collect(node -> node instanceof RerankExec)
             .stream()
             .map(RerankExec.class::cast)
@@ -311,28 +327,30 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
 
     public void testFuseMainPlanRerankScoreFilterPrunesBeforeSecondFetch() {
         Analyzer analyzer = booksAnalyzer();
-        PhysicalPlan plan = physicalPlan(
-            """
-                FROM books METADATA _score, _id, _index
-                | FORK
-                  ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
-                  ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
-                | FUSE
-                | SORT _score DESC, _id, _index
-                | LIMIT 4
-                | RERANK "Tolkien" ON title WITH { "inference_id" : "reranking-inference-id" }
-                | WHERE _score > 3.5
-                | SORT _score DESC, _id, _index
-                | LIMIT 1
-                | KEEP _score, _id, author
-                """,
-            analyzer
-        );
+        PhysicalPlan plan = physicalPlan("""
+            FROM books METADATA _score, _id, _index
+            | FORK
+              ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
+              ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
+            | FUSE
+            | SORT _score DESC, _id, _index
+            | LIMIT 4
+            | RERANK "Tolkien" ON title WITH { "inference_id" : "reranking-inference-id" }
+            | WHERE _score > 3.5
+            | SORT _score DESC, _id, _index
+            | LIMIT 1
+            | KEEP _score, _id, author
+            """, analyzer);
         Tuple<List<PhysicalPlan>, PhysicalPlan> subplansAndMainPlan = PlannerUtils.breakPlanIntoSubPlansAndMainPlan(plan);
         PhysicalPlan subplan = subplansAndMainPlan.v1().getFirst();
         Tuple<PhysicalPlan, PhysicalPlan> coordinatorAndDataPlan = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(subplan, config);
         ReductionPlan reductionPlan = reductionPlan((ExchangeSinkExec) coordinatorAndDataPlan.v2());
-        Attribute docAttribute = reductionPlan.dataNodePlan().output().stream().filter(EsQueryExec::isDocAttribute).findFirst().orElseThrow();
+        Attribute docAttribute = reductionPlan.dataNodePlan()
+            .output()
+            .stream()
+            .filter(EsQueryExec::isDocAttribute)
+            .findFirst()
+            .orElseThrow();
 
         Map<String, FieldAttribute> mainLateFields = parentFinalLateFieldAttributes(
             subplansAndMainPlan.v2(),
@@ -387,27 +405,29 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
 
     public void testFuseMainPlanFilterLateMaterializesDifferentFieldsAtTwoUseSites() {
         Analyzer analyzer = booksAnalyzer();
-        PhysicalPlan plan = physicalPlan(
-            """
-                FROM books METADATA _score, _id, _index
-                | FORK
-                  ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
-                  ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
-                | FUSE
-                | SORT _score DESC, _id, _index
-                | LIMIT 4
-                | WHERE LENGTH(author) > 3
-                | SORT _score DESC, _id, _index
-                | LIMIT 2
-                | KEEP _score, _id, title
-                """,
-            analyzer
-        );
+        PhysicalPlan plan = physicalPlan("""
+            FROM books METADATA _score, _id, _index
+            | FORK
+              ( WHERE author:"Tolkien" | SORT _score DESC, _id DESC | LIMIT 3 )
+              ( WHERE author:"Faulkner" | SORT _score DESC, _id DESC | LIMIT 3 )
+            | FUSE
+            | SORT _score DESC, _id, _index
+            | LIMIT 4
+            | WHERE LENGTH(author) > 3
+            | SORT _score DESC, _id, _index
+            | LIMIT 2
+            | KEEP _score, _id, title
+            """, analyzer);
         Tuple<List<PhysicalPlan>, PhysicalPlan> subplansAndMainPlan = PlannerUtils.breakPlanIntoSubPlansAndMainPlan(plan);
         PhysicalPlan subplan = subplansAndMainPlan.v1().getFirst();
         Tuple<PhysicalPlan, PhysicalPlan> coordinatorAndDataPlan = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(subplan, config);
         ReductionPlan reductionPlan = reductionPlan((ExchangeSinkExec) coordinatorAndDataPlan.v2());
-        Attribute docAttribute = reductionPlan.dataNodePlan().output().stream().filter(EsQueryExec::isDocAttribute).findFirst().orElseThrow();
+        Attribute docAttribute = reductionPlan.dataNodePlan()
+            .output()
+            .stream()
+            .filter(EsQueryExec::isDocAttribute)
+            .findFirst()
+            .orElseThrow();
 
         Map<String, FieldAttribute> mainLateFields = parentFinalLateFieldAttributes(
             subplansAndMainPlan.v2(),
@@ -460,11 +480,7 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
 
     private Analyzer booksAnalyzer() {
         IndexResolution indexResolution = IndexResolution.valid(
-            EsIndexGenerator.esIndex(
-                "books",
-                EsqlTestUtils.loadMapping("mapping-books.json"),
-                Map.of("books", IndexMode.STANDARD)
-            )
+            EsIndexGenerator.esIndex("books", EsqlTestUtils.loadMapping("mapping-books.json"), Map.of("books", IndexMode.STANDARD))
         );
         return AnalyzerTestUtils.analyzer(
             AnalyzerTestUtils.indexResolutions(indexResolution),
@@ -508,19 +524,16 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         return plan.collect(node -> node instanceof FieldExtractExec).stream().map(FieldExtractExec.class::cast).toList();
     }
 
+    private static List<MaterializeExec> materializeExecs(PhysicalPlan plan) {
+        return plan.collect(MaterializeExec.class::isInstance).stream().map(MaterializeExec.class::cast).toList();
+    }
+
     private static Set<String> attributeNames(List<Attribute> attributes) {
         return attributes.stream().map(Attribute::name).collect(Collectors.toSet());
     }
 
     private static Map<String, FieldAttribute> lateFieldAttributes(ReductionPlan reductionPlan) {
-        return reductionPlan.nodeReducePlan()
-            .collect(node -> node instanceof FieldExtractExec)
-            .stream()
-            .map(FieldExtractExec.class::cast)
-            .flatMap(fieldExtract -> fieldExtract.attributesToExtract().stream())
-            .filter(FieldAttribute.class::isInstance)
-            .map(FieldAttribute.class::cast)
-            .collect(Collectors.toMap(FieldAttribute::name, field -> field, (left, right) -> left));
+        return lateFieldAttributes(reductionPlan.nodeReducePlan());
     }
 
     private static Map<String, FieldAttribute> lateFieldAttributes(PhysicalPlan plan) {
@@ -540,14 +553,17 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         if (dataNodeChild instanceof org.elasticsearch.xpack.esql.plan.physical.FragmentExec fragmentExec
             && fragmentExec.fragment() instanceof org.elasticsearch.xpack.esql.plan.logical.Project project) {
             Map<String, FieldAttribute> fragmentFieldAttributes = new java.util.HashMap<>();
-            fragmentExec.fragment().forEachExpressionDown(FieldAttribute.class, field -> fragmentFieldAttributes.putIfAbsent(field.name(), field));
+            fragmentExec.fragment()
+                .forEachExpressionDown(FieldAttribute.class, field -> fragmentFieldAttributes.putIfAbsent(field.name(), field));
             fragmentExec.fragment()
                 .collect(org.elasticsearch.xpack.esql.plan.logical.EsRelation.class)
-                .forEach(relation -> relation.output()
-                    .stream()
-                    .filter(FieldAttribute.class::isInstance)
-                    .map(FieldAttribute.class::cast)
-                    .forEach(field -> fragmentFieldAttributes.putIfAbsent(field.name(), field)));
+                .forEach(
+                    relation -> relation.output()
+                        .stream()
+                        .filter(FieldAttribute.class::isInstance)
+                        .map(FieldAttribute.class::cast)
+                        .forEach(field -> fragmentFieldAttributes.putIfAbsent(field.name(), field))
+                );
             for (var projection : project.projections()) {
                 if (passthroughNames.contains(projection.name())) {
                     continue;
@@ -590,14 +606,17 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         if (dataNodeChild instanceof org.elasticsearch.xpack.esql.plan.physical.FragmentExec fragmentExec
             && fragmentExec.fragment() instanceof org.elasticsearch.xpack.esql.plan.logical.Project project) {
             Map<String, FieldAttribute> fragmentFieldAttributes = new java.util.HashMap<>();
-            fragmentExec.fragment().forEachExpressionDown(FieldAttribute.class, field -> fragmentFieldAttributes.putIfAbsent(field.name(), field));
+            fragmentExec.fragment()
+                .forEachExpressionDown(FieldAttribute.class, field -> fragmentFieldAttributes.putIfAbsent(field.name(), field));
             fragmentExec.fragment()
                 .collect(org.elasticsearch.xpack.esql.plan.logical.EsRelation.class)
-                .forEach(relation -> relation.output()
-                    .stream()
-                    .filter(FieldAttribute.class::isInstance)
-                    .map(FieldAttribute.class::cast)
-                    .forEach(field -> fragmentFieldAttributes.putIfAbsent(field.name(), field)));
+                .forEach(
+                    relation -> relation.output()
+                        .stream()
+                        .filter(FieldAttribute.class::isInstance)
+                        .map(FieldAttribute.class::cast)
+                        .forEach(field -> fragmentFieldAttributes.putIfAbsent(field.name(), field))
+                );
             for (var projection : project.projections()) {
                 if (parentAttributeNames.contains(projection.name()) == false) {
                     continue;
@@ -638,7 +657,23 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
                 .filter(attr -> lateFieldAttributes.containsKey(attr.name()) == false)
                 .collect(Collectors.toCollection(java.util.ArrayList::new));
             passthroughOutput.add(0, docAttribute);
-            return new ExchangeSourceExec(exchangeSource.source(), passthroughOutput, exchangeSource.isIntermediateAgg());
+            ExchangeSourceExec passthroughSource = new ExchangeSourceExec(
+                exchangeSource.source(),
+                passthroughOutput,
+                exchangeSource.isIntermediateAgg()
+            );
+            List<Attribute> deferredAttributes = lateFieldAttributes.values()
+                .stream()
+                .sorted(java.util.Comparator.comparing(Attribute::name))
+                .map(Attribute.class::cast)
+                .toList();
+            return MaterializeExec.local(
+                exchangeSource.source(),
+                passthroughSource,
+                docAttribute,
+                deferredAttributes,
+                MaterializeTarget.CURRENT_FINAL
+            );
         });
     }
 }

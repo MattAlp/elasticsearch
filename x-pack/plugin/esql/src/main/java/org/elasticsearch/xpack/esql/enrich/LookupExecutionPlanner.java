@@ -40,6 +40,7 @@ import org.elasticsearch.xpack.esql.core.expression.Expressions;
 import org.elasticsearch.xpack.esql.core.expression.NamedExpression;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.plan.physical.FieldExtractExec;
+import org.elasticsearch.xpack.esql.plan.physical.MaterializeExec;
 import org.elasticsearch.xpack.esql.plan.physical.OutputExec;
 import org.elasticsearch.xpack.esql.plan.physical.ParameterizedQueryExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
@@ -246,6 +247,8 @@ public class LookupExecutionPlanner {
             return planParameterizedQueryExec(parameterizedQueryExec, optimizationState, sourceFactory);
         } else if (node instanceof FieldExtractExec fieldExtractExec) {
             return planFieldExtractExec(plannerSettings, fieldExtractExec, source);
+        } else if (node instanceof MaterializeExec) {
+            return source;
         } else if (node instanceof ProjectExec projectExec) {
             return planProjectExec(projectExec, source);
         } else if (node instanceof OutputExec outputExec) {

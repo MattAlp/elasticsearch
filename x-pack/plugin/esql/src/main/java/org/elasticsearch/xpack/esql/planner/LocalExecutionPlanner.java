@@ -149,6 +149,7 @@ import org.elasticsearch.xpack.esql.plan.physical.LimitExec;
 import org.elasticsearch.xpack.esql.plan.physical.LocalSourceExec;
 import org.elasticsearch.xpack.esql.plan.physical.LookupJoinExec;
 import org.elasticsearch.xpack.esql.plan.physical.MMRExec;
+import org.elasticsearch.xpack.esql.plan.physical.MaterializeExec;
 import org.elasticsearch.xpack.esql.plan.physical.MetricsInfoExec;
 import org.elasticsearch.xpack.esql.plan.physical.MvExpandExec;
 import org.elasticsearch.xpack.esql.plan.physical.OutputExec;
@@ -303,6 +304,8 @@ public class LocalExecutionPlanner {
             return planTopN(topNExec, context);
         } else if (node instanceof EvalExec eval) {
             return planEval(eval, context);
+        } else if (node instanceof MaterializeExec materialize) {
+            return plan(materialize.child(), context);
         } else if (node instanceof DissectExec dissect) {
             return planDissect(dissect, context);
         } else if (node instanceof GrokExec grok) {
