@@ -15,12 +15,15 @@ import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.util.CollectionUtils;
 import org.elasticsearch.xpack.esql.optimizer.LocalPhysicalOptimizerContext;
 import org.elasticsearch.xpack.esql.optimizer.rules.physical.local.InsertFieldExtraction;
+import org.elasticsearch.xpack.esql.optimizer.rules.physical.local.LowerLocalMaterialize;
 import org.elasticsearch.xpack.esql.optimizer.rules.physical.local.PushTopNToSource;
 import org.elasticsearch.xpack.esql.optimizer.rules.physical.local.ReplaceSourceAttributes;
 import org.elasticsearch.xpack.esql.plan.logical.EsRelation;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
+import org.elasticsearch.xpack.esql.plan.logical.Materialize;
 import org.elasticsearch.xpack.esql.plan.logical.Project;
 import org.elasticsearch.xpack.esql.plan.logical.TopN;
+import org.elasticsearch.xpack.esql.plan.materialize.MaterializeMode;
 import org.elasticsearch.xpack.esql.plan.materialize.MaterializeTarget;
 import org.elasticsearch.xpack.esql.plan.physical.EsQueryExec;
 import org.elasticsearch.xpack.esql.plan.physical.EstimatesRowSize;
@@ -102,46 +105,83 @@ class LateMaterializationPlanner {
         }
 
         LocalPhysicalOptimizerContext context = contextFactory.apply(SEARCH_STATS_TOP_N_REPLACEMENT);
-
-        List<Attribute> physicalPlanOutput = toPhysical(topN, context).output();
-        Attribute doc = physicalPlanOutput.stream().filter(EsQueryExec::isDocAttribute).findFirst().orElse(null);
-        if (doc == null) {
-            return Optional.empty();
-        }
-
-        LogicalPlan withAddedDocToRelation = topN.transformUp(EsRelation.class, r -> {
-            if (r.indexMode() == IndexMode.LOOKUP) {
-                return r;
-            }
-            List<Attribute> attributes = CollectionUtils.prependToCopy(doc, r.output());
-            return r.withAttributes(attributes);
-        });
-        if (withAddedDocToRelation.output().stream().noneMatch(EsQueryExec::isDocAttribute)) {
-            // Defensive check: if any intermediate projects (or possibly another operator) removed the doc field, just abort this
-            // optimization altogether!
-            return Optional.empty();
-        }
-
-        AttributeSet orderRefsSet = AttributeSet.of(topN.order().stream().flatMap(o -> o.references().stream()).toList());
-        // Get the output from the physical plan below the TopN, and filter it to only the attributes needed for the final output (either
-        // because they are in the top-level Project's output, or because they are needed for ordering)
-        List<Attribute> expectedDataOutput = new ArrayList<>();
-        for (Attribute a : physicalPlanOutput) {
-            if (topLevelProject.outputSet().contains(a) || orderRefsSet.contains(a) || EsQueryExec.isDocAttribute(a)) {
-                expectedDataOutput.add(a);
-            }
-        }
-        var updatedFragment = new Project(Source.EMPTY, withAddedDocToRelation, expectedDataOutput);
-        FragmentExec updatedFragmentExec = fragmentExec.withFragment(updatedFragment);
-        ExchangeSinkExec updatedDataPlan = originalPlan.replaceChildAndUpdateOutput(updatedFragmentExec);
-
-        // Replace the TopN child with the data driver as the source.
         PhysicalPlan mappedReductionPlan = toPhysical(fragmentExec.fragment(), context);
         List<Attribute> deferredAttributes = lateMaterializeAttributes(mappedReductionPlan);
+
+        LogicalPlan reductionFragment = insertMaterializeBoundary(fragmentExec.fragment(), deferredAttributes).orElse(
+            fragmentExec.fragment()
+        );
+        Project reductionProject = reductionFragment instanceof Project p ? p : null;
+        if (reductionProject == null || (reductionProject.child() instanceof TopN) == false) {
+            return Optional.empty();
+        }
+        topLevelProject = reductionProject;
+        topN = (TopN) reductionProject.child();
+        Materialize materialize = topN.child() instanceof Materialize m ? m : null;
+        if (materialize != null) {
+            mappedReductionPlan = toPhysical(reductionFragment, context);
+            deferredAttributes = materialize.deferredAttributes();
+        }
+
+        Attribute doc;
+        List<Attribute> expectedDataOutput;
+        LogicalPlan dataFragmentChild;
+        if (materialize != null) {
+            doc = materialize.rowIdentity();
+            expectedDataOutput = CollectionUtils.prependToCopy(doc, materialize.carryAttributes());
+            dataFragmentChild = topN.replaceChild(materialize.child());
+        } else {
+            List<Attribute> physicalPlanOutput = toPhysical(topN, context).output();
+            doc = physicalPlanOutput.stream().filter(EsQueryExec::isDocAttribute).findFirst().orElse(null);
+            if (doc == null) {
+                return Optional.empty();
+            }
+
+            LogicalPlan withAddedDocToRelation = topN.transformUp(EsRelation.class, r -> {
+                if (r.indexMode() == IndexMode.LOOKUP) {
+                    return r;
+                }
+                List<Attribute> attributes = CollectionUtils.prependToCopy(doc, r.output());
+                return r.withAttributes(attributes);
+            });
+            if (withAddedDocToRelation.output().stream().noneMatch(EsQueryExec::isDocAttribute)) {
+                // Defensive check: if any intermediate projects (or possibly another operator) removed the doc field, just abort this
+                // optimization altogether!
+                return Optional.empty();
+            }
+
+            AttributeSet orderRefsSet = AttributeSet.of(topN.order().stream().flatMap(o -> o.references().stream()).toList());
+            // Get the output from the physical plan below the TopN, and filter it to only the attributes needed for the final output
+            // (either
+            // because they are in the top-level Project's output, or because they are needed for ordering)
+            expectedDataOutput = new ArrayList<>();
+            for (Attribute a : physicalPlanOutput) {
+                if (topLevelProject.outputSet().contains(a) || orderRefsSet.contains(a) || EsQueryExec.isDocAttribute(a)) {
+                    expectedDataOutput.add(a);
+                }
+            }
+            dataFragmentChild = withAddedDocToRelation;
+        }
+        var updatedFragment = new Project(Source.EMPTY, dataFragmentChild, expectedDataOutput);
+        FragmentExec updatedFragmentExec = fragmentExec.withFragment(updatedFragment);
+        ExchangeSinkExec updatedDataPlan = originalPlan.replaceChildAndUpdateOutput(updatedFragmentExec);
+        Source topNSource = topN.source();
+
+        // Replace the TopN child with the data driver as the source.
+        List<Attribute> reductionDeferredAttributes = deferredAttributes;
         PhysicalPlan reductionPlan = mappedReductionPlan.transformDown(TopNExec.class, t -> {
-            PhysicalPlan exchangeExec = new ExchangeSourceExec(topN.source(), expectedDataOutput, false /* isIntermediateAgg */);
-            if (deferredAttributes.isEmpty() == false) {
-                exchangeExec = MaterializeExec.local(topN.source(), exchangeExec, doc, deferredAttributes, MaterializeTarget.CURRENT_FINAL);
+            PhysicalPlan exchangeExec = new ExchangeSourceExec(topNSource, expectedDataOutput, false /* isIntermediateAgg */);
+            if (reductionDeferredAttributes.isEmpty() == false) {
+                exchangeExec = materialize == null
+                    ? MaterializeExec.local(topNSource, exchangeExec, doc, reductionDeferredAttributes, MaterializeTarget.CURRENT_FINAL)
+                    : MaterializeExec.local(
+                        topNSource,
+                        exchangeExec,
+                        doc,
+                        materialize.carryAttributes(),
+                        reductionDeferredAttributes,
+                        MaterializeTarget.CURRENT_FINAL
+                    );
             }
             // If the fragment is already sorted, tell the node-reduce TopN that its input will be sorted already
             boolean fragmentIsSorted = updatedFragment.child() instanceof TopN;
@@ -156,7 +196,83 @@ class LateMaterializationPlanner {
     }
 
     private static PhysicalPlan toPhysical(LogicalPlan plan, LocalPhysicalOptimizerContext context) {
-        return new InsertFieldExtraction().apply(new ReplaceSourceAttributes().apply(LocalMapper.INSTANCE.map(plan)), context);
+        PhysicalPlan mapped = new ReplaceSourceAttributes().apply(LocalMapper.INSTANCE.map(plan));
+        mapped = new LowerLocalMaterialize().apply(mapped, context);
+        return new InsertFieldExtraction().apply(mapped, context);
+    }
+
+    static Optional<LogicalPlan> insertMaterializeBoundary(
+        Function<SearchStats, LocalPhysicalOptimizerContext> contextFactory,
+        LogicalPlan fragment
+    ) {
+        LocalPhysicalOptimizerContext context = contextFactory.apply(SEARCH_STATS_TOP_N_REPLACEMENT);
+        List<Attribute> deferredAttributes = lateMaterializeAttributes(toPhysical(fragment, context));
+        return insertMaterializeBoundary(fragment, deferredAttributes);
+    }
+
+    private static Optional<LogicalPlan> insertMaterializeBoundary(LogicalPlan fragment, List<? extends Attribute> lateAttributes) {
+        Project topLevelProject = fragment instanceof Project p ? p : null;
+        if (topLevelProject == null) {
+            return Optional.empty();
+        }
+        TopN topN = topLevelProject.child() instanceof TopN tn ? tn : null;
+        if (topN == null) {
+            return Optional.empty();
+        }
+        if (topN.child() instanceof Materialize) {
+            return Optional.of(fragment);
+        }
+        if (lateAttributes.isEmpty()) {
+            return Optional.empty();
+        }
+
+        AttributeSet orderRefsSet = AttributeSet.of(topN.order().stream().flatMap(o -> o.references().stream()).toList());
+        Attribute doc = new FieldAttribute(topN.source(), null, null, EsQueryExec.DOC_ID_FIELD.getName(), EsQueryExec.DOC_ID_FIELD);
+        LogicalPlan childWithDoc = topN.child().transformUp(EsRelation.class, r -> {
+            if (r.indexMode() == IndexMode.LOOKUP || r.output().stream().anyMatch(EsQueryExec::isDocAttribute)) {
+                return r;
+            }
+            return r.withAttributes(CollectionUtils.prependToCopy(doc, r.output()));
+        });
+        TopN topNWithDoc = topN.replaceChild(childWithDoc);
+        if (topNWithDoc.output().stream().noneMatch(EsQueryExec::isDocAttribute)) {
+            return Optional.empty();
+        }
+
+        List<Attribute> outputAttributes = new ArrayList<>();
+        for (Attribute attribute : topNWithDoc.output()) {
+            if (EsQueryExec.isDocAttribute(attribute)
+                || topLevelProject.outputSet().contains(attribute)
+                || orderRefsSet.contains(attribute)) {
+                outputAttributes.add(attribute);
+            }
+        }
+
+        java.util.Set<String> deferredNames = lateAttributes.stream().map(Attribute::name).collect(Collectors.toSet());
+        List<Attribute> materializeDeferredAttributes = outputAttributes.stream()
+            .filter(attr -> EsQueryExec.isDocAttribute(attr) == false)
+            .filter(attr -> deferredNames.contains(attr.name()))
+            .toList();
+        if (materializeDeferredAttributes.isEmpty()) {
+            return Optional.empty();
+        }
+
+        AttributeSet deferredOutputSet = AttributeSet.of(materializeDeferredAttributes);
+        List<Attribute> carryAttributes = outputAttributes.stream()
+            .filter(attr -> EsQueryExec.isDocAttribute(attr) == false)
+            .filter(attr -> deferredOutputSet.contains(attr) == false)
+            .toList();
+        Materialize materialize = new Materialize(
+            topN.source(),
+            topNWithDoc.child(),
+            outputAttributes,
+            doc,
+            carryAttributes,
+            materializeDeferredAttributes,
+            MaterializeTarget.CURRENT_FINAL,
+            MaterializeMode.LOCAL
+        );
+        return Optional.of(topLevelProject.replaceChild(topNWithDoc.replaceChild(materialize)));
     }
 
     private static List<Attribute> lateMaterializeAttributes(PhysicalPlan plan) {

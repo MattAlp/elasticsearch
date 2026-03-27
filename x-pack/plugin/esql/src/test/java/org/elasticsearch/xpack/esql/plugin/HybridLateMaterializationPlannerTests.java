@@ -22,12 +22,17 @@ import org.elasticsearch.xpack.esql.core.expression.FoldContext;
 import org.elasticsearch.xpack.esql.index.EsIndexGenerator;
 import org.elasticsearch.xpack.esql.index.IndexResolution;
 import org.elasticsearch.xpack.esql.optimizer.AbstractLocalPhysicalPlanOptimizerTests;
+import org.elasticsearch.xpack.esql.optimizer.LocalPhysicalOptimizerContext;
 import org.elasticsearch.xpack.esql.optimizer.LogicalOptimizerContext;
 import org.elasticsearch.xpack.esql.optimizer.LogicalPlanOptimizer;
 import org.elasticsearch.xpack.esql.optimizer.PhysicalOptimizerContext;
 import org.elasticsearch.xpack.esql.optimizer.PhysicalPlanOptimizer;
 import org.elasticsearch.xpack.esql.parser.EsqlParser;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
+import org.elasticsearch.xpack.esql.plan.logical.Materialize;
+import org.elasticsearch.xpack.esql.plan.logical.Project;
+import org.elasticsearch.xpack.esql.plan.logical.TopN;
+import org.elasticsearch.xpack.esql.plan.materialize.MaterializeMode;
 import org.elasticsearch.xpack.esql.plan.materialize.MaterializeTarget;
 import org.elasticsearch.xpack.esql.plan.physical.AggregateExec;
 import org.elasticsearch.xpack.esql.plan.physical.EsQueryExec;
@@ -35,6 +40,7 @@ import org.elasticsearch.xpack.esql.plan.physical.ExchangeSinkExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSourceExec;
 import org.elasticsearch.xpack.esql.plan.physical.FieldExtractExec;
 import org.elasticsearch.xpack.esql.plan.physical.FilterExec;
+import org.elasticsearch.xpack.esql.plan.physical.FragmentExec;
 import org.elasticsearch.xpack.esql.plan.physical.FuseScoreEvalExec;
 import org.elasticsearch.xpack.esql.plan.physical.MaterializeExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
@@ -89,6 +95,37 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         assertThat(attributeNames(materializeExecs.getFirst().deferredAttributes()), equalTo(Set.of("salary")));
         assertThat(materializeExecs.getFirst().target(), equalTo(MaterializeTarget.CURRENT_FINAL));
         assertThat(lateFieldAttributes(reductionPlan).keySet(), equalTo(Set.of("salary")));
+    }
+
+    public void testInsertMaterializeBoundaryForTopNFragment() {
+        PhysicalPlan plan = physicalPlan("""
+            FROM test
+            | KEEP emp_no, salary
+            | SORT emp_no
+            | LIMIT 20
+            | EVAL my_score = salary + 1
+            | SORT my_score
+            | LIMIT 5
+            """, makeAnalyzer("mapping-basic.json"));
+        Tuple<PhysicalPlan, PhysicalPlan> plans = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(plan, config);
+        ExchangeSinkExec dataNodePlan = (ExchangeSinkExec) plans.v2();
+        FragmentExec fragmentExec = (FragmentExec) dataNodePlan.child();
+
+        LogicalPlan materializedFragment = LateMaterializationPlanner.insertMaterializeBoundary(
+            stats -> new LocalPhysicalOptimizerContext(PlannerSettings.DEFAULTS, new EsqlFlags(false), config, FoldContext.small(), stats),
+            fragmentExec.fragment()
+        ).orElseThrow();
+        assertThat(materializedFragment, instanceOf(Project.class));
+
+        TopN topN = (TopN) ((Project) materializedFragment).child();
+        assertThat(topN.child(), instanceOf(Materialize.class));
+
+        Materialize materialize = (Materialize) topN.child();
+        assertThat(attributeNames(materialize.output()), equalTo(Set.of("_doc", "emp_no", "salary")));
+        assertThat(attributeNames(materialize.carryAttributes()), equalTo(Set.of("emp_no")));
+        assertThat(attributeNames(materialize.deferredAttributes()), equalTo(Set.of("salary")));
+        assertThat(materialize.target(), equalTo(MaterializeTarget.CURRENT_FINAL));
+        assertThat(materialize.mode(), equalTo(MaterializeMode.LOCAL));
     }
 
     public void testFuseSubplansLateMaterializeBranchFields() {
@@ -537,7 +574,9 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         Map<String, FieldAttribute> materializedLateFieldAttributes = lateFieldAttributesFromMaterializeBoundary(
             reductionPlan.nodeReducePlan()
         );
-        return materializedLateFieldAttributes.isEmpty() ? lateFieldAttributes(reductionPlan.nodeReducePlan()) : materializedLateFieldAttributes;
+        return materializedLateFieldAttributes.isEmpty()
+            ? lateFieldAttributes(reductionPlan.nodeReducePlan())
+            : materializedLateFieldAttributes;
     }
 
     private static Map<String, FieldAttribute> lateFieldAttributes(PhysicalPlan plan) {
@@ -666,28 +705,37 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
             }
             return expression;
         }).transformUp(ExchangeSourceExec.class, exchangeSource -> {
-            List<Attribute> passthroughOutput = exchangeSource.output()
-                .stream()
-                .filter(attr -> lateFieldAttributes.containsKey(attr.name()) == false)
-                .collect(Collectors.toCollection(java.util.ArrayList::new));
-            passthroughOutput.add(0, docAttribute);
-            ExchangeSourceExec passthroughSource = new ExchangeSourceExec(
-                exchangeSource.source(),
-                passthroughOutput,
-                exchangeSource.isIntermediateAgg()
-            );
+            ExchangeSourceExec exchangeSourceWithDoc = exchangeSourceWithDoc(exchangeSource, docAttribute);
             List<Attribute> deferredAttributes = lateFieldAttributes.values()
                 .stream()
                 .sorted(java.util.Comparator.comparing(Attribute::name))
                 .map(Attribute.class::cast)
                 .toList();
-            return MaterializeExec.local(
+            Set<String> deferredNames = deferredAttributes.stream().map(Attribute::name).collect(Collectors.toSet());
+            List<Attribute> carryAttributes = exchangeSourceWithDoc.output()
+                .stream()
+                .filter(attr -> EsQueryExec.isDocAttribute(attr) == false)
+                .filter(attr -> deferredNames.contains(attr.name()) == false)
+                .toList();
+            return new MaterializeExec(
                 exchangeSource.source(),
-                passthroughSource,
+                exchangeSourceWithDoc,
                 docAttribute,
+                carryAttributes,
                 deferredAttributes,
-                MaterializeTarget.CURRENT_FINAL
+                MaterializeTarget.CURRENT_FINAL,
+                MaterializeMode.LOCAL
             );
         });
+    }
+
+    private static ExchangeSourceExec exchangeSourceWithDoc(ExchangeSourceExec exchangeSource, Attribute docAttribute) {
+        if (exchangeSource.output().stream().anyMatch(EsQueryExec::isDocAttribute)) {
+            return exchangeSource;
+        }
+        List<Attribute> output = new java.util.ArrayList<>(exchangeSource.output().size() + 1);
+        output.add(docAttribute);
+        output.addAll(exchangeSource.output());
+        return new ExchangeSourceExec(exchangeSource.source(), output, exchangeSource.isIntermediateAgg());
     }
 }

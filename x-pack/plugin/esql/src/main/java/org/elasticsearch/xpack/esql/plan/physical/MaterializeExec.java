@@ -66,11 +66,22 @@ public class MaterializeExec extends UnaryExec {
         MaterializeTarget target
     ) {
         List<Attribute> carryAttributes = child.output().stream().filter(attr -> EsQueryExec.isDocAttribute(attr) == false).toList();
+        return local(source, child, rowIdentity, carryAttributes, deferredAttributes, target);
+    }
+
+    public static MaterializeExec local(
+        Source source,
+        PhysicalPlan child,
+        Attribute rowIdentity,
+        List<? extends Attribute> carryAttributes,
+        List<? extends Attribute> deferredAttributes,
+        MaterializeTarget target
+    ) {
         return new MaterializeExec(
             source,
             child,
             rowIdentity,
-            carryAttributes,
+            List.copyOf(carryAttributes),
             List.copyOf(deferredAttributes),
             target,
             MaterializeMode.LOCAL

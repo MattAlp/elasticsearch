@@ -1674,17 +1674,8 @@ public class ComputeService {
             }
             return expression;
         }).transformUp(ExchangeSourceExec.class, exchangeSource -> {
-            List<Attribute> passthroughOutput = exchangeSource.output()
-                .stream()
-                .filter(attr -> lateFieldAttributes.containsKey(attr.name()) == false)
-                .collect(Collectors.toCollection(ArrayList::new));
-            passthroughOutput.add(0, docAttribute);
-            ExchangeSourceExec passthroughSource = new ExchangeSourceExec(
-                exchangeSource.source(),
-                passthroughOutput,
-                exchangeSource.isIntermediateAgg()
-            );
-            return withMaterializeBoundary(passthroughSource, docAttribute, lateFieldAttributes, MaterializeTarget.CURRENT_FINAL);
+            ExchangeSourceExec exchangeSourceWithDoc = exchangeSourceWithDoc(exchangeSource, docAttribute);
+            return withMaterializeBoundary(exchangeSourceWithDoc, docAttribute, lateFieldAttributes, MaterializeTarget.CURRENT_FINAL);
         });
     }
 
@@ -1692,7 +1683,9 @@ public class ComputeService {
         Map<String, FieldAttribute> materializedLateFieldAttributes = lateFieldAttributesFromMaterializeBoundary(
             reductionPlan.nodeReducePlan()
         );
-        return materializedLateFieldAttributes.isEmpty() ? lateFieldAttributes(reductionPlan.nodeReducePlan()) : materializedLateFieldAttributes;
+        return materializedLateFieldAttributes.isEmpty()
+            ? lateFieldAttributes(reductionPlan.nodeReducePlan())
+            : materializedLateFieldAttributes;
     }
 
     private static Map<String, FieldAttribute> lateFieldAttributes(PhysicalPlan plan) {
@@ -1729,7 +1722,23 @@ public class ComputeService {
             .sorted(java.util.Comparator.comparing(Attribute::name))
             .map(Attribute.class::cast)
             .toList();
-        return MaterializeExec.local(exchangeSource.source(), exchangeSource, docAttribute, deferredAttributes, target);
+        Set<String> deferredNames = deferredAttributes.stream().map(Attribute::name).collect(Collectors.toSet());
+        List<Attribute> carryAttributes = exchangeSource.output()
+            .stream()
+            .filter(attr -> org.elasticsearch.xpack.esql.plan.physical.EsQueryExec.isDocAttribute(attr) == false)
+            .filter(attr -> deferredNames.contains(attr.name()) == false)
+            .toList();
+        return MaterializeExec.local(exchangeSource.source(), exchangeSource, docAttribute, carryAttributes, deferredAttributes, target);
+    }
+
+    private static ExchangeSourceExec exchangeSourceWithDoc(ExchangeSourceExec exchangeSource, Attribute docAttribute) {
+        if (exchangeSource.output().stream().anyMatch(org.elasticsearch.xpack.esql.plan.physical.EsQueryExec::isDocAttribute)) {
+            return exchangeSource;
+        }
+        List<Attribute> output = new ArrayList<>(exchangeSource.output().size() + 1);
+        output.add(docAttribute);
+        output.addAll(exchangeSource.output());
+        return new ExchangeSourceExec(exchangeSource.source(), output, exchangeSource.isIntermediateAgg());
     }
 
     private static Map<String, FieldAttribute> parentFinalLateFieldAttributes(
