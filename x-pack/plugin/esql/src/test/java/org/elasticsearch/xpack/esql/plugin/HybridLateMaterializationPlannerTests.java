@@ -97,7 +97,7 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         assertThat(materializeExecs, hasSize(1));
         assertThat(attributeNames(materializeExecs.getFirst().deferredAttributes()), equalTo(Set.of("salary")));
         assertThat(materializeExecs.getFirst().target(), equalTo(MaterializeTarget.CURRENT_FINAL));
-        assertThat(lateFieldAttributes(reductionPlan).keySet(), equalTo(Set.of("salary")));
+        assertThat(reductionLateMaterializationSpec(reductionPlan).deferredFieldNames(), equalTo(Set.of("salary")));
     }
 
     public void testInsertMaterializeBoundaryForTopNFragment() {
@@ -154,9 +154,8 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         Tuple<PhysicalPlan, PhysicalPlan> coordinatorAndDataPlan = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(subplan, config);
         ExchangeSinkExec dataNodePlan = (ExchangeSinkExec) coordinatorAndDataPlan.v2();
         ReductionPlan reductionPlan = reductionPlan(dataNodePlan);
-        Map<String, FieldAttribute> lateFields = parentFinalLateFieldAttributes(
+        ComputeService.LateMaterializationSpec lateMaterializationSpec = parentFinalLateMaterializationSpec(
             subplansAndMainPlan.v2(),
-            subplan,
             dataNodePlan,
             reductionPlan
         );
@@ -164,7 +163,7 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
 
         LateMaterializationPlanner.MaterializeBoundaryFragment boundary = InsertMaterializePhase.materializeBoundaryFragment(
             fragmentExec.fragment(),
-            lateFields.values().stream().sorted(java.util.Comparator.comparing(Attribute::name)).map(Attribute.class::cast).toList(),
+            lateMaterializationSpec.deferredAttributes(),
             MaterializeTarget.PARENT_FINAL
         ).orElseThrow();
         LogicalPlan materializedFragment = boundary.project();
@@ -179,7 +178,7 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         assertThat(materialize.mode(), equalTo(MaterializeMode.LOCAL));
         assertThat(attributeNames(boundary.passthroughOutput()), equalTo(Set.of("_doc", "_score", "_id", "_index")));
 
-        ExchangeSinkExec rewrittenDataPlan = dataNodePlanWithParentFinalBoundary(dataNodePlan, lateFields);
+        ExchangeSinkExec rewrittenDataPlan = dataNodePlanWithParentFinalBoundary(dataNodePlan, lateMaterializationSpec);
         assertThat(attributeNames(rewrittenDataPlan.output()), equalTo(Set.of("_doc", "_score", "_id", "_index")));
         FragmentExec rewrittenFragment = (FragmentExec) rewrittenDataPlan.child();
         Project rewrittenProject = (Project) rewrittenFragment.fragment();
@@ -292,18 +291,12 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         Tuple<List<PhysicalPlan>, PhysicalPlan> subplansAndMainPlan = PlannerUtils.breakPlanIntoSubPlansAndMainPlan(plan);
         PhysicalPlan subplan = subplansAndMainPlan.v1().getFirst();
         Tuple<PhysicalPlan, PhysicalPlan> coordinatorAndDataPlan = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(subplan, config);
-        ReductionPlan reductionPlan = reductionPlan((ExchangeSinkExec) coordinatorAndDataPlan.v2());
-        Attribute docAttribute = reductionPlan.dataNodePlan()
-            .output()
-            .stream()
-            .filter(EsQueryExec::isDocAttribute)
-            .findFirst()
-            .orElseThrow();
+        ExchangeSinkExec dataNodePlan = (ExchangeSinkExec) coordinatorAndDataPlan.v2();
+        ReductionPlan reductionPlan = reductionPlan(dataNodePlan);
 
         PhysicalPlan rewrittenMainPlan = mainPlanWithDocPassthrough(
             subplansAndMainPlan.v2(),
-            docAttribute,
-            lateFieldAttributes((ExchangeSinkExec) coordinatorAndDataPlan.v2(), reductionPlan)
+            currentFinalLateMaterializationSpec(subplansAndMainPlan.v2(), dataNodePlan, reductionPlan)
         );
         PhysicalPlan optimizedMainPlan = PlannerUtils.localCoordinatorPlan(
             PlannerSettings.DEFAULTS,
@@ -350,20 +343,17 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         Tuple<List<PhysicalPlan>, PhysicalPlan> subplansAndMainPlan = PlannerUtils.breakPlanIntoSubPlansAndMainPlan(plan);
         PhysicalPlan subplan = subplansAndMainPlan.v1().getFirst();
         Tuple<PhysicalPlan, PhysicalPlan> coordinatorAndDataPlan = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(subplan, config);
-        ReductionPlan reductionPlan = reductionPlan((ExchangeSinkExec) coordinatorAndDataPlan.v2());
-        Attribute docAttribute = reductionPlan.dataNodePlan()
-            .output()
-            .stream()
-            .filter(EsQueryExec::isDocAttribute)
-            .findFirst()
-            .orElseThrow();
+        ExchangeSinkExec dataNodePlan = (ExchangeSinkExec) coordinatorAndDataPlan.v2();
+        ReductionPlan reductionPlan = reductionPlan(dataNodePlan);
 
-        Map<String, FieldAttribute> mainLateFields = new java.util.HashMap<>(lateFieldAttributes(subplansAndMainPlan.v2()));
-        mainLateFields.putAll(lateFieldAttributes(subplan));
-        mainLateFields.putAll(lateFieldAttributes((ExchangeSinkExec) coordinatorAndDataPlan.v2(), reductionPlan));
-        assertThat(mainLateFields.keySet(), equalTo(Set.of("title")));
+        ComputeService.LateMaterializationSpec mainLateMaterialization = currentFinalLateMaterializationSpec(
+            subplansAndMainPlan.v2(),
+            dataNodePlan,
+            reductionPlan
+        );
+        assertThat(mainLateMaterialization.deferredFieldNames(), equalTo(Set.of("title")));
 
-        PhysicalPlan rewrittenMainPlan = mainPlanWithDocPassthrough(subplansAndMainPlan.v2(), docAttribute, mainLateFields);
+        PhysicalPlan rewrittenMainPlan = mainPlanWithDocPassthrough(subplansAndMainPlan.v2(), mainLateMaterialization);
         PhysicalPlan optimizedMainPlan = PlannerUtils.localCoordinatorPlan(
             PlannerSettings.DEFAULTS,
             new EsqlFlags(false),
@@ -413,23 +403,17 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         Tuple<List<PhysicalPlan>, PhysicalPlan> subplansAndMainPlan = PlannerUtils.breakPlanIntoSubPlansAndMainPlan(plan);
         PhysicalPlan subplan = subplansAndMainPlan.v1().getFirst();
         Tuple<PhysicalPlan, PhysicalPlan> coordinatorAndDataPlan = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(subplan, config);
-        ReductionPlan reductionPlan = reductionPlan((ExchangeSinkExec) coordinatorAndDataPlan.v2());
-        Attribute docAttribute = reductionPlan.dataNodePlan()
-            .output()
-            .stream()
-            .filter(EsQueryExec::isDocAttribute)
-            .findFirst()
-            .orElseThrow();
+        ExchangeSinkExec dataNodePlan = (ExchangeSinkExec) coordinatorAndDataPlan.v2();
+        ReductionPlan reductionPlan = reductionPlan(dataNodePlan);
 
-        Map<String, FieldAttribute> mainLateFields = parentFinalLateFieldAttributes(
+        ComputeService.LateMaterializationSpec mainLateMaterialization = currentFinalLateMaterializationSpec(
             subplansAndMainPlan.v2(),
-            subplan,
-            (ExchangeSinkExec) coordinatorAndDataPlan.v2(),
+            dataNodePlan,
             reductionPlan
         );
-        assertThat(mainLateFields.keySet(), equalTo(Set.of("title", "author")));
+        assertThat(mainLateMaterialization.deferredFieldNames(), equalTo(Set.of("title", "author")));
 
-        PhysicalPlan rewrittenMainPlan = mainPlanWithDocPassthrough(subplansAndMainPlan.v2(), docAttribute, mainLateFields);
+        PhysicalPlan rewrittenMainPlan = mainPlanWithDocPassthrough(subplansAndMainPlan.v2(), mainLateMaterialization);
         PhysicalPlan optimizedMainPlan = PlannerUtils.localCoordinatorPlan(
             PlannerSettings.DEFAULTS,
             new EsqlFlags(false),
@@ -495,9 +479,8 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         PhysicalPlan subplan = subplansAndMainPlan.v1().getFirst();
         Tuple<PhysicalPlan, PhysicalPlan> coordinatorAndDataPlan = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(subplan, config);
         ReductionPlan reductionPlan = reductionPlan((ExchangeSinkExec) coordinatorAndDataPlan.v2());
-        Map<String, FieldAttribute> lateFields = parentFinalLateFieldAttributes(
+        ComputeService.LateMaterializationSpec lateMaterializationSpec = parentFinalLateMaterializationSpec(
             subplansAndMainPlan.v2(),
-            subplan,
             (ExchangeSinkExec) coordinatorAndDataPlan.v2(),
             reductionPlan
         );
@@ -505,7 +488,7 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         PhysicalPlan rewrittenCoordinatorPlan = coordinatorPlanWithParentFinalBoundary(
             coordinatorAndDataPlan.v1(),
             reductionPlan,
-            lateFields
+            lateMaterializationSpec
         );
         List<MaterializeExec> beforeLowering = materializeExecs(rewrittenCoordinatorPlan);
         assertThat(beforeLowering, hasSize(1));
@@ -551,23 +534,17 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         Tuple<List<PhysicalPlan>, PhysicalPlan> subplansAndMainPlan = PlannerUtils.breakPlanIntoSubPlansAndMainPlan(plan);
         PhysicalPlan subplan = subplansAndMainPlan.v1().getFirst();
         Tuple<PhysicalPlan, PhysicalPlan> coordinatorAndDataPlan = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(subplan, config);
-        ReductionPlan reductionPlan = reductionPlan((ExchangeSinkExec) coordinatorAndDataPlan.v2());
-        Attribute docAttribute = reductionPlan.dataNodePlan()
-            .output()
-            .stream()
-            .filter(EsQueryExec::isDocAttribute)
-            .findFirst()
-            .orElseThrow();
+        ExchangeSinkExec dataNodePlan = (ExchangeSinkExec) coordinatorAndDataPlan.v2();
+        ReductionPlan reductionPlan = reductionPlan(dataNodePlan);
 
-        Map<String, FieldAttribute> mainLateFields = parentFinalLateFieldAttributes(
+        ComputeService.LateMaterializationSpec mainLateMaterialization = currentFinalLateMaterializationSpec(
             subplansAndMainPlan.v2(),
-            subplan,
-            (ExchangeSinkExec) coordinatorAndDataPlan.v2(),
+            dataNodePlan,
             reductionPlan
         );
-        assertThat(mainLateFields.keySet(), equalTo(Set.of("title", "author")));
+        assertThat(mainLateMaterialization.deferredFieldNames(), equalTo(Set.of("title", "author")));
 
-        PhysicalPlan rewrittenMainPlan = mainPlanWithDocPassthrough(subplansAndMainPlan.v2(), docAttribute, mainLateFields);
+        PhysicalPlan rewrittenMainPlan = mainPlanWithDocPassthrough(subplansAndMainPlan.v2(), mainLateMaterialization);
         PhysicalPlan optimizedMainPlan = PlannerUtils.localCoordinatorPlan(
             PlannerSettings.DEFAULTS,
             new EsqlFlags(false),
@@ -628,23 +605,17 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         Tuple<List<PhysicalPlan>, PhysicalPlan> subplansAndMainPlan = PlannerUtils.breakPlanIntoSubPlansAndMainPlan(plan);
         PhysicalPlan subplan = subplansAndMainPlan.v1().getFirst();
         Tuple<PhysicalPlan, PhysicalPlan> coordinatorAndDataPlan = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(subplan, config);
-        ReductionPlan reductionPlan = reductionPlan((ExchangeSinkExec) coordinatorAndDataPlan.v2());
-        Attribute docAttribute = reductionPlan.dataNodePlan()
-            .output()
-            .stream()
-            .filter(EsQueryExec::isDocAttribute)
-            .findFirst()
-            .orElseThrow();
+        ExchangeSinkExec dataNodePlan = (ExchangeSinkExec) coordinatorAndDataPlan.v2();
+        ReductionPlan reductionPlan = reductionPlan(dataNodePlan);
 
-        Map<String, FieldAttribute> mainLateFields = parentFinalLateFieldAttributes(
+        ComputeService.LateMaterializationSpec mainLateMaterialization = currentFinalLateMaterializationSpec(
             subplansAndMainPlan.v2(),
-            subplan,
-            (ExchangeSinkExec) coordinatorAndDataPlan.v2(),
+            dataNodePlan,
             reductionPlan
         );
-        assertThat(mainLateFields.keySet(), equalTo(Set.of("author", "title")));
+        assertThat(mainLateMaterialization.deferredFieldNames(), equalTo(Set.of("author", "title")));
 
-        PhysicalPlan rewrittenMainPlan = mainPlanWithDocPassthrough(subplansAndMainPlan.v2(), docAttribute, mainLateFields);
+        PhysicalPlan rewrittenMainPlan = mainPlanWithDocPassthrough(subplansAndMainPlan.v2(), mainLateMaterialization);
         PhysicalPlan optimizedMainPlan = PlannerUtils.localCoordinatorPlan(
             PlannerSettings.DEFAULTS,
             new EsqlFlags(false),
@@ -739,195 +710,23 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         return attributes.stream().map(Attribute::name).collect(Collectors.toSet());
     }
 
-    private static Map<String, FieldAttribute> lateFieldAttributes(ReductionPlan reductionPlan) {
-        Map<String, FieldAttribute> materializedLateFieldAttributes = lateFieldAttributesFromMaterializeBoundary(
-            reductionPlan.nodeReducePlan()
-        );
-        return materializedLateFieldAttributes.isEmpty()
-            ? lateFieldAttributes(reductionPlan.nodeReducePlan())
-            : materializedLateFieldAttributes;
-    }
-
-    private static Map<String, FieldAttribute> lateFieldAttributes(PhysicalPlan plan) {
-        return plan.collect(node -> node instanceof FieldExtractExec)
-            .stream()
-            .map(FieldExtractExec.class::cast)
-            .flatMap(fieldExtract -> fieldExtract.attributesToExtract().stream())
-            .filter(FieldAttribute.class::isInstance)
-            .map(FieldAttribute.class::cast)
-            .collect(Collectors.toMap(FieldAttribute::name, field -> field, (left, right) -> left));
-    }
-
-    private static Map<String, FieldAttribute> lateFieldAttributesFromMaterializeBoundary(PhysicalPlan plan) {
-        return plan.collect(MaterializeExec.class::isInstance)
-            .stream()
-            .map(MaterializeExec.class::cast)
-            .flatMap(materialize -> materialize.deferredAttributes().stream())
-            .filter(FieldAttribute.class::isInstance)
-            .map(FieldAttribute.class::cast)
-            .collect(Collectors.toMap(FieldAttribute::name, field -> field, (left, right) -> left));
-    }
-
-    private static Map<String, FieldAttribute> lateFieldAttributes(ExchangeSinkExec originalDataNodePlan, ReductionPlan reductionPlan) {
-        Map<String, FieldAttribute> lateFieldAttributes = new java.util.HashMap<>(lateFieldAttributes(reductionPlan));
-        Set<String> passthroughNames = attributeNames(reductionPlan.dataNodePlan().output());
-        PhysicalPlan dataNodeChild = originalDataNodePlan.child();
-        if (dataNodeChild instanceof org.elasticsearch.xpack.esql.plan.physical.FragmentExec fragmentExec
-            && fragmentExec.fragment() instanceof org.elasticsearch.xpack.esql.plan.logical.Project project) {
-            Map<String, FieldAttribute> fragmentFieldAttributes = new java.util.HashMap<>();
-            fragmentExec.fragment()
-                .forEachExpressionDown(FieldAttribute.class, field -> fragmentFieldAttributes.putIfAbsent(field.name(), field));
-            fragmentExec.fragment()
-                .collect(org.elasticsearch.xpack.esql.plan.logical.EsRelation.class)
-                .forEach(
-                    relation -> relation.output()
-                        .stream()
-                        .filter(FieldAttribute.class::isInstance)
-                        .map(FieldAttribute.class::cast)
-                        .forEach(field -> fragmentFieldAttributes.putIfAbsent(field.name(), field))
-                );
-            for (var projection : project.projections()) {
-                if (passthroughNames.contains(projection.name())) {
-                    continue;
-                }
-                FieldAttribute fieldAttribute = null;
-                if (projection instanceof FieldAttribute field) {
-                    fieldAttribute = field;
-                } else if (projection instanceof Alias alias && alias.child() instanceof FieldAttribute field) {
-                    fieldAttribute = (FieldAttribute) field.withName(alias.name()).withId(alias.id());
-                }
-                if (fieldAttribute == null) {
-                    fieldAttribute = fragmentFieldAttributes.get(projection.name());
-                }
-                if (fieldAttribute != null) {
-                    lateFieldAttributes.putIfAbsent(projection.name(), fieldAttribute);
-                }
-            }
-        }
-        return lateFieldAttributes;
-    }
-
-    private static Map<String, FieldAttribute> parentFinalLateFieldAttributes(
-        PhysicalPlan mainPlan,
-        PhysicalPlan subplan,
-        ExchangeSinkExec originalDataNodePlan,
-        ReductionPlan reductionPlan
-    ) {
-        Map<String, FieldAttribute> lateFieldAttributes = new java.util.HashMap<>(lateFieldAttributes(subplan));
-        lateFieldAttributes.putAll(lateFieldAttributes(originalDataNodePlan, reductionPlan));
-        lateFieldAttributes.putAll(lateFieldAttributes(originalDataNodePlan, mainPlan));
-        lateFieldAttributes.putAll(lateFieldAttributes(mainPlan));
-        return lateFieldAttributes;
-    }
-
-    private static Map<String, FieldAttribute> lateFieldAttributes(ExchangeSinkExec originalDataNodePlan, PhysicalPlan parentPlan) {
-        Set<String> parentAttributeNames = new java.util.HashSet<>();
-        parentPlan.forEachExpressionDown(Attribute.class, attribute -> parentAttributeNames.add(attribute.name()));
-        Map<String, FieldAttribute> lateFieldAttributes = new java.util.HashMap<>();
-        PhysicalPlan dataNodeChild = originalDataNodePlan.child();
-        if (dataNodeChild instanceof org.elasticsearch.xpack.esql.plan.physical.FragmentExec fragmentExec
-            && fragmentExec.fragment() instanceof org.elasticsearch.xpack.esql.plan.logical.Project project) {
-            Map<String, FieldAttribute> fragmentFieldAttributes = new java.util.HashMap<>();
-            fragmentExec.fragment()
-                .forEachExpressionDown(FieldAttribute.class, field -> fragmentFieldAttributes.putIfAbsent(field.name(), field));
-            fragmentExec.fragment()
-                .collect(org.elasticsearch.xpack.esql.plan.logical.EsRelation.class)
-                .forEach(
-                    relation -> relation.output()
-                        .stream()
-                        .filter(FieldAttribute.class::isInstance)
-                        .map(FieldAttribute.class::cast)
-                        .forEach(field -> fragmentFieldAttributes.putIfAbsent(field.name(), field))
-                );
-            for (var projection : project.projections()) {
-                if (parentAttributeNames.contains(projection.name()) == false) {
-                    continue;
-                }
-                FieldAttribute fieldAttribute = null;
-                if (projection instanceof FieldAttribute field) {
-                    fieldAttribute = field;
-                } else if (projection instanceof Alias alias && alias.child() instanceof FieldAttribute field) {
-                    fieldAttribute = (FieldAttribute) field.withName(alias.name()).withId(alias.id());
-                }
-                if (fieldAttribute == null) {
-                    fieldAttribute = fragmentFieldAttributes.get(projection.name());
-                }
-                if (fieldAttribute != null) {
-                    lateFieldAttributes.putIfAbsent(projection.name(), fieldAttribute);
-                }
-            }
-        }
-        return lateFieldAttributes;
-    }
-
     private static PhysicalPlan mainPlanWithDocPassthrough(
         PhysicalPlan mainPlan,
-        Attribute docAttribute,
-        Map<String, FieldAttribute> lateFieldAttributes
+        ComputeService.LateMaterializationSpec lateMaterializationSpec
     ) {
-        return mainPlan.transformExpressionsDown(Expression.class, expression -> {
-            if (expression instanceof Attribute attribute) {
-                FieldAttribute lateField = lateFieldAttributes.get(attribute.name());
-                if (lateField != null) {
-                    return lateField.withId(attribute.id());
-                }
-            }
-            return expression;
-        }).transformUp(ExchangeSourceExec.class, exchangeSource -> {
-            ExchangeSourceExec exchangeSourceWithDoc = exchangeSourceWithDoc(exchangeSource, docAttribute);
-            List<Attribute> deferredAttributes = lateFieldAttributes.values()
-                .stream()
-                .sorted(java.util.Comparator.comparing(Attribute::name))
-                .map(Attribute.class::cast)
-                .toList();
-            Set<String> deferredNames = deferredAttributes.stream().map(Attribute::name).collect(Collectors.toSet());
-            List<Attribute> carryAttributes = exchangeSourceWithDoc.output()
-                .stream()
-                .filter(attr -> EsQueryExec.isDocAttribute(attr) == false)
-                .filter(attr -> deferredNames.contains(attr.name()) == false)
-                .toList();
-            return new MaterializeExec(
-                exchangeSource.source(),
-                exchangeSourceWithDoc,
-                docAttribute,
-                carryAttributes,
-                deferredAttributes,
-                MaterializeTarget.CURRENT_FINAL,
-                MaterializeMode.LOCAL
-            );
-        });
+        return lateMaterializationSpec.rewriteDeferredFieldReferences(mainPlan)
+            .transformUp(ExchangeSourceExec.class, lateMaterializationSpec::withMaterializeBoundary);
     }
 
     private static PhysicalPlan coordinatorPlanWithParentFinalBoundary(
         PhysicalPlan coordinatorPlan,
         ReductionPlan reductionPlan,
-        Map<String, FieldAttribute> lateFieldAttributes
+        ComputeService.LateMaterializationSpec lateMaterializationSpec
     ) {
-        Attribute docAttribute = reductionPlan.dataNodePlan().output().stream().filter(EsQueryExec::isDocAttribute).findFirst().orElseThrow();
         var replaced = new java.util.concurrent.atomic.AtomicBoolean();
         PhysicalPlan updatedPlan = coordinatorPlan.transformUp(ExchangeSourceExec.class, exchangeSource -> {
             if (replaced.compareAndSet(false, true)) {
-                ExchangeSourceExec exchangeSourceWithDoc = exchangeSourceWithDoc(exchangeSource, docAttribute);
-                List<Attribute> deferredAttributes = lateFieldAttributes.values()
-                    .stream()
-                    .sorted(java.util.Comparator.comparing(Attribute::name))
-                    .map(Attribute.class::cast)
-                    .toList();
-                Set<String> deferredNames = deferredAttributes.stream().map(Attribute::name).collect(Collectors.toSet());
-                List<Attribute> carryAttributes = exchangeSourceWithDoc.output()
-                    .stream()
-                    .filter(attr -> EsQueryExec.isDocAttribute(attr) == false)
-                    .filter(attr -> deferredNames.contains(attr.name()) == false)
-                    .toList();
-                return new MaterializeExec(
-                    exchangeSource.source(),
-                    exchangeSourceWithDoc,
-                    docAttribute,
-                    carryAttributes,
-                    deferredAttributes,
-                    MaterializeTarget.PARENT_FINAL,
-                    MaterializeMode.LOCAL
-                );
+                return lateMaterializationSpec.withMaterializeBoundary(exchangeSource);
             }
             return exchangeSource;
         });
@@ -936,16 +735,22 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
             if (sinkChild instanceof ProjectExec project) {
                 sinkChild = project.child();
             }
-            List<Attribute> sinkOutput = sinkChild.output().stream().filter(attr -> lateFieldAttributes.containsKey(attr.name()) == false).toList();
+            List<Attribute> sinkOutput = sinkChild.output()
+                .stream()
+                .filter(attr -> lateMaterializationSpec.deferredFieldNames().contains(attr.name()) == false)
+                .toList();
             updatedPlan = new ExchangeSinkExec(sink.source(), sinkOutput, sink.isIntermediateAgg(), sinkChild);
         }
         return updatedPlan;
     }
 
-    private static ExchangeSinkExec dataNodePlanWithParentFinalBoundary(ExchangeSinkExec dataNodePlan, Map<String, FieldAttribute> lateFieldAttributes) {
+    private static ExchangeSinkExec dataNodePlanWithParentFinalBoundary(
+        ExchangeSinkExec dataNodePlan,
+        ComputeService.LateMaterializationSpec lateMaterializationSpec
+    ) {
         FragmentExec fragmentExec = (FragmentExec) dataNodePlan.child();
         Project project = (Project) fragmentExec.fragment();
-        LateMaterializationPlanner.MaterializeBoundaryFragment boundary = parentFinalReductionBoundary(dataNodePlan, lateFieldAttributes).orElseThrow();
+        LateMaterializationPlanner.MaterializeBoundaryFragment boundary = parentFinalReductionBoundary(dataNodePlan, lateMaterializationSpec).orElseThrow();
         FragmentExec updatedFragment = fragmentExec.withFragment(
             new Project(project.source(), boundary.loweredTopN(), boundary.passthroughProjections(project.projections()))
         );
@@ -960,30 +765,134 @@ public class HybridLateMaterializationPlannerTests extends AbstractLocalPhysical
         Tuple<PhysicalPlan, PhysicalPlan> coordinatorAndDataPlan = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(subplan, config);
         ExchangeSinkExec dataNodePlan = (ExchangeSinkExec) coordinatorAndDataPlan.v2();
         ReductionPlan reductionPlan = reductionPlan(dataNodePlan);
-        Map<String, FieldAttribute> lateFields = parentFinalLateFieldAttributes(
+        ComputeService.LateMaterializationSpec lateMaterializationSpec = parentFinalLateMaterializationSpec(
             subplansAndMainPlan.v2(),
-            subplan,
             dataNodePlan,
             reductionPlan
         );
-        LateMaterializationPlanner.MaterializeBoundaryFragment boundary = parentFinalReductionBoundary(dataNodePlan, lateFields).orElseThrow();
+        LateMaterializationPlanner.MaterializeBoundaryFragment boundary = parentFinalReductionBoundary(dataNodePlan, lateMaterializationSpec)
+            .orElseThrow();
         assertThat(attributeNames(boundary.materialize().deferredAttributes()), equalTo(expectedDeferred));
         assertThat(boundary.materialize().target(), equalTo(MaterializeTarget.PARENT_FINAL));
         assertThat(attributeNames(boundary.passthroughOutput()), equalTo(Set.of("_doc", "_score", "_id", "_index")));
 
-        ExchangeSinkExec rewrittenDataPlan = dataNodePlanWithParentFinalBoundary(dataNodePlan, lateFields);
+        ExchangeSinkExec rewrittenDataPlan = dataNodePlanWithParentFinalBoundary(dataNodePlan, lateMaterializationSpec);
         assertThat(attributeNames(rewrittenDataPlan.output()), equalTo(attributeNames(boundary.passthroughOutput())));
+    }
+
+    private static ComputeService.LateMaterializationSpec currentFinalLateMaterializationSpec(
+        PhysicalPlan mainPlan,
+        ExchangeSinkExec dataNodePlan,
+        ReductionPlan reductionPlan
+    ) {
+        Attribute docAttribute = reductionPlan.dataNodePlan().output().stream().filter(EsQueryExec::isDocAttribute).findFirst().orElseThrow();
+        ComputeService.LateMaterializationSpec parentFinalLateMaterialization = parentFinalLateMaterializationSpec(
+            mainPlan,
+            dataNodePlan,
+            reductionPlan
+        );
+        return new ComputeService.LateMaterializationSpec(
+            docAttribute,
+            parentFinalLateMaterialization.deferredFieldAttributes(),
+            MaterializeTarget.CURRENT_FINAL
+        );
+    }
+
+    private static ComputeService.LateMaterializationSpec reductionLateMaterializationSpec(ReductionPlan reductionPlan) {
+        MaterializeExec materialize = materializeExecs(reductionPlan.nodeReducePlan()).stream()
+            .filter(exec -> exec.target() == MaterializeTarget.CURRENT_FINAL)
+            .findFirst()
+            .orElse(null);
+        return materialize == null
+            ? null
+            : new ComputeService.LateMaterializationSpec(
+                materialize.rowIdentity(),
+                materialize.deferredAttributes().stream().filter(FieldAttribute.class::isInstance).map(FieldAttribute.class::cast).toList(),
+                MaterializeTarget.CURRENT_FINAL
+            );
+    }
+
+    private static ComputeService.LateMaterializationSpec parentFinalLateMaterializationSpec(
+        PhysicalPlan mainPlan,
+        ExchangeSinkExec dataNodePlan,
+        ReductionPlan reductionPlan
+    ) {
+        Attribute docAttribute = reductionPlan.dataNodePlan().output().stream().filter(EsQueryExec::isDocAttribute).findFirst().orElseThrow();
+        ComputeService.LateMaterializationSpec mainLateMaterialization = new ComputeService.LateMaterializationSpec(
+            docAttribute,
+            fieldAttributesByName(dataNodePlan, referencedFieldNames(mainPlan)).values()
+                .stream()
+                .sorted(java.util.Comparator.comparing(Attribute::name))
+                .toList(),
+            MaterializeTarget.PARENT_FINAL
+        );
+        ComputeService.LateMaterializationSpec reductionLateMaterialization = reductionLateMaterializationSpec(reductionPlan);
+        List<FieldAttribute> deferredAttributes = new java.util.ArrayList<>(mainLateMaterialization.deferredFieldAttributes());
+        if (reductionLateMaterialization != null) {
+            deferredAttributes.addAll(reductionLateMaterialization.deferredFieldAttributes());
+        }
+        return new ComputeService.LateMaterializationSpec(docAttribute, deferredAttributes, MaterializeTarget.PARENT_FINAL);
+    }
+
+    private static Set<String> referencedFieldNames(PhysicalPlan plan) {
+        Set<String> referencedFieldNames = new java.util.HashSet<>();
+        plan.forEachExpressionDown(Attribute.class, attribute -> referencedFieldNames.add(attribute.name()));
+        return referencedFieldNames;
+    }
+
+    private static Map<String, FieldAttribute> fieldAttributesByName(
+        ExchangeSinkExec dataNodePlan,
+        Set<String> requestedFieldNames
+    ) {
+        Map<String, FieldAttribute> fieldAttributes = new java.util.LinkedHashMap<>();
+        FragmentExec fragmentExec = (FragmentExec) dataNodePlan.child();
+        Project project = (Project) fragmentExec.fragment();
+        Map<String, FieldAttribute> fragmentFieldAttributes = new java.util.HashMap<>();
+        fragmentExec.fragment().forEachExpressionDown(FieldAttribute.class, field -> fragmentFieldAttributes.putIfAbsent(field.name(), field));
+        fragmentExec.fragment()
+            .collect(org.elasticsearch.xpack.esql.plan.logical.EsRelation.class)
+            .forEach(
+                relation -> relation.output()
+                    .stream()
+                    .filter(FieldAttribute.class::isInstance)
+                    .map(FieldAttribute.class::cast)
+                    .forEach(field -> fragmentFieldAttributes.putIfAbsent(field.name(), field))
+            );
+        for (NamedExpression projection : project.projections()) {
+            if (requestedFieldNames.contains(projection.name()) == false) {
+                continue;
+            }
+            FieldAttribute fieldAttribute = null;
+            if (projection instanceof FieldAttribute field) {
+                fieldAttribute = field;
+            } else if (projection instanceof Alias alias && alias.child() instanceof FieldAttribute field) {
+                fieldAttribute = (FieldAttribute) field.withName(alias.name()).withId(alias.id());
+            }
+            if (fieldAttribute == null) {
+                fieldAttribute = fragmentFieldAttributes.get(projection.name());
+            }
+            if (fieldAttribute != null) {
+                fieldAttributes.putIfAbsent(projection.name(), fieldAttribute);
+            }
+        }
+        for (String requestedFieldName : requestedFieldNames) {
+            FieldAttribute fieldAttribute = fragmentFieldAttributes.get(requestedFieldName);
+            if (fieldAttribute != null) {
+                fieldAttributes.putIfAbsent(requestedFieldName, fieldAttribute);
+            }
+        }
+        return fieldAttributes;
     }
 
     private static java.util.Optional<LateMaterializationPlanner.MaterializeBoundaryFragment> parentFinalReductionBoundary(
         ExchangeSinkExec dataNodePlan,
-        Map<String, FieldAttribute> lateFieldAttributes
+        ComputeService.LateMaterializationSpec lateMaterializationSpec
     ) {
         FragmentExec fragmentExec = (FragmentExec) dataNodePlan.child();
         Project project = (Project) fragmentExec.fragment();
         return InsertMaterializePhase.materializeBoundaryFragment(
             project,
-            lateFieldAttributes.values().stream().sorted(java.util.Comparator.comparing(Attribute::name)).map(Attribute.class::cast).toList(),
+            lateMaterializationSpec.deferredAttributes(),
             MaterializeTarget.PARENT_FINAL
         );
     }
