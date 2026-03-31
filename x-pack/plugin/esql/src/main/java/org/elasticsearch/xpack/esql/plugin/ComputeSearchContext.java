@@ -8,6 +8,8 @@
 package org.elasticsearch.xpack.esql.plugin;
 
 import org.apache.lucene.util.SetOnce;
+import org.elasticsearch.core.AbstractRefCounted;
+import org.elasticsearch.core.RefCounted;
 import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.index.query.SearchExecutionContext;
@@ -30,10 +32,12 @@ class ComputeSearchContext implements Releasable {
     private final int index;
     private final SearchContext searchContext;
     private final SetOnce<ShardContext> shardContext = new SetOnce<>();
+    private final RefCounted refs;
 
     ComputeSearchContext(int index, SearchContext searchContext) {
         this.index = index;
         this.searchContext = searchContext;
+        this.refs = AbstractRefCounted.of(() -> Releasables.close(searchContext));
     }
 
     public int index() {
@@ -42,13 +46,22 @@ class ComputeSearchContext implements Releasable {
 
     ShardContext shardContext() {
         if (shardContext.get() == null) {
-            shardContext.set(createShardContext());
+            synchronized (this) {
+                if (shardContext.get() == null) {
+                    refs.incRef();
+                    shardContext.set(createShardContext());
+                }
+            }
         }
         return shardContext.get();
     }
 
     public SearchContext searchContext() {
         return searchContext;
+    }
+
+    void incRef() {
+        refs.incRef();
     }
 
     private ShardContext createShardContext() {
@@ -59,11 +72,15 @@ class ComputeSearchContext implements Releasable {
             }
         };
         searchContext.addReleasable(searchExecutionContext::releaseQueryConstructionMemory);
-        return new DefaultShardContext(index, this, searchExecutionContext, searchContext.request().getAliasFilter());
+        return new DefaultShardContext(index, this::decRef, searchExecutionContext, searchContext.request().getAliasFilter());
     }
 
     @Override
     public void close() {
-        Releasables.close(searchContext);
+        decRef();
+    }
+
+    boolean decRef() {
+        return refs.decRef();
     }
 }
