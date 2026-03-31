@@ -123,6 +123,7 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
         OriginalIndices originalIndices,
         ExchangeSourceHandler exchangeSource,
         Runnable runOnTaskFailure,
+        RemoteFetchService.TrackedSessions remoteFetchSessions,
         ActionListener<ComputeResponse> outListener
     ) {
         Integer maxConcurrentNodesPerCluster = PlanConcurrencyCalculator.INSTANCE.calculateNodesConcurrency(dataNodePlan, configuration);
@@ -199,6 +200,11 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                                 .equals(connection.getNode().getId());
                             boolean enableReduceNodeLateMaterialization = EsqlCapabilities.Cap.ENABLE_REDUCE_NODE_LATE_MATERIALIZATION
                                 .isEnabled();
+                            boolean supportsRetainedSearchContexts = connection.getTransportVersion()
+                                .supports(DataNodeRequest.ESQL_REMOTE_FETCH_RETAINED_CONTEXTS);
+                            boolean retainSearchContexts = remoteFetchSessions != null
+                                && computeService.plannerSettings().get().remoteFetchLateMaterialization()
+                                && supportsRetainedSearchContexts;
                             var dataNodeRequest = new DataNodeRequest(
                                 childSessionId,
                                 configuration,
@@ -212,8 +218,12 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                                 // TopN late materialization, listed below), as the node-reduce driver would end up doing the exact same
                                 // work as the final driver.
                                 queryPragmas.nodeLevelReduction() && sameNodeAsCoordinator == false,
-                                queryPragmas.nodeLevelReduction() && enableReduceNodeLateMaterialization
+                                queryPragmas.nodeLevelReduction() && enableReduceNodeLateMaterialization,
+                                retainSearchContexts
                             );
+                            if (retainSearchContexts) {
+                                remoteFetchSessions.track(connection.getNode(), nodeReduceSessionId(childSessionId));
+                            }
                             transportService.sendChildRequest(
                                 connection,
                                 ComputeService.DATA_ACTION_NAME,
@@ -362,6 +372,7 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                             new String[0],
                             IndicesOptions.STRICT_EXPAND_OPEN,
                             queryPragmas.nodeLevelReduction(),
+                            false,
                             false,
                             nodeSplits
                         );
@@ -785,6 +796,7 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                 plan,
                 request.runNodeLevelReduction(),
                 request.reductionLateMaterialization(),
+                request.retainSearchContexts(),
                 planTimeProfile
             );
         } else {
@@ -792,8 +804,9 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
             return;
         }
         final String sessionId = request.sessionId();
+        final String nodeReduceSessionId = nodeReduceSessionId(sessionId);
         request = new DataNodeRequest(
-            sessionId + "[n]", // internal session
+            nodeReduceSessionId, // internal session
             request.configuration(),
             request.clusterAlias(),
             request.shards(),
@@ -803,11 +816,32 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
             request.indicesOptions(),
             request.runNodeLevelReduction(),
             request.reductionLateMaterialization(),
+            request.retainSearchContexts(),
             request.externalSplits()
         );
         // the sender doesn't support retry on shard failures, so we need to fail fast here.
         final boolean failFastOnShardFailures = supportShardLevelRetryFailure(channel.getVersion()) == false;
         var computeSearchContexts = new AcquiredSearchContexts(request.shards().size());
+        ActionListener<DataNodeComputeResponse> responseListener;
+        if (request.retainSearchContexts()) {
+            final RetainedSearchContextsRegistry.Registration retainedSearchContexts;
+            try {
+                retainedSearchContexts = computeService.remoteFetchService()
+                    .retainSearchContexts(nodeReduceSessionId, computeSearchContexts);
+            } catch (Exception e) {
+                computeSearchContexts.close();
+                listener.onFailure(e);
+                return;
+            }
+            ((CancellableTask) task).addListener(retainedSearchContexts::close);
+            responseListener = ActionListener.wrap(listener::onResponse, e -> {
+                try (retainedSearchContexts) {
+                    listener.onFailure(e);
+                }
+            });
+        } else {
+            responseListener = ActionListener.releaseAfter(listener, computeSearchContexts);
+        }
         runComputeOnDataNode(
             (CancellableTask) task,
             sessionId,
@@ -818,8 +852,12 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
             computeSearchContexts,
             computeService.plannerSettings().get(),
             planTimeProfile,
-            ActionListener.releaseAfter(listener, computeSearchContexts)
+            responseListener
         );
+    }
+
+    private static String nodeReduceSessionId(String sessionId) {
+        return sessionId + "[n]";
     }
 
     private void handleExternalSourceRequest(
