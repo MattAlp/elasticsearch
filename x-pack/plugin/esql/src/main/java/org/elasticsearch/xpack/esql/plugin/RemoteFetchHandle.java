@@ -20,9 +20,10 @@ import java.util.Objects;
 /**
  * Serializable row handle for coordinator-driven remote fetch.
  * <p>
- * The existing {@code _doc} column is intentionally local-only because {@code DocBlock}s do not cross a transport
- * boundary. This handle captures the minimum routing information needed to revisit a document on its owning node
- * after the coordinator has already narrowed the candidate set.
+ * {@code DocBlock} references (shard ordinal, segment, doc) are only meaningful on the node that produced them —
+ * a coordinator receiving pages from multiple data nodes cannot resolve those local ordinals back to the original
+ * shard. This handle pairs the doc triple with the originating node and session so the coordinator can route a
+ * fetch request back to the owning node after narrowing the candidate set.
  */
 public record RemoteFetchHandle(String nodeId, String sessionId, int shard, int segment, int doc) implements Writeable {
     public static final Writeable.Reader<RemoteFetchHandle> READER = RemoteFetchHandle::new;

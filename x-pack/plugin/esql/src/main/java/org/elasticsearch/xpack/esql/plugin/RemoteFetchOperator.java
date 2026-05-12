@@ -257,6 +257,17 @@ public final class RemoteFetchOperator extends AsyncOperator<RemoteFetchOperator
         return new GroupedHandles(groups, groupByPosition, offsetByPosition);
     }
 
+    /**
+     * Validates pages returned by a single fetch group and determines the response schema.
+     * <p>
+     * Pages may contain exactly {@code outputFields.size()} columns (plain fetch) or one extra trailing column
+     * carrying an original-position mapping (pushdown with filtering). All pages in a group must use the same
+     * schema. For the plain-fetch case the total row count must equal the number of handles sent; for the
+     * position-mapped case rows may be fewer (filtered) so only the schema is checked.
+     *
+     * @return {@code true} if the pages carry an extra position-mapping column, {@code false} otherwise
+     * @throws IllegalStateException on column count mismatch, inconsistent schemas, or unexpected row counts
+     */
     private boolean validateFetchedPages(Group group, List<Page> pages) {
         int positions = 0;
         Boolean hasPositionMapping = null;
@@ -320,13 +331,21 @@ public final class RemoteFetchOperator extends AsyncOperator<RemoteFetchOperator
         }
     }
 
+    /**
+     * Merges fetched pages when a server-side pushdown filter may have dropped rows. The fetched pages carry an
+     * extra trailing column with original-position indices so we can match surviving rows back to the coordinator's
+     * input page. Rows whose position is absent from the fetch response are omitted from the output.
+     */
     private Page mergeFetchedPageWithFiltering(
         Page inputPage,
         int[] groupByPosition,
         int[] offsetByPosition,
         List<GroupPages> pagesByGroup
     ) {
+        // Build a per-group lookup from original handle offset -> (pageIndex, row) in the fetched pages
         List<Map<Integer, FetchedRowRef>> groupMappings = buildGroupMappings(pagesByGroup);
+
+        // Walk the input positions and keep only those that survived the pushdown filter
         List<Integer> originalPositions = new ArrayList<>(inputPage.getPositionCount());
         List<FetchedRowRef> keptRows = new ArrayList<>(inputPage.getPositionCount());
         for (int position = 0; position < inputPage.getPositionCount(); position++) {
@@ -338,6 +357,8 @@ public final class RemoteFetchOperator extends AsyncOperator<RemoteFetchOperator
                 keptRows.add(rowRef);
             }
         }
+
+        // Rebuild: copy kept input columns + append fetched field columns, both filtered to surviving rows
         Block[] outputBlocks = new Block[inputPage.getBlockCount() + outputFields.size()];
         Block.Builder[] builders = new Block.Builder[outputBlocks.length];
         boolean success = false;
