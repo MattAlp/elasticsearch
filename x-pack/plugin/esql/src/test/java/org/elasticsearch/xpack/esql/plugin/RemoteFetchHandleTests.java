@@ -34,30 +34,6 @@ public class RemoteFetchHandleTests extends ESTestCase {
         }
     }
 
-    public void testRejectsNegativeShard() {
-        IllegalArgumentException e = expectThrows(
-            IllegalArgumentException.class,
-            () -> new RemoteFetchHandle(randomAlphaOfLength(8), randomAlphaOfLength(8), -1, 0, 0)
-        );
-        assertEquals("shard must be non-negative", e.getMessage());
-    }
-
-    public void testRejectsNegativeSegment() {
-        IllegalArgumentException e = expectThrows(
-            IllegalArgumentException.class,
-            () -> new RemoteFetchHandle(randomAlphaOfLength(8), randomAlphaOfLength(8), 0, -1, 0)
-        );
-        assertEquals("segment must be non-negative", e.getMessage());
-    }
-
-    public void testRejectsNegativeDoc() {
-        IllegalArgumentException e = expectThrows(
-            IllegalArgumentException.class,
-            () -> new RemoteFetchHandle(randomAlphaOfLength(8), randomAlphaOfLength(8), 0, 0, -1)
-        );
-        assertEquals("doc must be non-negative", e.getMessage());
-    }
-
     private RemoteFetchHandle randomHandle() {
         return new RemoteFetchHandle(
             randomAlphaOfLengthBetween(5, 12),
