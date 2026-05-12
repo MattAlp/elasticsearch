@@ -423,7 +423,11 @@ public final class RemoteFetchOperator extends AsyncOperator<RemoteFetchOperator
                         Page page = pages.get(pageIndex);
                         IntBlock positionBlock = page.getBlock(page.getBlockCount() - 1);
                         for (int row = 0; row < page.getPositionCount(); row++) {
-                            mapping.put(positionBlock.getInt(row), new FetchedRowRef(group, pageIndex, row));
+                            int pos = positionBlock.getInt(row);
+                            FetchedRowRef prev = mapping.put(pos, new FetchedRowRef(group, pageIndex, row));
+                            if (prev != null) {
+                                throw new IllegalStateException("remote fetch returned duplicate position [" + pos + "]");
+                            }
                         }
                     }
                 } else {

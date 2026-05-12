@@ -557,7 +557,16 @@ public final class RemoteFetchService {
                 for (int row = 0; row < page.getPositionCount(); row++) {
                     builder.appendInt(position++);
                 }
-                withPosition.add(page.appendBlock(builder.build()));
+                Block positionBlock = builder.build();
+                Block[] blocks = new Block[page.getBlockCount() + 1];
+                for (int i = 0; i < page.getBlockCount(); i++) {
+                    blocks[i] = page.getBlock(i);
+                    blocks[i].incRef();
+                }
+                blocks[page.getBlockCount()] = positionBlock;
+                withPosition.add(new Page(page.getPositionCount(), blocks));
+            } finally {
+                page.releaseBlocks();
             }
         }
         return withPosition;
