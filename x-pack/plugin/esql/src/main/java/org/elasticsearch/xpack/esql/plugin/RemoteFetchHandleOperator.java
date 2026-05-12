@@ -7,6 +7,7 @@
 
 package org.elasticsearch.xpack.esql.plugin;
 
+import org.elasticsearch.common.io.stream.BytesStreamOutput;
 import org.elasticsearch.compute.data.Block;
 import org.elasticsearch.compute.data.BytesRefBlock;
 import org.elasticsearch.compute.data.DocBlock;
@@ -16,6 +17,9 @@ import org.elasticsearch.compute.operator.AbstractPageMappingOperator;
 import org.elasticsearch.compute.operator.DriverContext;
 import org.elasticsearch.compute.operator.Operator;
 import org.elasticsearch.core.Releasables;
+
+import java.io.IOException;
+import java.io.UncheckedIOException;
 
 /**
  * Encodes local {@code _doc} references into transport-safe remote fetch handles.
@@ -49,18 +53,23 @@ public final class RemoteFetchHandleOperator extends AbstractPageMappingOperator
     protected Page process(Page page) {
         Block[] blocks = new Block[page.getBlockCount()];
         boolean success = false;
-        try (BytesRefBlock.Builder handleBuilder = driverContext.blockFactory().newBytesRefBlockBuilder(page.getPositionCount())) {
+        try (
+            BytesRefBlock.Builder handleBuilder = driverContext.blockFactory().newBytesRefBlockBuilder(page.getPositionCount());
+            BytesStreamOutput scratch = new BytesStreamOutput()
+        ) {
             DocVector docVector = ((DocBlock) page.getBlock(docChannel)).asVector();
             for (int position = 0; position < page.getPositionCount(); position++) {
-                handleBuilder.appendBytesRef(
-                    new RemoteFetchHandle(
-                        nodeId,
-                        sessionId,
-                        docVector.shards().getInt(position),
-                        docVector.segments().getInt(position),
-                        docVector.docs().getInt(position)
-                    ).toBytesRef()
-                );
+                scratch.reset();
+                try {
+                    scratch.writeString(nodeId);
+                    scratch.writeString(sessionId);
+                    scratch.writeVInt(docVector.shards().getInt(position));
+                    scratch.writeVInt(docVector.segments().getInt(position));
+                    scratch.writeVInt(docVector.docs().getInt(position));
+                } catch (IOException e) {
+                    throw new UncheckedIOException("failed to encode remote fetch handle", e);
+                }
+                handleBuilder.appendBytesRef(scratch.bytes().toBytesRef());
             }
             for (int block = 0; block < blocks.length; block++) {
                 if (block == docChannel) {
