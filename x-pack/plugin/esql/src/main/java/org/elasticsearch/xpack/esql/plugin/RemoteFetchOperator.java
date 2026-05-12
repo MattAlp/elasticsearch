@@ -38,6 +38,12 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public final class RemoteFetchOperator extends AsyncOperator<RemoteFetchOperator.RemoteFetchResult> {
     record RemoteFetchResult(Page inputPage, int[] groupByPosition, int[] offsetByPosition, List<GroupPages> pagesByGroup) {
+        RemoteFetchResult {
+            if ((groupByPosition == null) != (offsetByPosition == null) || (groupByPosition == null) != (pagesByGroup == null)) {
+                throw new IllegalArgumentException("groupByPosition, offsetByPosition, and pagesByGroup must all be null or all non-null");
+            }
+        }
+
         static RemoteFetchResult passthrough(Page inputPage) {
             return new RemoteFetchResult(inputPage, null, null, null);
         }
@@ -173,10 +179,7 @@ public final class RemoteFetchOperator extends AsyncOperator<RemoteFetchOperator
                     hasPositionMapping = validateFetchedPages(group, pages);
                 } catch (Exception e) {
                     releasePages(pages);
-                    if (completed.compareAndSet(false, true)) {
-                        releasePagesByGroup(pagesByGroup);
-                        listener.onFailure(e);
-                    }
+                    failAndRelease(completed, pagesByGroup, listener, e);
                     return;
                 }
                 pagesByGroup.set(currentGroup, new GroupPages(pages, hasPositionMapping));
@@ -185,12 +188,7 @@ public final class RemoteFetchOperator extends AsyncOperator<RemoteFetchOperator
                         new RemoteFetchResult(inputPage, groupedHandles.groupByPosition(), groupedHandles.offsetByPosition(), pagesByGroup)
                     );
                 }
-            }, e -> {
-                if (completed.compareAndSet(false, true)) {
-                    releasePagesByGroup(pagesByGroup);
-                    listener.onFailure(e);
-                }
-            }));
+            }, e -> failAndRelease(completed, pagesByGroup, listener, e)));
         }
     }
 
@@ -205,6 +203,18 @@ public final class RemoteFetchOperator extends AsyncOperator<RemoteFetchOperator
     @Override
     protected void doClose() {
         client.close();
+    }
+
+    private static void failAndRelease(
+        AtomicBoolean completed,
+        List<GroupPages> pagesByGroup,
+        ActionListener<RemoteFetchResult> listener,
+        Exception e
+    ) {
+        if (completed.compareAndSet(false, true)) {
+            releasePagesByGroup(pagesByGroup);
+            listener.onFailure(e);
+        }
     }
 
     @Override
@@ -451,9 +461,7 @@ public final class RemoteFetchOperator extends AsyncOperator<RemoteFetchOperator
 
     private static void releasePages(List<Page> pages) {
         if (pages != null) {
-            for (Page page : pages) {
-                Releasables.closeExpectNoException(page::releaseBlocks);
-            }
+            Releasables.closeExpectNoException(Releasables.wrap(pages));
         }
     }
 
