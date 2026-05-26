@@ -258,6 +258,7 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
             new InsertFromAggregateMetricDouble(),
             new ResolveImplicitTimeSeriesIdentityGrouping(),
             new ResolveUnionTypesInUnionAll(),
+            new PropagateSyntheticAttributesThroughProjects(),
             new ResolveUnmapped()
         ),
         new Batch<>(
@@ -2402,22 +2403,7 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
                 return esr;
             });
             if (res.equals(plan) == false) {
-                res = res.transformUp(Project.class, p -> {
-                    List<Attribute> syntheticAttributesToCarryOver = new ArrayList<>();
-                    for (Attribute attr : p.inputSet()) {
-                        if (attr.synthetic() && p.outputSet().contains(attr) == false) {
-                            syntheticAttributesToCarryOver.add(attr);
-                        }
-                    }
-
-                    if (syntheticAttributesToCarryOver.isEmpty()) {
-                        return p;
-                    }
-
-                    List<NamedExpression> newProjections = new ArrayList<>(p.projections());
-                    newProjections.addAll(syntheticAttributesToCarryOver);
-                    return new Project(p.source(), p.child(), newProjections);
-                });
+                res = carryOverSyntheticAttributesThroughProjects(res);
             }
             return res;
         }
@@ -3034,6 +3020,13 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
                     : unionAll
             );
 
+            // Synthetic conversion attributes introduced in UnionAll output must survive intermediate
+            // RENAME/KEEP/DROP projects above the UnionAll until UnionTypesCleanup strips synthetics from
+            // user-visible output.
+            if (convertFunctionsToAttributes.isEmpty() == false) {
+                planWithConvertFunctionsPushedDown = carryOverSyntheticAttributesThroughProjects(planWithConvertFunctionsPushedDown);
+            }
+
             // Then replace the conversion functions with the corresponding attributes in the UnionAll output
             LogicalPlan planWithConvertFunctionsReplaced = replaceConvertFunctions(
                 planWithConvertFunctionsPushedDown,
@@ -3542,5 +3535,43 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
             });
             return isEmpty.get();
         }
+    }
+
+    /**
+     * Ensure synthetic attributes already present in a {@link Project}'s input remain projected.
+     * <p>
+     * Multiple analysis rules create synthetic attributes (e.g. union-type conversion placeholders
+     * named {@code $$<field>$converted_to$<type>}) and then rewrite expressions above to reference
+     * them. If an intermediate {@link Project} created by commands like {@code RENAME}/{@code KEEP}/
+     * {@code DROP} omits these attributes, downstream references become unbound and optimization fails
+     * with missing-reference errors.
+     */
+    private static class PropagateSyntheticAttributesThroughProjects extends Rule<LogicalPlan, LogicalPlan> {
+        @Override
+        public LogicalPlan apply(LogicalPlan plan) {
+            return plan.resolved() ? carryOverSyntheticAttributesThroughProjects(plan) : plan;
+        }
+    }
+
+    private static LogicalPlan carryOverSyntheticAttributesThroughProjects(LogicalPlan plan) {
+        AttributeSet.Builder requiredByAncestors = plan.outputSet().asBuilder();
+        return plan.transformDown(p -> {
+            LogicalPlan updated = p;
+            if (p instanceof Project project) {
+                List<Attribute> syntheticAttributesToCarryOver = new ArrayList<>();
+                for (Attribute attr : project.inputSet()) {
+                    if (attr.synthetic() && requiredByAncestors.contains(attr) && project.outputSet().contains(attr) == false) {
+                        syntheticAttributesToCarryOver.add(attr);
+                    }
+                }
+                if (syntheticAttributesToCarryOver.isEmpty() == false) {
+                    List<NamedExpression> newProjections = new ArrayList<>(project.projections());
+                    newProjections.addAll(syntheticAttributesToCarryOver);
+                    updated = new Project(project.source(), project.child(), newProjections);
+                }
+            }
+            requiredByAncestors.addAll(updated.references());
+            return updated;
+        });
     }
 }
