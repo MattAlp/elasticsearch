@@ -1588,6 +1588,11 @@ public class EsqlCapabilities {
         REMOTE_ENRICH_AFTER_LOOKUP_JOIN,
 
         /**
+         * Support for remote fetch, which retains data-node search contexts and performs a follow-up fetch phase from the coordinator.
+         */
+        REMOTE_FETCH(Build.current().isSnapshot()),
+
+        /**
          * MATCH PHRASE function
          */
         MATCH_PHRASE_FUNCTION,
