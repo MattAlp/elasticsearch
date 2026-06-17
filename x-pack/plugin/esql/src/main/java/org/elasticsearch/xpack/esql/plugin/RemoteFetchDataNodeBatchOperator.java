@@ -7,12 +7,10 @@
 
 package org.elasticsearch.xpack.esql.plugin;
 
-import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.TransportVersion;
 import org.elasticsearch.common.io.stream.NamedWriteableRegistry;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
-import org.elasticsearch.compute.data.BytesRefBlock;
 import org.elasticsearch.compute.data.Page;
 import org.elasticsearch.compute.operator.Operator;
 import org.elasticsearch.core.Releasables;
@@ -20,7 +18,6 @@ import org.elasticsearch.xcontent.XContentBuilder;
 
 import java.io.IOException;
 import java.util.ArrayDeque;
-import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
 import java.util.Objects;
@@ -121,19 +118,7 @@ final class RemoteFetchDataNodeBatchOperator implements Operator {
         if (page.getBlockCount() != 1) {
             throw new IllegalStateException("expected a single handle block but got [" + page.getBlockCount() + "]");
         }
-        BytesRefBlock handlesBlock = page.getBlock(0);
-        List<RemoteFetchHandle> handles = new ArrayList<>(page.getPositionCount());
-        BytesRef scratch = new BytesRef();
-        for (int position = 0; position < page.getPositionCount(); position++) {
-            if (handlesBlock.isNull(position)) {
-                throw new IllegalStateException("remote fetch handle block cannot contain nulls");
-            }
-            if (handlesBlock.getValueCount(position) != 1) {
-                throw new IllegalStateException("remote fetch handle block must have exactly one value per row");
-            }
-            handles.add(RemoteFetchHandle.fromBytesRef(handlesBlock.getBytesRef(handlesBlock.getFirstValueIndex(position), scratch)));
-        }
-        return handles;
+        return RemoteFetchHandleBlock.decodeHandles(page.getBlock(0), page.getPositionCount());
     }
 
     private void enqueue(List<Page> fetchedPages) {

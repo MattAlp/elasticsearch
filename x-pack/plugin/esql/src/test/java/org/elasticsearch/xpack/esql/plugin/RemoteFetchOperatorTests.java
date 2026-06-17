@@ -712,16 +712,18 @@ public class RemoteFetchOperatorTests extends ESTestCase {
         }
     }
 
-    private static BytesRefBlock handles(DriverContext driverContext) {
-        try (BytesRefBlock.Builder builder = driverContext.blockFactory().newBytesRefBlockBuilder(3)) {
-            builder.appendBytesRef(new RemoteFetchHandle("node-a", "session-a", 1, 0, 11).toBytesRef());
-            builder.appendBytesRef(new RemoteFetchHandle("node-b", "session-b", 2, 0, 22).toBytesRef());
-            builder.appendBytesRef(new RemoteFetchHandle("node-a", "session-a", 1, 0, 33).toBytesRef());
-            return builder.build();
-        }
+    private static Block handles(DriverContext driverContext) {
+        return RemoteFetchHandleBlock.fromHandles(
+            driverContext.blockFactory(),
+            List.of(
+                new RemoteFetchHandle("node-a", "session-a", 1, 0, 11),
+                new RemoteFetchHandle("node-b", "session-b", 2, 0, 22),
+                new RemoteFetchHandle("node-a", "session-a", 1, 0, 33)
+            )
+        );
     }
 
-    private static BytesRefBlock handlesWithNull(DriverContext driverContext) {
+    private static Block handlesWithNull(DriverContext driverContext) {
         try (BytesRefBlock.Builder builder = driverContext.blockFactory().newBytesRefBlockBuilder(1)) {
             builder.appendNull();
             return builder.build();
@@ -772,7 +774,7 @@ public class RemoteFetchOperatorTests extends ESTestCase {
         RecordingClient(DriverContext driverContext) {}
 
         @Override
-        public RemoteFetchService.Exchange openExchange(
+        public RemoteFetchService.TargetExchange openTargetExchange(
             String nodeId,
             String sessionId,
             List<RemoteFetchService.FetchField> fields,
@@ -803,7 +805,7 @@ public class RemoteFetchOperatorTests extends ESTestCase {
         @Override
         public void close() {}
 
-        private class RecordingExchange implements RemoteFetchService.Exchange {
+        private class RecordingExchange implements RemoteFetchService.TargetExchange {
             private final String nodeId;
             private final String sessionId;
             private final Queue<Page> pages = new ArrayDeque<>();

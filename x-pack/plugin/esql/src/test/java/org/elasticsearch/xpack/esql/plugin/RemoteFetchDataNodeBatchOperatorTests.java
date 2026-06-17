@@ -7,7 +7,6 @@
 
 package org.elasticsearch.xpack.esql.plugin;
 
-import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.compute.data.BlockFactory;
 import org.elasticsearch.compute.data.BytesRefBlock;
 import org.elasticsearch.compute.data.IntBlock;
@@ -120,6 +119,25 @@ public class RemoteFetchDataNodeBatchOperatorTests extends OperatorTestCase {
         assertThat(captured, equalTo(expected));
     }
 
+    public void testDecodesCompositeHandleBlock() {
+        DriverContext driverContext = driverContext();
+        List<RemoteFetchHandle> expected = List.of(handle("node-1", "session-1", 10), handle("node-1", "session-1", 20));
+        AtomicInteger calls = new AtomicInteger();
+        List<RemoteFetchHandle> captured = new ArrayList<>();
+
+        try (RemoteFetchDataNodeBatchOperator operator = new RemoteFetchDataNodeBatchOperator(handles -> {
+            calls.incrementAndGet();
+            captured.addAll(handles);
+            return List.of();
+        })) {
+            operator.addInput(compositeHandlesPage(driverContext, expected));
+            assertNull(operator.getOutput());
+        }
+
+        assertThat(calls.get(), equalTo(1));
+        assertThat(captured, equalTo(expected));
+    }
+
     public void testRejectsHandlesFromDifferentTargetSessionsInSingleBatch() {
         DriverContext driverContext = driverContext();
         try (RemoteFetchDataNodeBatchOperator operator = new RemoteFetchDataNodeBatchOperator(handles -> List.of())) {
@@ -150,6 +168,10 @@ public class RemoteFetchDataNodeBatchOperatorTests extends OperatorTestCase {
         }
     }
 
+    private static Page compositeHandlesPage(DriverContext driverContext, List<RemoteFetchHandle> handles) {
+        return new Page(RemoteFetchHandleBlock.fromHandles(driverContext.blockFactory(), handles));
+    }
+
     private static Page singleIntPage(DriverContext driverContext, int value) {
         try (IntBlock.Builder builder = driverContext.blockFactory().newIntBlockBuilder(1)) {
             builder.appendInt(value);
@@ -168,14 +190,9 @@ public class RemoteFetchDataNodeBatchOperatorTests extends OperatorTestCase {
 
     private static List<Integer> docsFromHandlePages(List<Page> pages) {
         List<Integer> docs = new ArrayList<>();
-        BytesRef scratch = new BytesRef();
         for (Page page : pages) {
-            BytesRefBlock block = page.getBlock(0);
-            for (int position = 0; position < page.getPositionCount(); position++) {
-                assertThat(block.getValueCount(position), equalTo(1));
-                RemoteFetchHandle handle = RemoteFetchHandle.fromBytesRef(block.getBytesRef(block.getFirstValueIndex(position), scratch));
-                docs.add(Math.toIntExact(handle.doc()));
-            }
+            List<RemoteFetchHandle> handles = RemoteFetchHandleBlock.decodeHandles(page.getBlock(0), page.getPositionCount());
+            handles.forEach(handle -> docs.add(Math.toIntExact(handle.doc())));
         }
         return docs;
     }

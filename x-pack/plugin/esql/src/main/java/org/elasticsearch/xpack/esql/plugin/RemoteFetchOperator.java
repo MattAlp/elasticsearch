@@ -7,11 +7,9 @@
 
 package org.elasticsearch.xpack.esql.plugin;
 
-import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.common.util.concurrent.ThreadContext;
 import org.elasticsearch.compute.data.BatchMetadata;
 import org.elasticsearch.compute.data.Block;
-import org.elasticsearch.compute.data.BytesRefBlock;
 import org.elasticsearch.compute.data.IntBlock;
 import org.elasticsearch.compute.data.Page;
 import org.elasticsearch.compute.operator.DriverContext;
@@ -116,7 +114,7 @@ public final class RemoteFetchOperator implements Operator {
 
     private static final class PendingGroup {
         private final Group group;
-        private final RemoteFetchService.Exchange exchange;
+        private final RemoteFetchService.TargetExchange exchange;
         private final long batchId;
         private final List<Page> pages = new ArrayList<>();
         private boolean batchSent;
@@ -124,7 +122,7 @@ public final class RemoteFetchOperator implements Operator {
         private boolean complete;
         private boolean hasPositionMapping;
 
-        private PendingGroup(Group group, RemoteFetchService.Exchange exchange, long batchId) {
+        private PendingGroup(Group group, RemoteFetchService.TargetExchange exchange, long batchId) {
             this.group = group;
             this.exchange = exchange;
             this.batchId = batchId;
@@ -144,7 +142,7 @@ public final class RemoteFetchOperator implements Operator {
     private final int maxOutstandingRequests;
     private final RemoteFetchService.Client client;
     private final AtomicLong batchIds = new AtomicLong();
-    private final Map<TargetSession, RemoteFetchService.Exchange> exchanges = new HashMap<>();
+    private final Map<TargetSession, RemoteFetchService.TargetExchange> exchanges = new HashMap<>();
     private final Map<Long, PendingGroup> pendingByBatch = new HashMap<>();
     private final Deque<PendingInput> pendingInputs = new ArrayDeque<>();
     private boolean finishing;
@@ -203,9 +201,15 @@ public final class RemoteFetchOperator implements Operator {
             pendingInput = new PendingInput(inputPage, groupedHandles.groupByPosition(), groupedHandles.offsetByPosition(), pendingGroups);
             pendingInputs.addLast(pendingInput);
             for (Group group : groupedHandles.groups()) {
-                RemoteFetchService.Exchange exchange = exchanges.computeIfAbsent(
+                RemoteFetchService.TargetExchange exchange = exchanges.computeIfAbsent(
                     group.target,
-                    target -> client.openExchange(target.nodeId(), target.retainedSessionId(), requestFields, pushdownPlan, configuration)
+                    target -> client.openTargetExchange(
+                        target.nodeId(),
+                        target.retainedSessionId(),
+                        requestFields,
+                        pushdownPlan,
+                        configuration
+                    )
                 );
                 long batchId = batchIds.incrementAndGet();
                 PendingGroup pendingGroup = new PendingGroup(group, exchange, batchId);
@@ -232,7 +236,7 @@ public final class RemoteFetchOperator implements Operator {
     @Override
     public void finish() {
         finishing = true;
-        for (RemoteFetchService.Exchange exchange : exchanges.values()) {
+        for (RemoteFetchService.TargetExchange exchange : exchanges.values()) {
             exchange.finish();
         }
     }
@@ -246,7 +250,7 @@ public final class RemoteFetchOperator implements Operator {
         if (finishing == false || pendingInputs.isEmpty() == false) {
             return false;
         }
-        for (RemoteFetchService.Exchange exchange : exchanges.values()) {
+        for (RemoteFetchService.TargetExchange exchange : exchanges.values()) {
             if (exchange.isFinished() == false) {
                 return false;
             }
@@ -300,7 +304,7 @@ public final class RemoteFetchOperator implements Operator {
             if (needsInput()) {
                 return NOT_BLOCKED;
             }
-            for (RemoteFetchService.Exchange exchange : exchanges.values()) {
+            for (RemoteFetchService.TargetExchange exchange : exchanges.values()) {
                 if (exchange.isFinished() == false) {
                     return exchange.waitForCompletion();
                 }
@@ -325,7 +329,7 @@ public final class RemoteFetchOperator implements Operator {
         }
         pendingInputs.clear();
         pendingByBatch.clear();
-        for (RemoteFetchService.Exchange exchange : exchanges.values()) {
+        for (RemoteFetchService.TargetExchange exchange : exchanges.values()) {
             Releasables.closeExpectNoException(exchange);
         }
         client.close();
@@ -335,7 +339,7 @@ public final class RemoteFetchOperator implements Operator {
         boolean foundPage;
         do {
             foundPage = false;
-            for (RemoteFetchService.Exchange exchange : exchanges.values()) {
+            for (RemoteFetchService.TargetExchange exchange : exchanges.values()) {
                 Page page;
                 while ((page = exchange.pollPage()) != null) {
                     foundPage = true;
@@ -355,7 +359,7 @@ public final class RemoteFetchOperator implements Operator {
         if (failure != null) {
             return true;
         }
-        for (RemoteFetchService.Exchange exchange : exchanges.values()) {
+        for (RemoteFetchService.TargetExchange exchange : exchanges.values()) {
             Exception exchangeFailure = exchange.getFailure();
             if (exchangeFailure != null) {
                 failure = exchangeFailure;
@@ -432,23 +436,15 @@ public final class RemoteFetchOperator implements Operator {
     }
 
     private GroupedHandles decodeHandles(Page inputPage) {
-        BytesRefBlock handlesBlock = inputPage.getBlock(handleChannel);
+        Block handlesBlock = inputPage.getBlock(handleChannel);
+        List<RemoteFetchHandle> decodedHandles = RemoteFetchHandleBlock.decodeHandles(handlesBlock, inputPage.getPositionCount());
         Map<TargetSession, Integer> groupLookup = new LinkedHashMap<>();
         List<Group> groups = new ArrayList<>();
         int[] groupByPosition = new int[inputPage.getPositionCount()];
         int[] offsetByPosition = new int[inputPage.getPositionCount()];
-        BytesRef scratch = new BytesRef();
 
         for (int position = 0; position < inputPage.getPositionCount(); position++) {
-            if (handlesBlock.isNull(position)) {
-                throw new IllegalStateException("remote fetch handle column cannot contain nulls");
-            }
-            if (handlesBlock.getValueCount(position) != 1) {
-                throw new IllegalStateException("remote fetch handle column must contain exactly one handle per row");
-            }
-            RemoteFetchHandle handle = RemoteFetchHandle.fromBytesRef(
-                handlesBlock.getBytesRef(handlesBlock.getFirstValueIndex(position), scratch)
-            );
+            RemoteFetchHandle handle = decodedHandles.get(position);
             TargetSession target = new TargetSession(handle.nodeId(), handle.retainedSessionId());
             Integer groupIndex = groupLookup.get(target);
             if (groupIndex == null) {
@@ -605,33 +601,30 @@ public final class RemoteFetchOperator implements Operator {
 
         // Rebuild: copy kept input columns + append fetched field columns, both filtered to surviving rows
         Block[] outputBlocks = new Block[inputPage.getBlockCount() + outputFields.size()];
-        Block.Builder[] builders = new Block.Builder[outputBlocks.length];
+        Block.Builder[] fetchedBuilders = new Block.Builder[outputFields.size()];
         boolean success = false;
         try {
+            int[] keptInputPositions = new int[originalPositions.size()];
+            for (int i = 0; i < originalPositions.size(); i++) {
+                keptInputPositions[i] = originalPositions.get(i);
+            }
+
             for (int i = 0; i < inputPage.getBlockCount(); i++) {
-                builders[i] = inputPage.getBlock(i).elementType().newBlockBuilder(originalPositions.size(), driverContext.blockFactory());
+                outputBlocks[i] = inputPage.getBlock(i).filter(false, keptInputPositions);
             }
             for (int i = 0; i < outputFields.size(); i++) {
-                builders[inputPage.getBlockCount() + i] = PlannerUtils.toElementType(outputFields.get(i).dataType())
+                fetchedBuilders[i] = PlannerUtils.toElementType(outputFields.get(i).dataType())
                     .newBlockBuilder(originalPositions.size(), driverContext.blockFactory());
             }
             for (int i = 0; i < originalPositions.size(); i++) {
-                int inputPos = originalPositions.get(i);
-                for (int block = 0; block < inputPage.getBlockCount(); block++) {
-                    builders[block].copyFrom(inputPage.getBlock(block), inputPos, inputPos + 1);
-                }
                 FetchedRowRef rowRef = keptRows.get(i);
                 Page fetchedPage = pagesByGroup.get(rowRef.group()).pages().get(rowRef.pageIndex());
                 for (int field = 0; field < outputFields.size(); field++) {
-                    builders[inputPage.getBlockCount() + field].copyFrom(
-                        fetchedPage.getBlock(field),
-                        rowRef.position(),
-                        rowRef.position() + 1
-                    );
+                    fetchedBuilders[field].copyFrom(fetchedPage.getBlock(field), rowRef.position(), rowRef.position() + 1);
                 }
             }
-            for (int i = 0; i < outputBlocks.length; i++) {
-                outputBlocks[i] = builders[i].build();
+            for (int field = 0; field < outputFields.size(); field++) {
+                outputBlocks[inputPage.getBlockCount() + field] = fetchedBuilders[field].build();
             }
             Page output = new Page(originalPositions.size(), outputBlocks);
             success = true;
@@ -639,7 +632,7 @@ public final class RemoteFetchOperator implements Operator {
         } finally {
             inputPage.releaseBlocks();
             releasePagesByGroup(pagesByGroup);
-            Releasables.closeExpectNoException(builders);
+            Releasables.closeExpectNoException(fetchedBuilders);
             if (success == false) {
                 Releasables.closeExpectNoException(outputBlocks);
             }

@@ -8,12 +8,10 @@
 package org.elasticsearch.xpack.esql.expression.function.scalar;
 
 import org.apache.lucene.util.RamUsageEstimator;
-import org.elasticsearch.common.io.stream.BytesStreamOutput;
 import org.elasticsearch.common.io.stream.NamedWriteableRegistry;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.compute.data.Block;
-import org.elasticsearch.compute.data.BytesRefBlock;
 import org.elasticsearch.compute.data.DocBlock;
 import org.elasticsearch.compute.data.DocVector;
 import org.elasticsearch.compute.data.Page;
@@ -27,10 +25,9 @@ import org.elasticsearch.xpack.esql.core.tree.NodeInfo;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.io.stream.PlanStreamInput;
-import org.elasticsearch.xpack.esql.plugin.RemoteFetchHandle;
+import org.elasticsearch.xpack.esql.plugin.RemoteFetchHandleBlock;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.util.List;
 import java.util.Objects;
 
@@ -185,35 +182,14 @@ public class RemoteFetchHandleFunction extends EsqlScalarFunction {
 
         @Override
         public Block eval(Page page) {
-            try (
-                Block block = doc.eval(page);
-                BytesRefBlock.Builder handleBuilder = driverContext.blockFactory().newBytesRefBlockBuilder(page.getPositionCount());
-                BytesStreamOutput scratch = new BytesStreamOutput()
-            ) {
+            try (Block block = doc.eval(page)) {
                 if (block instanceof DocBlock == false) {
                     throw new IllegalStateException(
                         "remote fetch handle requires a _doc block but got [" + block.getClass().getName() + "]"
                     );
                 }
-                // DocBlock is always single-valued and non-null by construction.
                 DocVector docVector = ((DocBlock) block).asVector();
-                for (int position = 0; position < page.getPositionCount(); position++) {
-                    scratch.reset();
-                    try {
-                        RemoteFetchHandle.encodeTo(
-                            scratch,
-                            nodeId,
-                            retainedSessionId,
-                            docVector.shards().getInt(position),
-                            docVector.segments().getInt(position),
-                            docVector.docs().getInt(position)
-                        );
-                    } catch (IOException e) {
-                        throw new UncheckedIOException("failed to encode remote fetch handle", e);
-                    }
-                    handleBuilder.appendBytesRef(scratch.bytes().toBytesRef());
-                }
-                return handleBuilder.build();
+                return RemoteFetchHandleBlock.fromDocVector(driverContext.blockFactory(), docVector, nodeId, retainedSessionId);
             }
         }
 

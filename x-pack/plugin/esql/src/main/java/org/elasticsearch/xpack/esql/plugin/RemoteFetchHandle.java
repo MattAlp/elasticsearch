@@ -23,10 +23,9 @@ import java.util.Objects;
  * shard. This handle pairs the doc triple with the originating node and retained session so the coordinator can route a
  * fetch request back to the owning node after narrowing the candidate set.
  * <p>
- * Remote fetch deliberately carries this as one serialized {@code keyword}-like value per row. A struct-of-arrays
- * representation would save repeated node/retained-session bytes, but it would require a new internal data type and block
- * implementation to keep the handle as a single logical column across generic projection, exchange, and top-N
- * operators. The serialized form keeps this prototype on existing block/exchange machinery.
+ * Remote fetch now carries these values in an internal {@code CompositeBlock} struct-of-arrays representation
+ * ({@link RemoteFetchHandleBlock}) so exchange pages avoid per-row blob encoding/decoding. The bytes form remains
+ * available for backwards-compatible test fixtures and transitional readers.
  * <p>
  * This is intentionally a bytes payload contract for compute pages, not a transport-level wire contract. If later
  * phases need explicit cross-cluster routing identity in transport-scoped handle fields, introduce an explicit

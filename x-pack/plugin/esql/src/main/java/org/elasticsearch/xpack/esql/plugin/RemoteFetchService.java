@@ -24,7 +24,6 @@ import org.elasticsearch.common.util.concurrent.ThreadContext;
 import org.elasticsearch.compute.data.BatchMetadata;
 import org.elasticsearch.compute.data.BlockFactory;
 import org.elasticsearch.compute.data.BlockStreamInput;
-import org.elasticsearch.compute.data.BytesRefBlock;
 import org.elasticsearch.compute.data.LocalCircuitBreaker;
 import org.elasticsearch.compute.data.Page;
 import org.elasticsearch.compute.lucene.IndexedByShardId;
@@ -183,12 +182,7 @@ public final class RemoteFetchService {
     }
 
     private Page buildHandlesPage(List<RemoteFetchHandle> handles, long batchId) {
-        try (BytesRefBlock.Builder builder = blockFactory.newBytesRefBlockBuilder(handles.size())) {
-            for (RemoteFetchHandle handle : handles) {
-                builder.appendBytesRef(handle.toBytesRef());
-            }
-            return new Page(new BatchMetadata(batchId, 0, true), builder.build());
-        }
+        return new Page(new BatchMetadata(batchId, 0, true), RemoteFetchHandleBlock.fromHandles(blockFactory, handles));
     }
 
     private static Configuration readConfiguration(StreamInput in) throws IOException {

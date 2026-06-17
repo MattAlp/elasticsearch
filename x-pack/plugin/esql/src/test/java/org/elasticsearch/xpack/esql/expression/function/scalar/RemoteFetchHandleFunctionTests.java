@@ -7,9 +7,7 @@
 
 package org.elasticsearch.xpack.esql.expression.function.scalar;
 
-import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.common.util.BigArrays;
-import org.elasticsearch.compute.data.BytesRefBlock;
 import org.elasticsearch.compute.data.DocBlock;
 import org.elasticsearch.compute.data.IntBlock;
 import org.elasticsearch.compute.data.Page;
@@ -26,6 +24,7 @@ import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.evaluator.EvalMapper;
 import org.elasticsearch.xpack.esql.planner.Layout;
 import org.elasticsearch.xpack.esql.plugin.RemoteFetchHandle;
+import org.elasticsearch.xpack.esql.plugin.RemoteFetchHandleBlock;
 
 import java.util.List;
 
@@ -71,10 +70,10 @@ public class RemoteFetchHandleFunctionTests extends ESTestCase {
             assertEquals(100, sortValues.getInt(0));
             assertEquals(200, sortValues.getInt(1));
 
-            BytesRefBlock handles = output.getBlock(2);
-            assertEquals(2, handles.getPositionCount());
-            assertEquals(new RemoteFetchHandle("node-a", "session-a", 1, 2, 10), decode(handles, 0));
-            assertEquals(new RemoteFetchHandle("node-a", "session-a", 3, 4, 20), decode(handles, 1));
+            List<RemoteFetchHandle> handles = RemoteFetchHandleBlock.decodeHandles(output.getBlock(2), output.getPositionCount());
+            assertEquals(2, handles.size());
+            assertEquals(new RemoteFetchHandle("node-a", "session-a", 1, 2, 10), handles.get(0));
+            assertEquals(new RemoteFetchHandle("node-a", "session-a", 3, 4, 20), handles.get(1));
         } finally {
             if (input != null) {
                 input.releaseBlocks();
@@ -110,10 +109,5 @@ public class RemoteFetchHandleFunctionTests extends ESTestCase {
             () -> function.replaceChildren(List.of(new Literal(Source.EMPTY, null, DataType.NULL)))
         );
         assertThat(e.getMessage(), containsString("requires _doc attribute input"));
-    }
-
-    private static RemoteFetchHandle decode(BytesRefBlock handles, int position) {
-        BytesRef scratch = new BytesRef();
-        return RemoteFetchHandle.fromBytesRef(handles.getBytesRef(handles.getFirstValueIndex(position), scratch));
     }
 }
