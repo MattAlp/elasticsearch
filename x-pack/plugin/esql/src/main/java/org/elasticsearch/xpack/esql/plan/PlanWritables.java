@@ -26,7 +26,6 @@ import org.elasticsearch.xpack.esql.plan.logical.OrderBy;
 import org.elasticsearch.xpack.esql.plan.logical.ParameterizedQuery;
 import org.elasticsearch.xpack.esql.plan.logical.Project;
 import org.elasticsearch.xpack.esql.plan.logical.RegisteredDomain;
-import org.elasticsearch.xpack.esql.plan.logical.RemoteFetchSource;
 import org.elasticsearch.xpack.esql.plan.logical.Sample;
 import org.elasticsearch.xpack.esql.plan.logical.SampledAggregate;
 import org.elasticsearch.xpack.esql.plan.logical.Subquery;
@@ -66,7 +65,6 @@ import org.elasticsearch.xpack.esql.plan.physical.MetricsInfoExec;
 import org.elasticsearch.xpack.esql.plan.physical.MvExpandExec;
 import org.elasticsearch.xpack.esql.plan.physical.ProjectExec;
 import org.elasticsearch.xpack.esql.plan.physical.RegisteredDomainExec;
-import org.elasticsearch.xpack.esql.plan.physical.RemoteFetchExec;
 import org.elasticsearch.xpack.esql.plan.physical.SampleExec;
 import org.elasticsearch.xpack.esql.plan.physical.SampledAggregateExec;
 import org.elasticsearch.xpack.esql.plan.physical.ShowExec;
@@ -117,7 +115,6 @@ public class PlanWritables {
             ParameterizedQuery.ENTRY,
             Project.ENTRY,
             Project.V9_ENTRY, // Backward compatibility for reading old "EsqlProject" type
-            RemoteFetchSource.ENTRY,
             Rerank.ENTRY,
             Sample.ENTRY,
             SampledAggregate.ENTRY,
@@ -156,7 +153,6 @@ public class PlanWritables {
             LocalSourceExec.ENTRY,
             MvExpandExec.ENTRY,
             ProjectExec.ENTRY,
-            RemoteFetchExec.ENTRY,
             RerankExec.ENTRY,
             SampleExec.ENTRY,
             SampledAggregateExec.ENTRY,
