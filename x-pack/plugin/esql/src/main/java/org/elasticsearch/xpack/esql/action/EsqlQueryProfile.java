@@ -13,10 +13,12 @@ import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.io.stream.Writeable;
 import org.elasticsearch.xcontent.ToXContentFragment;
 import org.elasticsearch.xcontent.XContentBuilder;
+import org.elasticsearch.xpack.esql.analysis.UnmappedResolution;
 
 import java.io.IOException;
 import java.util.Collection;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -64,6 +66,8 @@ public class EsqlQueryProfile implements Writeable, ToXContentFragment {
     private final AtomicInteger splitsScanned;
     /** Estimated bytes scanned across the discovered external splits. */
     private final AtomicLong bytesScanned;
+    /** The query-level unmapped field resolution mode. */
+    private volatile UnmappedResolution unmappedResolution;
 
     private static final TransportVersion ESQL_QUERY_PLANNING_PROFILE = TransportVersion.fromName("esql_query_planning_profile");
     private static final TransportVersion ESQL_QUERY_PROFILE_VIEW_RESOLUTION = TransportVersion.fromName(
@@ -74,9 +78,10 @@ public class EsqlQueryProfile implements Writeable, ToXContentFragment {
         "esql_separate_dependency_resolution"
     );
     private static final TransportVersion ESQL_EXTERNAL_SCAN_PROFILE = TransportVersion.fromName("esql_external_scan_profile");
+    public static final TransportVersion ESQL_PROFILE_UNMAPPED_FIELDS_MODE = TransportVersion.fromName("esql_profile_unmapped_fields_mode");
 
     public EsqlQueryProfile() {
-        this(null, null, null, null, null, null, null, null, null, null, 0, 0, 0, 0L);
+        this(null, null, null, null, null, null, null, null, null, null, 0, 0, 0, 0L, UnmappedResolution.DEFAULT);
     }
 
     // For testing
@@ -94,7 +99,8 @@ public class EsqlQueryProfile implements Writeable, ToXContentFragment {
         int fieldCapsCalls,
         int filesScanned,
         int splitsScanned,
-        long bytesScanned
+        long bytesScanned,
+        UnmappedResolution unmappedResolution
     ) {
         this.totalMarker = new TimeSpanMarker(QUERY, true, query);
         this.planningMarker = new TimeSpanMarker(PLANNING, false, planning);
@@ -110,6 +116,7 @@ public class EsqlQueryProfile implements Writeable, ToXContentFragment {
         this.filesScanned = new AtomicInteger(filesScanned);
         this.splitsScanned = new AtomicInteger(splitsScanned);
         this.bytesScanned = new AtomicLong(bytesScanned);
+        this.unmappedResolution = unmappedResolution;
     }
 
     public static EsqlQueryProfile readFrom(StreamInput in) throws IOException {
@@ -151,6 +158,10 @@ public class EsqlQueryProfile implements Writeable, ToXContentFragment {
             splitsScanned = in.readVInt();
             bytesScanned = in.readVLong();
         }
+        UnmappedResolution unmappedResolution = UnmappedResolution.DEFAULT;
+        if (in.getTransportVersion().supports(ESQL_PROFILE_UNMAPPED_FIELDS_MODE)) {
+            unmappedResolution = in.readEnum(UnmappedResolution.class);
+        }
         return new EsqlQueryProfile(
             query,
             planning,
@@ -165,7 +176,8 @@ public class EsqlQueryProfile implements Writeable, ToXContentFragment {
             fieldCapsCalls,
             filesScanned,
             splitsScanned,
-            bytesScanned
+            bytesScanned,
+            unmappedResolution
         );
     }
 
@@ -205,6 +217,9 @@ public class EsqlQueryProfile implements Writeable, ToXContentFragment {
             out.writeVInt(splitsScanned.get());
             out.writeVLong(bytesScanned.get());
         }
+        if (out.getTransportVersion().supports(ESQL_PROFILE_UNMAPPED_FIELDS_MODE)) {
+            out.writeEnum(unmappedResolution);
+        }
     }
 
     @Override
@@ -224,7 +239,8 @@ public class EsqlQueryProfile implements Writeable, ToXContentFragment {
             && Objects.equals(fieldCapsCalls.get(), that.fieldCapsCalls.get())
             && filesScanned.get() == that.filesScanned.get()
             && splitsScanned.get() == that.splitsScanned.get()
-            && bytesScanned.get() == that.bytesScanned.get();
+            && bytesScanned.get() == that.bytesScanned.get()
+            && unmappedResolution == that.unmappedResolution;
     }
 
     @Override
@@ -243,7 +259,8 @@ public class EsqlQueryProfile implements Writeable, ToXContentFragment {
             fieldCapsCalls.get(),
             filesScanned.get(),
             splitsScanned.get(),
-            bytesScanned.get()
+            bytesScanned.get(),
+            unmappedResolution
         );
     }
 
@@ -278,6 +295,8 @@ public class EsqlQueryProfile implements Writeable, ToXContentFragment {
             + splitsScanned.get()
             + ", bytesScanned="
             + bytesScanned.get()
+            + ", unmappedResolution="
+            + unmappedResolution
             + '}';
     }
 
@@ -397,6 +416,14 @@ public class EsqlQueryProfile implements Writeable, ToXContentFragment {
         );
     }
 
+    public void setUnmappedResolution(UnmappedResolution unmappedResolution) {
+        this.unmappedResolution = unmappedResolution;
+    }
+
+    public UnmappedResolution unmappedResolution() {
+        return unmappedResolution;
+    }
+
     /**
      * Safely stops all markers that were started but not yet stopped.
      * This is useful in error paths where we need to ensure all timing data is captured.
@@ -428,6 +455,7 @@ public class EsqlQueryProfile implements Writeable, ToXContentFragment {
                 builder.field("bytes_scanned", bytes);
             }
         }
+        builder.field("unmapped_fields", unmappedResolution.name().toLowerCase(Locale.ROOT));
         return builder;
     }
 
