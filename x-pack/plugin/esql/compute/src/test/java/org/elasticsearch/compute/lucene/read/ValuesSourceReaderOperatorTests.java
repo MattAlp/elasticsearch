@@ -1742,6 +1742,17 @@ public class ValuesSourceReaderOperatorTests extends OperatorTestCase {
 
     public void testSourceLoadProfileCounters() throws IOException {
         initMapping();
+        testSourceLoadProfileCounters(fieldInfo(mapperService.fieldType("source_text"), ElementType.BYTES_REF));
+    }
+
+    public void testSourceLoadProfileCountersForUnmappedField() throws IOException {
+        testSourceLoadProfileCounters(
+            fieldInfo(new KeywordFieldMapper.KeywordFieldType("source_text", false, false, Collections.emptyMap()), ElementType.BYTES_REF)
+        );
+    }
+
+    private void testSourceLoadProfileCounters(ValuesSourceReaderOperator.FieldInfo fieldInfo) throws IOException {
+        initMapping();
         int docCount = between(ValuesFromSingleReader.SEQUENTIAL_BOUNDARY, ValuesFromSingleReader.SEQUENTIAL_BOUNDARY * 2);
         var runner = new TestDriverRunner().builder(driverContext());
         List<Page> source = CannedSourceOperator.collectPages(simpleInput(runner.context(), docCount, docCount, docCount));
@@ -1751,7 +1762,7 @@ public class ValuesSourceReaderOperatorTests extends OperatorTestCase {
             .run(
                 new ValuesSourceReaderOperator.Factory(
                     ByteSizeValue.ofGb(1),
-                    List.of(fieldInfo(mapperService.fieldType("source_text"), ElementType.BYTES_REF)),
+                    List.of(fieldInfo),
                     new IndexedByShardIdFromSingleton<>(
                         new ValuesSourceReaderOperator.ShardContext(
                             reader,
