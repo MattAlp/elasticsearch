@@ -214,6 +214,7 @@ import org.elasticsearch.xpack.esql.plan.physical.inference.RerankExec;
 import org.elasticsearch.xpack.esql.planner.EsPhysicalOperationProviders.ShardContext;
 import org.elasticsearch.xpack.esql.planner.mapper.Mapper;
 import org.elasticsearch.xpack.esql.plugin.EsqlPlugin;
+import org.elasticsearch.xpack.esql.plugin.FetchHandle;
 import org.elasticsearch.xpack.esql.plugin.FetchOperator;
 import org.elasticsearch.xpack.esql.plugin.FetchService;
 import org.elasticsearch.xpack.esql.plugin.QueryPragmas;
@@ -234,6 +235,7 @@ import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
@@ -818,13 +820,14 @@ public class LocalExecutionPlanner {
             .stream()
             .map(attr -> new FetchService.FetchField(fieldName(attr), attr.dataType()))
             .toList();
+        PhysicalPlan pushdownPlan = exec.pushdownPlan();
         Layout layout = source.layout.builder().append(exec.fetchedOutputAttributes()).build();
         return source.with(
             new FetchOperator.Factory(
                 handle.channel(),
                 requestFields,
                 exec.fetchedOutputAttributes(),
-                exec.pushdownPlan(),
+                pushdownPlan,
                 configuration,
                 Math.max(1, context.queryPragmas().exchangeBufferSize()),
                 () -> fetchService.newReleasingBatchExchangeClient(parentTask)
@@ -921,7 +924,15 @@ public class LocalExecutionPlanner {
         if (numericFactory != null) {
             return source.with(numericFactory, source.layout);
         }
-        var common = topNCommon(rowSize, topNExec.order(), topNExec.limit(), topNExec.docValuesAttributes(), source, context);
+        var common = topNCommon(
+            rowSize,
+            topNExec.order(),
+            topNExec.limit(),
+            topNExec.docValuesAttributes(),
+            topNExec.child().output(),
+            source,
+            context
+        );
         TopNOperator.ParallelWorkerConfig parallelWorkerConfig = null;
         if (parallelWorkerExecutor != null) {
             int workerCount = Math.max(1, Math.min(context.plannerSettings.parallelTopNMaxWorkers(), esqlWorkerPoolSize / 2));
@@ -1219,7 +1230,15 @@ public class LocalExecutionPlanner {
     private PhysicalOperation planTopNBy(TopNByExec topNByExec, LocalExecutionPlannerContext context) {
         final Integer rowSize = topNByExec.estimatedRowSize();
         PhysicalOperation source = plan(topNByExec.child(), context);
-        var common = topNCommon(rowSize, topNByExec.order(), topNByExec.limitPerGroup(), topNByExec.docValuesAttributes(), source, context);
+        var common = topNCommon(
+            rowSize,
+            topNByExec.order(),
+            topNByExec.limitPerGroup(),
+            topNByExec.docValuesAttributes(),
+            topNByExec.child().output(),
+            source,
+            context
+        );
         List<Integer> groupKeys = topNByExec.groupings()
             .stream()
             .map(grouping -> getAttributeChannel(grouping, source.layout, "LIMIT BY expression must be an attribute"))
@@ -1249,6 +1268,7 @@ public class LocalExecutionPlanner {
         List<Order> order,
         Expression limitExpr,
         Set<Attribute> docValuesAttributes,
+        List<Attribute> inputAttributes,
         PhysicalOperation source,
         LocalExecutionPlannerContext context
     ) {
@@ -1256,11 +1276,20 @@ public class LocalExecutionPlanner {
 
         ElementType[] elementTypes = new ElementType[source.layout.numberOfChannels()];
         TopNEncoder[] encoders = new TopNEncoder[source.layout.numberOfChannels()];
+        Set<NameId> fetchHandleIds = inputAttributes.stream()
+            .filter(FetchHandle::isAttribute)
+            .map(Attribute::id)
+            .collect(Collectors.toSet());
         List<Layout.ChannelSet> inverse = source.layout.inverse();
         for (int channel = 0; channel < inverse.size(); channel++) {
-            var fieldExtractPreference = fieldExtractPreference(docValuesAttributes, inverse.get(channel).nameIds());
-            elementTypes[channel] = PlannerUtils.toElementType(inverse.get(channel).type(), fieldExtractPreference);
-            encoders[channel] = TopNExec.encoder(inverse.get(channel).type(), context.shardContexts);
+            Layout.ChannelSet channelSet = inverse.get(channel);
+            var fieldExtractPreference = fieldExtractPreference(docValuesAttributes, channelSet.nameIds());
+            elementTypes[channel] = PlannerUtils.toElementType(channelSet.type(), fieldExtractPreference);
+            boolean fetchHandleChannel = channelSet.nameIds().stream().anyMatch(fetchHandleIds::contains);
+            // Handles use a keyword-shaped block to cross generic exchanges, but their contents are binary StreamOutput payloads.
+            encoders[channel] = fetchHandleChannel
+                ? TopNEncoder.DEFAULT_UNSORTABLE
+                : TopNExec.encoder(channelSet.type(), context.shardContexts);
         }
         List<TopNOperator.SortOrder> orders = order.stream().map(o -> {
             int sortByChannel = getAttributeChannel(o.child(), source.layout, "order by expression must be an attribute");
