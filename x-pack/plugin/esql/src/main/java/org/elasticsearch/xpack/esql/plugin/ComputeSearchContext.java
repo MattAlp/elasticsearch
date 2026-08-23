@@ -34,7 +34,7 @@ import java.util.Objects;
  *     this context,
  *     so when operators finish and the shard context's ref count reaches zero, the underlying {@link SearchContext} is closed. This is
  *     cached via {@link SetOnce} since the same shard context is shared across data and node-reduce drivers.</li>
- *     <li>{@link #newDetachedShardContext()} — for the retained-contexts path (remote fetch). Creates a <i>fresh, independent</i>
+ *     <li>{@link #newDetachedShardContext()} — for the retained-contexts path (fetch). Creates a <i>fresh, independent</i>
  *     {@link ShardContext} whose close is a no-op with respect to the underlying {@link SearchContext}. Use this when the
  *     {@link SearchContext} lifecycle is managed externally (e.g., by a {@link RetainedSearchContextsRegistry} entry) and must outlive any
  *     single set of operators.</li>
@@ -89,7 +89,7 @@ class ComputeSearchContext implements Releasable {
      * when the search context lifecycle is managed externally (e.g., by a {@link RetainedSearchContextsRegistry} entry) and must survive
      * across multiple sets of operators. Each call returns a new instance with its own ref count.
      * <p>
-     * This detached mode is a temporary design: it exists to support retained-context remote fetch while the broader lifecycle model is
+     * This detached mode is a temporary design: it exists to support retained-context fetch while the broader lifecycle model is
      * being finalized. Expect it to be replaced or folded into a unified context ownership scheme in a follow-up.
      */
     ShardContext newDetachedShardContext() {
@@ -102,7 +102,7 @@ class ComputeSearchContext implements Releasable {
             searchContext.getSearchExecutionContext(),
             queryWarnings
         );
-        // Registered unconditionally; for detached shard contexts this is a no-op since the remote fetch path does not construct
+        // Registered unconditionally; for detached shard contexts this is a no-op since the fetch path does not construct
         // Lucene queries and the counter stays at zero.
         searchContext.addReleasable(searchExecutionContext::releaseQueryConstructionMemory);
         return new DefaultShardContext(index, releasable, searchExecutionContext, searchContext.request().getAliasFilter());
