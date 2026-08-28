@@ -137,7 +137,7 @@ public class CrossClusterQueryIT extends AbstractCrossClusterTestCase {
         }
     }
 
-    public void testFetchTopNIsDisabledForCrossClusterSearch() throws Exception {
+    public void testFetchTopNRunsInsideEachCluster() throws Exception {
         assumeTrue("fetch_topn is an experimental query pragma", Build.current().isSnapshot());
         setupTwoClusters();
         QueryPragmas pragmas = new QueryPragmas(
@@ -155,13 +155,16 @@ public class CrossClusterQueryIT extends AbstractCrossClusterTestCase {
 
             try (EsqlQueryResponse response = runQuery(request)) {
                 assertThat(getValuesList(response), hasSize(5));
-                assertFalse(
-                    response.profile()
-                        .drivers()
-                        .stream()
-                        .flatMap(driver -> driver.operators().stream())
-                        .anyMatch(operator -> operator.status() instanceof FetchOperator.Status)
-                );
+                List<FetchOperator.Status> fetchStatuses = response.profile()
+                    .drivers()
+                    .stream()
+                    .flatMap(driver -> driver.operators().stream())
+                    .map(operator -> operator.status())
+                    .filter(FetchOperator.Status.class::isInstance)
+                    .map(FetchOperator.Status.class::cast)
+                    .toList();
+                assertThat(fetchStatuses, hasSize(2));
+                assertThat(fetchStatuses.stream().mapToLong(FetchOperator.Status::rowsEmitted).sum(), lessThanOrEqualTo(10L));
             }
         }
     }

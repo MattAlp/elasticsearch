@@ -17,6 +17,7 @@ import org.elasticsearch.compute.lucene.EmptyIndexedByShardId;
 import org.elasticsearch.compute.operator.DriverCompletionInfo;
 import org.elasticsearch.compute.operator.PlanTimeProfile;
 import org.elasticsearch.compute.operator.exchange.ExchangeService;
+import org.elasticsearch.compute.operator.exchange.ExchangeSinkHandler;
 import org.elasticsearch.compute.operator.exchange.ExchangeSourceHandler;
 import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.TimeValue;
@@ -46,8 +47,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Manages computes across multiple clusters by sending {@link ClusterComputeRequest} to remote clusters and executing the computes.
- * This handler delegates the execution of computes on data nodes within each remote cluster to {@link DataNodeComputeHandler}.
+ * Manages computes for local and remote cluster execution islands. Remote work starts through {@link ClusterComputeRequest}; both paths
+ * delegate their data-node work to {@link DataNodeComputeHandler}.
  */
 final class ClusterComputeHandler implements TransportRequestHandler<ClusterComputeRequest> {
     private final ComputeService computeService;
@@ -242,7 +243,7 @@ final class ClusterComputeHandler implements TransportRequestHandler<ClusterComp
             listener.onFailure(new IllegalStateException("expected exchange sink for a remote compute; got " + plan));
             return;
         }
-        runComputeOnRemoteCluster(
+        runComputeOnCluster(
             request.clusterAlias(),
             request.sessionId(),
             (CancellableTask) task,
@@ -250,20 +251,21 @@ final class ClusterComputeHandler implements TransportRequestHandler<ClusterComp
             (ExchangeSinkExec) plan,
             Set.of(remoteClusterPlan.targetIndices()),
             remoteClusterPlan.originalIndices(),
+            exchangeService.getSinkHandler(request.sessionId()),
             listener
         );
     }
 
     /**
-     * Performs a compute on a remote cluster. The output pages are placed in an exchange sink specified by
-     * {@code globalSessionId}. The coordinator on the main cluster will poll pages from there.
+     * Performs a compute for one cluster execution island. The output pages are placed in the supplied exchange sink. The global
+     * coordinator polls materialized pages from that sink.
      * <p>
-     * Currently, the coordinator on the remote cluster polls pages from data nodes within the remote cluster
+     * The coordinator of the island polls pages from data nodes within the same cluster
      * and performs cluster-level reduction before sending pages to the querying cluster. This reduction aims
      * to minimize data transfers across clusters but may require additional CPU resources for operations like
      * aggregations.
      */
-    void runComputeOnRemoteCluster(
+    void runComputeOnCluster(
         String clusterAlias,
         String globalSessionId,
         CancellableTask parentTask,
@@ -271,24 +273,34 @@ final class ClusterComputeHandler implements TransportRequestHandler<ClusterComp
         ExchangeSinkExec plan,
         Set<String> concreteIndices,
         OriginalIndices originalIndices,
+        ExchangeSinkHandler exchangeSink,
         ActionListener<ComputeResponse> listener
     ) {
-        final var exchangeSink = exchangeService.getSinkHandler(globalSessionId);
         parentTask.addListener(
             () -> exchangeService.finishSinkHandler(globalSessionId, new TaskCancelledException(parentTask.getReasonCancelled()))
         );
         exchangeSink.addCompletionListener(ActionListener.running(() -> exchangeService.finishSinkHandler(globalSessionId, null)));
         final String localSessionId = clusterAlias + ":" + globalSessionId;
-        ReductionPlan reductionPlan = ComputeService.reductionPlan(
+        ReductionPlan reductionPlan = ComputeService.clusterReductionPlan(
             computeService.plannerSettings().get(),
             computeService.createFlags(),
             configuration,
             configuration.newFoldContext(),
             plan,
+            computeService.minimumTransportVersion(),
             true,
             false,
             configuration.profile() ? new PlanTimeProfile() : null
         );
+        final boolean retainSearchContexts = reductionPlan.retainSearchContexts();
+        final FetchService.RetainedSessionReleaser retainedSessionReleaser = retainSearchContexts
+            ? computeService.fetchService().newRetainedSessionReleaser()
+            : null;
+        listener = ActionListener.runBefore(listener, () -> {
+            if (retainedSessionReleaser != null) {
+                retainedSessionReleaser.close();
+            }
+        });
         PhysicalPlan coordinatorPlan = reductionPlan.nodeReducePlan();
         final AtomicReference<ComputeResponse> finalResponse = new AtomicReference<>();
         final EsqlFlags flags = computeService.createFlags();
@@ -309,7 +321,7 @@ final class ClusterComputeHandler implements TransportRequestHandler<ClusterComp
                     parentTask,
                     new ComputeContext(
                         localSessionId,
-                        "remote_reduce",
+                        "cluster_reduce",
                         clusterAlias,
                         flags,
                         EmptyIndexedByShardId.instance(),
@@ -337,8 +349,8 @@ final class ClusterComputeHandler implements TransportRequestHandler<ClusterComp
                     concreteIndices,
                     originalIndices,
                     exchangeSource,
-                    false,
-                    null,
+                    retainSearchContexts,
+                    retainedSessionReleaser,
                     cancelQueryOnFailure,
                     computeListener.acquireCompute().map(r -> {
                         finalResponse.set(r);

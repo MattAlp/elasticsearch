@@ -143,6 +143,54 @@ public final class ReductionPlanner {
     }
 
     /**
+     * Builds the coordinator and data-node plans for one execution island. Fetch handles created by this rewrite are consumed by the
+     * coordinator of the same island and therefore never cross a cluster or project boundary.
+     */
+    public static ReductionPlan planCluster(
+        PlannerSettings plannerSettings,
+        EsqlFlags flags,
+        Configuration configuration,
+        FoldContext foldCtx,
+        ExchangeSinkExec originalPlan,
+        TransportVersion minimumTransportVersion,
+        boolean runNodeLevelReduction,
+        boolean reduceNodeLateMaterialization,
+        PlanTimeProfile planTimeProfile
+    ) {
+        long startTime = planTimeProfile == null ? 0 : System.nanoTime();
+        if (configuration.pragmas().fetchTopN() && minimumTransportVersion.supports(FetchBoundaryExec.ESQL_FETCH_BOUNDARY)) {
+            Function<SearchStats, LocalPhysicalOptimizerContext> contextFactory = stats -> new LocalPhysicalOptimizerContext(
+                plannerSettings,
+                flags,
+                configuration,
+                foldCtx,
+                stats
+            );
+            Optional<ReductionPlan> fetchPlan = planClusterTopN(contextFactory, originalPlan, minimumTransportVersion);
+            if (fetchPlan.isPresent()) {
+                ReductionPlan planned = fetchPlan.get();
+                PhysicalVerifier.LOCAL_INSTANCE.verify(planned.nodeReducePlan(), originalPlan.output());
+                ExchangeSourceExec reductionSource = (ExchangeSourceExec) planned.nodeReducePlan().collectLeaves().getFirst();
+                PhysicalVerifier.LOCAL_INSTANCE.verify(planned.dataNodePlan(), reductionSource.output());
+                if (planTimeProfile != null) {
+                    planTimeProfile.addReductionPlanNanos(System.nanoTime() - startTime);
+                }
+                return planned;
+            }
+        }
+        return plan(
+            plannerSettings,
+            flags,
+            configuration,
+            foldCtx,
+            originalPlan,
+            runNodeLevelReduction,
+            reduceNodeLateMaterialization,
+            planTimeProfile
+        );
+    }
+
+    /**
      * Builds request-specific node-reduction and shard plans, consuming any fetch boundary carried by the physical plan.
      */
     public static ReductionPlan plan(
@@ -207,7 +255,13 @@ public final class ReductionPlanner {
                 localNodeId,
                 retainedSessionId
             );
-            // Not a TopN - must be an agg or a limit
+            case PlannerUtils.TopNByReduction topNBy -> runNodeLevelReduction
+                ? placePlanBetweenExchanges.apply(topNBy.plan())
+                : passThroughReduction;
+            case PlannerUtils.LimitByReduction limitBy -> runNodeLevelReduction
+                ? placePlanBetweenExchanges.apply(limitBy.plan())
+                : passThroughReduction;
+            // Not a TopN/TopNBy/LimitBy - must be an agg or a limit
             case PlannerUtils.ReducedPlan rp -> runNodeLevelReduction ? placePlanBetweenExchanges.apply(rp.plan()) : passThroughReduction;
             case PlannerUtils.SimplePlanReduction.NO_REDUCTION -> passThroughReduction;
         };
@@ -399,6 +453,76 @@ public final class ReductionPlanner {
         PhysicalPlan projected = new ProjectExec(Source.EMPTY, withHandle, fetchBoundary.handoffOutput());
         PhysicalPlan sizedReductionPlan = EstimatesRowSize.estimateRowSize(updatedFragmentExec.estimatedRowSize(), projected);
         return new ReductionPlan(originalPlan.replaceChild(sizedReductionPlan), updatedDataPlan);
+    }
+
+    /**
+     * Adds an island-local fetch around a TopN reduction. The data-node output is the private handle schema; the island output remains
+     * the original materialized schema expected by the global coordinator.
+     */
+    private static Optional<ReductionPlan> planClusterTopN(
+        Function<SearchStats, LocalPhysicalOptimizerContext> contextFactory,
+        ExchangeSinkExec originalPlan,
+        TransportVersion minimumTransportVersion
+    ) {
+        TopNPlanningContext planningContext = analyzeTopN(contextFactory, originalPlan.child(), ExistingDocPolicy.PREPEND_IF_MISSING)
+            .orElse(null);
+        if (planningContext == null) {
+            return Optional.empty();
+        }
+
+        List<Attribute> handoffOutput = new ArrayList<>();
+        Attribute handle = fetchHandleAttribute(planningContext.topN().source());
+        handoffOutput.add(handle);
+        for (Attribute attr : planningContext.expectedDataOutput()) {
+            if (EsQueryExec.isDocAttribute(attr) == false) {
+                handoffOutput.add(attr);
+            }
+        }
+
+        AttributeSet handoffOutputSet = AttributeSet.of(handoffOutput);
+        List<Attribute> attributesToFetch = new ArrayList<>();
+        List<FieldExtractionSpec> extractionSpecs = new ArrayList<>();
+        for (Attribute attr : planningContext.topLevelProject().output()) {
+            if (handoffOutputSet.contains(attr) == false) {
+                FieldExtractionSpec extractionSpec = FieldExtractionSpec.plan(
+                    attr,
+                    planningContext.optimizerContext().configuration().pragmas().fieldExtractPreference()
+                ).orElse(null);
+                if (extractionSpec == null || extractionSpec.supports(minimumTransportVersion) == false) {
+                    return Optional.empty();
+                }
+                attributesToFetch.add(attr);
+                extractionSpecs.add(extractionSpec);
+            }
+        }
+        if (attributesToFetch.isEmpty()) {
+            return Optional.empty();
+        }
+
+        FragmentExec fragment = planningContext.fragmentExec()
+            .withFragment(new Project(Source.EMPTY, planningContext.withAddedDocToRelation(), planningContext.expectedDataOutput()));
+        FetchBoundaryExec boundary = new FetchBoundaryExec(originalPlan.source(), fragment, handle, handoffOutput);
+        ExchangeSinkExec boundaryPlan = originalPlan.replaceChildAndUpdateOutput(boundary);
+
+        TopNExec islandTopN = planningContext.physicalPlan(planningContext.topN())
+            .collect(TopNExec.class)
+            .getFirst()
+            .replaceChild(new ExchangeSourceExec(planningContext.topN().source(), handoffOutput, false));
+        FragmentExec fetchPlan = new FragmentExec(new FetchSource(Source.EMPTY, attributesToFetch));
+        PhysicalPlan fetched = new FetchExec(
+            originalPlan.source(),
+            islandTopN,
+            handle,
+            attributesToFetch,
+            extractionSpecs,
+            attributesToFetch,
+            fetchPlan
+        );
+        PhysicalPlan materialized = fetched.output().equals(originalPlan.output())
+            ? fetched
+            : new ProjectExec(originalPlan.source(), fetched, originalPlan.output());
+        PhysicalPlan sizedMaterialized = EstimatesRowSize.estimateRowSize(fragment.estimatedRowSize(), materialized);
+        return Optional.of(new ReductionPlan(originalPlan.replaceChild(sizedMaterialized), boundaryPlan));
     }
 
     private static Optional<ReductionPlan> planDeferredTopNFields(

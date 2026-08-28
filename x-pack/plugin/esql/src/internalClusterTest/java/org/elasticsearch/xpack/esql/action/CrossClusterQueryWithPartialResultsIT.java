@@ -177,6 +177,34 @@ public class CrossClusterQueryWithPartialResultsIT extends AbstractCrossClusterT
         }
     }
 
+    public void testFetchTopNFailureIsContainedToClusterIsland() throws Exception {
+        populateIndices();
+        EsqlQueryRequest request = new EsqlQueryRequest();
+        request.query("FROM ok*,*-b:fail* | SORT v + 1 DESC | LIMIT 10 | KEEP id, fail_me");
+        request.allowPartialResults(true);
+        request.includeCCSMetadata(randomBoolean());
+        request.pragmas(
+            new QueryPragmas(
+                Settings.builder()
+                    .put(QueryPragmas.FETCH_TOPN.getKey(), true)
+                    .put(QueryPragmas.MAX_CONCURRENT_SHARDS_PER_NODE.getKey(), 1)
+                    .build()
+            )
+        );
+        request.acceptedPragmaRisks(true);
+
+        try (var resp = runQuery(request)) {
+            assertTrue(resp.isPartial());
+            List<List<Object>> rows = getValuesList(resp);
+            assertThat(rows.size(), greaterThan(0));
+            assertThat(rows.size(), lessThanOrEqualTo(10));
+            assertTrue(rows.stream().allMatch(row -> local.okIds.contains(row.getFirst())));
+            assertClusterSuccess(resp, LOCAL_CLUSTER, local.okShards);
+            assertThat(resp.getExecutionInfo().getCluster(REMOTE_CLUSTER_2).getStatus(), equalTo(EsqlExecutionInfo.Cluster.Status.SKIPPED));
+            assertClusterFailure(resp, REMOTE_CLUSTER_2, "Accessing failing field");
+        }
+    }
+
     public void testLocalIndexMissing() throws Exception {
         populateIndices();
         EsqlQueryRequest request = new EsqlQueryRequest();
