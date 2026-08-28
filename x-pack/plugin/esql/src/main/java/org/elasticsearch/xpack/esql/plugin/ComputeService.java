@@ -8,6 +8,7 @@
 package org.elasticsearch.xpack.esql.plugin;
 
 import org.elasticsearch.ExceptionsHelper;
+import org.elasticsearch.TransportVersion;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.OriginalIndices;
 import org.elasticsearch.action.search.SearchRequest;
@@ -1036,6 +1037,8 @@ public class ComputeService {
         Map<String, OriginalIndices> clusterToOriginalIndices = getIndices(resolvedPlan, EsRelation::originalIndices);
         var localOriginalIndices = clusterToOriginalIndices.remove(LOCAL_CLUSTER);
         var localConcreteIndices = clusterToConcreteIndices.remove(LOCAL_CLUSTER);
+        final boolean runLocalAsClusterIsland = configuration.pragmas().fetchTopN()
+            && clusterToConcreteIndices.values().stream().anyMatch(indices -> indices.indices().length > 0);
         final boolean retainSearchContexts = reductionPlanning.retainSearchContexts();
         /*
          * Grab the output attributes here, so we can pass them to
@@ -1113,47 +1116,102 @@ public class ComputeService {
                     );
                     // starts computes on data nodes on the main cluster
                     if (localConcreteIndices != null && localConcreteIndices.indices().length > 0) {
-                        final var dataNodesListener = localListener.acquireCompute();
-                        dataNodeComputeHandler.startComputeOnDataNodes(
-                            sessionId,
-                            LOCAL_CLUSTER,
-                            rootTask,
-                            flags,
-                            configuration,
-                            dataNodePlan,
-                            Set.of(localConcreteIndices.indices()),
-                            localOriginalIndices,
-                            exchangeSource,
-                            retainSearchContexts,
-                            fetchRetainedSessionReleaser,
-                            cancelQueryOnFailure,
-                            ActionListener.wrap(r -> {
-                                localClusterWasInterrupted.set(execInfo.isStopped());
-                                execInfo.swapCluster(
-                                    LOCAL_CLUSTER,
-                                    (k, v) -> new EsqlExecutionInfo.Cluster.Builder(v).setTotalShards(r.getTotalShards())
-                                        .setSuccessfulShards(r.getSuccessfulShards())
-                                        .setSkippedShards(r.getSkippedShards())
-                                        .setFailedShards(r.getFailedShards())
-                                        .addFailures(r.failures)
-                                        .build()
+                        if (runLocalAsClusterIsland) {
+                            final String localIslandSessionId = newChildSession(sessionId);
+                            final ExchangeSinkHandler localIslandSink = exchangeService.createSinkHandler(
+                                localIslandSessionId,
+                                configuration.pragmas().exchangeBufferSize()
+                            );
+                            final boolean allowPartialIsland = configuration.allowPartialResults();
+                            final ActionListener<DriverCompletionInfo> islandCompletion = localListener.acquireCompute()
+                                .delegateResponse((l, e) -> {
+                                    if (allowPartialIsland && EsqlCCSUtils.canAllowPartial(e)) {
+                                        execInfo.swapCluster(
+                                            LOCAL_CLUSTER,
+                                            (k, v) -> new EsqlExecutionInfo.Cluster.Builder(v).setStatus(
+                                                EsqlExecutionInfo.Cluster.Status.PARTIAL
+                                            ).addFailures(List.of(new ShardSearchFailure(e))).build()
+                                        );
+                                        l.onResponse(DriverCompletionInfo.EMPTY);
+                                    } else {
+                                        l.onFailure(e);
+                                    }
+                                });
+                            try (var islandListener = new ComputeListener(cancelQueryOnFailure, islandCompletion)) {
+                                exchangeSource.addRemoteSink(
+                                    localIslandSink::fetchPageAsync,
+                                    allowPartialIsland == false,
+                                    () -> {},
+                                    1,
+                                    islandListener.acquireAvoid()
                                 );
-                                dataNodesListener.onResponse(r.getCompletionInfo());
-                            }, e -> {
-                                if (DataNodeComputeHandler.allowPartialResults(configuration, retainSearchContexts)
-                                    && EsqlCCSUtils.canAllowPartial(e)) {
+                                clusterComputeHandler.runComputeOnCluster(
+                                    LOCAL_CLUSTER,
+                                    localIslandSessionId,
+                                    rootTask,
+                                    configuration,
+                                    (ExchangeSinkExec) dataNodePlan,
+                                    Set.of(localConcreteIndices.indices()),
+                                    localOriginalIndices,
+                                    localIslandSink,
+                                    islandListener.acquireCompute().map(r -> {
+                                        localClusterWasInterrupted.set(execInfo.isStopped());
+                                        execInfo.swapCluster(
+                                            LOCAL_CLUSTER,
+                                            (k, v) -> new EsqlExecutionInfo.Cluster.Builder(v).setTotalShards(r.getTotalShards())
+                                                .setSuccessfulShards(r.getSuccessfulShards())
+                                                .setSkippedShards(r.getSkippedShards())
+                                                .setFailedShards(r.getFailedShards())
+                                                .addFailures(r.failures)
+                                                .build()
+                                        );
+                                        return r.getCompletionInfo();
+                                    })
+                                );
+                            }
+                        } else {
+                            final var dataNodesListener = localListener.acquireCompute();
+                            dataNodeComputeHandler.startComputeOnDataNodes(
+                                sessionId,
+                                LOCAL_CLUSTER,
+                                rootTask,
+                                flags,
+                                configuration,
+                                dataNodePlan,
+                                Set.of(localConcreteIndices.indices()),
+                                localOriginalIndices,
+                                exchangeSource,
+                                retainSearchContexts,
+                                fetchRetainedSessionReleaser,
+                                cancelQueryOnFailure,
+                                ActionListener.wrap(r -> {
+                                    localClusterWasInterrupted.set(execInfo.isStopped());
                                     execInfo.swapCluster(
                                         LOCAL_CLUSTER,
-                                        (k, v) -> new EsqlExecutionInfo.Cluster.Builder(v).setStatus(
-                                            EsqlExecutionInfo.Cluster.Status.PARTIAL
-                                        ).addFailures(List.of(new ShardSearchFailure(e))).build()
+                                        (k, v) -> new EsqlExecutionInfo.Cluster.Builder(v).setTotalShards(r.getTotalShards())
+                                            .setSuccessfulShards(r.getSuccessfulShards())
+                                            .setSkippedShards(r.getSkippedShards())
+                                            .setFailedShards(r.getFailedShards())
+                                            .addFailures(r.failures)
+                                            .build()
                                     );
-                                    dataNodesListener.onResponse(DriverCompletionInfo.EMPTY);
-                                } else {
-                                    dataNodesListener.onFailure(e);
-                                }
-                            })
-                        );
+                                    dataNodesListener.onResponse(r.getCompletionInfo());
+                                }, e -> {
+                                    if (DataNodeComputeHandler.allowPartialResults(configuration, retainSearchContexts)
+                                        && EsqlCCSUtils.canAllowPartial(e)) {
+                                        execInfo.swapCluster(
+                                            LOCAL_CLUSTER,
+                                            (k, v) -> new EsqlExecutionInfo.Cluster.Builder(v).setStatus(
+                                                EsqlExecutionInfo.Cluster.Status.PARTIAL
+                                            ).addFailures(List.of(new ShardSearchFailure(e))).build()
+                                        );
+                                        dataNodesListener.onResponse(DriverCompletionInfo.EMPTY);
+                                    } else {
+                                        dataNodesListener.onFailure(e);
+                                    }
+                                })
+                            );
+                        }
                     }
                 }
                 // starts computes on remote clusters
@@ -1637,6 +1695,35 @@ public class ComputeService {
             reduceNodeLateMaterialization,
             planTimeProfile
         );
+    }
+
+    /** Builds the reduction performed by a cluster or project before its rows enter the global exchange. */
+    public static ReductionPlan clusterReductionPlan(
+        PlannerSettings plannerSettings,
+        EsqlFlags flags,
+        Configuration configuration,
+        FoldContext foldContext,
+        ExchangeSinkExec originalPlan,
+        TransportVersion minimumTransportVersion,
+        boolean runNodeLevelReduction,
+        boolean reduceNodeLateMaterialization,
+        PlanTimeProfile planTimeProfile
+    ) {
+        return ReductionPlanner.planCluster(
+            plannerSettings,
+            flags,
+            configuration,
+            foldContext,
+            originalPlan,
+            minimumTransportVersion,
+            runNodeLevelReduction,
+            reduceNodeLateMaterialization,
+            planTimeProfile
+        );
+    }
+
+    TransportVersion minimumTransportVersion() {
+        return clusterService.state().getMinTransportVersion();
     }
 
     /**

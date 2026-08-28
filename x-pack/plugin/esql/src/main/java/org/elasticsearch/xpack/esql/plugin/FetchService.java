@@ -51,7 +51,6 @@ import org.elasticsearch.transport.TransportChannel;
 import org.elasticsearch.transport.TransportRequestHandler;
 import org.elasticsearch.transport.TransportRequestOptions;
 import org.elasticsearch.transport.TransportService;
-import org.elasticsearch.xpack.esql.action.EsqlQueryAction;
 import org.elasticsearch.xpack.esql.io.stream.PlanStreamInput;
 import org.elasticsearch.xpack.esql.io.stream.PlanStreamOutput;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
@@ -78,7 +77,7 @@ import java.util.stream.Collectors;
  * {@link FieldExtractionSpec} instances. The service binds those specifications to the retained shard contexts on the target node.
  */
 public final class FetchService {
-    private static final String ACTION_PREFIX = EsqlQueryAction.NAME + "/fetch";
+    private static final String ACTION_PREFIX = "internal:data/read/esql/fetch";
     static final String RELEASE_ACTION_NAME = ACTION_PREFIX + "/release";
     static final String EXCHANGE_SETUP_ACTION_NAME = ACTION_PREFIX + "/exchange_setup";
     private static final TimeValue RETAINED_CONTEXTS_REAPER_INTERVAL = TimeValue.timeValueMinutes(1);

@@ -293,6 +293,66 @@ public class ReductionPlannerTests extends ESTestCase {
         assertFalse(rewritten.output().stream().anyMatch(FetchHandle::isAttribute));
     }
 
+    public void testPlansTopNFetchInsideClusterIsland() {
+        PhysicalPlan distributedPlan = distributedQueryPlan(
+            "FROM employees | SORT hire_date | LIMIT 20 | KEEP hire_date, salary, emp_no",
+            fetchConfiguration()
+        );
+        ExchangeSinkExec originalDataPlan = as(
+            PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(distributedPlan, fetchConfiguration()).v2(),
+            ExchangeSinkExec.class
+        );
+
+        ReductionPlan planned = ReductionPlanner.planCluster(
+            PlannerSettings.DEFAULTS,
+            new EsqlFlags(false),
+            fetchConfiguration(),
+            FoldContext.small(),
+            originalDataPlan,
+            TransportVersion.current(),
+            true,
+            false,
+            null
+        );
+
+        assertTrue(planned.retainSearchContexts());
+        assertThat(planned.nodeReducePlan().output(), equalTo(originalDataPlan.output()));
+        assertThat(planned.nodeReducePlan().collect(FetchExec.class), hasSize(1));
+        assertThat(planned.dataNodePlan().child(), instanceOf(FetchBoundaryExec.class));
+        assertThat(
+            planned.dataNodePlan().output().stream().map(Attribute::name).toList(),
+            equalTo(List.of(FetchHandle.ATTRIBUTE_NAME, "hire_date"))
+        );
+    }
+
+    public void testClusterIslandFallsBackBeforeFetchBoundaryVersion() {
+        PhysicalPlan distributedPlan = distributedQueryPlan(
+            "FROM employees | SORT hire_date | LIMIT 20 | KEEP hire_date, salary, emp_no",
+            fetchConfiguration()
+        );
+        ExchangeSinkExec originalDataPlan = as(
+            PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(distributedPlan, fetchConfiguration()).v2(),
+            ExchangeSinkExec.class
+        );
+
+        ReductionPlan planned = ReductionPlanner.planCluster(
+            PlannerSettings.DEFAULTS,
+            new EsqlFlags(false),
+            fetchConfiguration(),
+            FoldContext.small(),
+            originalDataPlan,
+            TransportVersionUtils.getPreviousVersion(FetchBoundaryExec.ESQL_FETCH_BOUNDARY),
+            true,
+            false,
+            null
+        );
+
+        assertFalse(planned.retainSearchContexts());
+        assertThat(planned.nodeReducePlan().collect(FetchExec.class), hasSize(0));
+        assertThat(planned.dataNodePlan().collect(FetchBoundaryExec.class), hasSize(0));
+        assertThat(planned.nodeReducePlan().output(), equalTo(originalDataPlan.output()));
+    }
+
     public void testNoRetainedContextsWhenFetchBoundaryIsNotProduced() {
         Configuration configuration = EsqlTestUtils.configuration(
             new QueryPragmas(Settings.builder().put(QueryPragmas.FETCH_TOPN.getKey(), true).build())

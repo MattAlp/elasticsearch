@@ -8,6 +8,7 @@
 package org.elasticsearch.xpack.esql.planner.reduction;
 
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSinkExec;
+import org.elasticsearch.xpack.esql.plan.physical.FetchBoundaryExec;
 
 /**
  * This class is {@code public} for testing.
@@ -17,4 +18,9 @@ import org.elasticsearch.xpack.esql.plan.physical.ExchangeSinkExec;
  * @param dataNodePlan The plan to be executed on the data driver. This may contain a
  * {@link org.elasticsearch.xpack.esql.plan.physical.FragmentExec}.
  */
-public record ReductionPlan(ExchangeSinkExec nodeReducePlan, ExchangeSinkExec dataNodePlan) {}
+public record ReductionPlan(ExchangeSinkExec nodeReducePlan, ExchangeSinkExec dataNodePlan) {
+    /** Whether the data-node plan requires search contexts to remain available for a later fetch. */
+    public boolean retainSearchContexts() {
+        return dataNodePlan.anyMatch(FetchBoundaryExec.class::isInstance);
+    }
+}
