@@ -11,6 +11,7 @@ import org.elasticsearch.xpack.esql.VerificationException;
 import org.elasticsearch.xpack.esql.common.Failures;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.optimizer.rules.physical.InsertPartialWindowAggregates;
+import org.elasticsearch.xpack.esql.optimizer.rules.physical.PlanDeferredFetch;
 import org.elasticsearch.xpack.esql.optimizer.rules.physical.ProjectAwayColumns;
 import org.elasticsearch.xpack.esql.optimizer.rules.physical.ReplaceSampledStatsBySampleAndStats;
 import org.elasticsearch.xpack.esql.plan.physical.FragmentExec;
@@ -31,6 +32,7 @@ public class PhysicalPlanOptimizer extends ParameterizedRuleExecutor<PhysicalPla
             "Plan Boundary",
             Limiter.ONCE,
             new ProjectAwayColumns(),
+            new PlanDeferredFetch(),
             new ReplaceSampledStatsBySampleAndStats(),
             new InsertPartialWindowAggregates()
         )

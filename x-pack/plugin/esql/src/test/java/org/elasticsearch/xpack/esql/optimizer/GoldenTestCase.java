@@ -27,6 +27,7 @@ import org.elasticsearch.search.internal.AliasFilter;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.test.TransportVersionUtils;
 import org.elasticsearch.test.junit.listeners.ReproduceInfoPrinter;
+import org.elasticsearch.transport.RemoteClusterAware;
 import org.elasticsearch.xpack.esql.CsvTestsDataLoader;
 import org.elasticsearch.xpack.esql.EsqlTestUtils;
 import org.elasticsearch.xpack.esql.LoadMapping;
@@ -54,19 +55,21 @@ import org.elasticsearch.xpack.esql.index.IndexResolution;
 import org.elasticsearch.xpack.esql.plan.EsqlStatement;
 import org.elasticsearch.xpack.esql.plan.IndexPattern;
 import org.elasticsearch.xpack.esql.plan.QueryPlan;
+import org.elasticsearch.xpack.esql.plan.logical.EsRelation;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSinkExec;
+import org.elasticsearch.xpack.esql.plan.physical.FragmentExec;
 import org.elasticsearch.xpack.esql.plan.physical.LookupJoinExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
 import org.elasticsearch.xpack.esql.planner.PlannerSettings;
 import org.elasticsearch.xpack.esql.planner.PlannerUtils;
 import org.elasticsearch.xpack.esql.planner.mapper.LocalMapper;
 import org.elasticsearch.xpack.esql.planner.mapper.Mapper;
+import org.elasticsearch.xpack.esql.plugin.ComputeService;
 import org.elasticsearch.xpack.esql.plugin.EsqlFlags;
 import org.elasticsearch.xpack.esql.plugin.QueryPragmas;
 import org.elasticsearch.xpack.esql.plugin.ReductionPlan;
-import org.elasticsearch.xpack.esql.plugin.ReductionPlanner;
 import org.elasticsearch.xpack.esql.session.Configuration;
 import org.elasticsearch.xpack.esql.session.IndexResolver;
 import org.elasticsearch.xpack.esql.session.Versioned;
@@ -228,7 +231,17 @@ public abstract class GoldenTestCase extends ESTestCase {
         }
 
         TestBuilder(String esqlQuery) {
-            this(esqlQuery, EnumSet.allOf(Stage.class), EsqlTestUtils.TEST_SEARCH_STATS, new String[0], null, null);
+            // Keep distributed reduction opt-in while the role and lifetime of this planning stage are still being evaluated.
+            // Enabling it here would commit every golden suite to the current approach for distributed rewrites and require a
+            // distributed_reduction snapshot, with suitable planning configuration, for every default test.
+            this(
+                esqlQuery,
+                EnumSet.complementOf(EnumSet.of(Stage.DISTRIBUTED_REDUCTION)),
+                EsqlTestUtils.TEST_SEARCH_STATS,
+                new String[0],
+                null,
+                null
+            );
         }
 
         public TestBuilder optimizer(Function<LogicalOptimizerContext, LogicalPlanOptimizer> factory) {
@@ -707,6 +720,7 @@ public abstract class GoldenTestCase extends ESTestCase {
                 || stages.contains(Stage.LOCAL_PHYSICAL_OPTIMIZATION)
                 || stages.contains(Stage.LOOKUP_LOGICAL_OPTIMIZATION)
                 || stages.contains(Stage.LOOKUP_PHYSICAL_OPTIMIZATION)
+                || stages.contains(Stage.DISTRIBUTED_REDUCTION)
                 || stages.contains(Stage.NODE_REDUCE)
                 || stages.contains(Stage.NODE_REDUCE_LOCAL_PHYSICAL_OPTIMIZATION)) {
                 // When query approximation is enabled, the logical plan can contain
@@ -721,6 +735,37 @@ public abstract class GoldenTestCase extends ESTestCase {
                 );
                 if (stages.contains(Stage.PHYSICAL_OPTIMIZATION)) {
                     result.add(Tuple.tuple(Stage.PHYSICAL_OPTIMIZATION, verifyOrWrite(physicalPlan, Stage.PHYSICAL_OPTIMIZATION)));
+                }
+                if (stages.contains(Stage.DISTRIBUTED_REDUCTION)) {
+                    Configuration fetchConfiguration = EsqlTestUtils.configuration(
+                        new QueryPragmas(Settings.builder().put(QueryPragmas.FETCH_TOPN.getKey(), true).build()),
+                        esqlQuery,
+                        statement
+                    );
+                    PhysicalPlan fetchInput = new Mapper().map(new Versioned<>(logicallyOptimized, transportVersion));
+                    fetchInput = fetchInput.transformDown(
+                        FragmentExec.class,
+                        fragment -> fragment.withFragment(fragment.fragment().transformDown(EsRelation.class, relation -> {
+                            List<String> concreteIndices = relation.indexProperties().isEmpty()
+                                ? List.of(relation.indexPattern())
+                                : List.copyOf(relation.indexProperties().keySet());
+                            return new EsRelation(
+                                relation.source(),
+                                relation.indexPattern(),
+                                relation.indexMode(),
+                                relation.originalIndices(),
+                                Map.of(RemoteClusterAware.LOCAL_CLUSTER_GROUP_KEY, concreteIndices),
+                                relation.indexProperties(),
+                                relation.output()
+                            );
+                        }))
+                    );
+                    PhysicalPlan distributedReductionPlan = new PhysicalPlanOptimizer(
+                        new PhysicalOptimizerContext(fetchConfiguration, transportVersion)
+                    ).optimize(fetchInput);
+                    result.add(
+                        Tuple.tuple(Stage.DISTRIBUTED_REDUCTION, verifyOrWrite(distributedReductionPlan, Stage.DISTRIBUTED_REDUCTION))
+                    );
                 }
                 PhysicalPlan localPhysicalPlan = null;
                 boolean needsLocalPlan = stages.contains(Stage.LOCAL_PHYSICAL_OPTIMIZATION)
@@ -763,7 +808,7 @@ public abstract class GoldenTestCase extends ESTestCase {
                     if (exchanges.isEmpty() == false) {
                         ExchangeExec exec = EsqlTestUtils.singleValue(exchanges);
                         var sink = new ExchangeSinkExec(exec.source(), exec.output(), false, exec.child());
-                        var reductionPlan = ReductionPlanner.plan(
+                        var reductionPlan = ComputeService.reductionPlan(
                             PlannerSettings.DEFAULTS,
                             new EsqlFlags(false),
                             configuration,
@@ -1083,6 +1128,8 @@ public abstract class GoldenTestCase extends ESTestCase {
         LOGICAL_OPTIMIZATION(new SingleFileOutput("logical_optimization")),
         /** See {@link PhysicalPlanOptimizer}. */
         PHYSICAL_OPTIMIZATION(new SingleFileOutput("physical_optimization")),
+        /** See {@link org.elasticsearch.xpack.esql.optimizer.rules.physical.PlanDeferredFetch}. */
+        DISTRIBUTED_REDUCTION(new SingleFileOutput("distributed_reduction")),
         /**
          * See {@link LocalPhysicalPlanOptimizer}. There's no LOCAL_LOGICAL here since in production we use PlannerUtils.localPlan to
          * produce the local physical plan directly from non-local physical plan.
@@ -1099,7 +1146,8 @@ public abstract class GoldenTestCase extends ESTestCase {
          */
         LOOKUP_PHYSICAL_OPTIMIZATION(new SingleFileOutput("lookup_physical_optimization")),
         /**
-         * See {@link ReductionPlanner}. Actually results in <b>two</b> plans: one for the node reduce driver and one for the data nodes.
+         * See {@link ComputeService#reductionPlan}. Actually results in <b>two</b> plans: one for the node reduce driver and one for the
+         * data nodes.
          */
         NODE_REDUCE(new DualFileOutput("local_reduce_planned_reduce_driver", "local_reduce_planned_data_driver")),
 

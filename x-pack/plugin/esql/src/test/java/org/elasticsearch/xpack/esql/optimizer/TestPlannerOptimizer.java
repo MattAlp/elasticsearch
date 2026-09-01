@@ -79,6 +79,13 @@ public class TestPlannerOptimizer {
         return EstimatesRowSize.estimateRowSize(0, physicalPlanOptimizer.optimize(physicalPlan(query, analyzer)));
     }
 
+    /**
+     * Builds the mapped distributed plan before global physical optimization.
+     */
+    public PhysicalPlan mappedPlan(String query) {
+        return physicalPlan(query, analyzer);
+    }
+
     private PhysicalPlan optimizedPlan(PhysicalPlan plan, SearchStats searchStats) {
         return optimizedPlan(plan, searchStats, new EsqlFlags(true));
     }

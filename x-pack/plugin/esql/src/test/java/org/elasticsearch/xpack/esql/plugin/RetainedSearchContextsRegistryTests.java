@@ -210,6 +210,29 @@ public class RetainedSearchContextsRegistryTests extends ESTestCase {
         assertTrue(searchContext.isClosed());
     }
 
+    public void testHeartbeatKeepsIdleRegistrationOpen() {
+        long[] now = new long[] { 0L };
+        RetainedSearchContextsRegistry expiringRegistry = new RetainedSearchContextsRegistry(() -> now[0], TimeValue.timeValueMillis(10));
+        SearchContext searchContext = createSearchContext();
+        AcquiredSearchContexts contexts = createContexts(searchContext);
+
+        RetainedSearchContextsRegistry.Handle registration = expiringRegistry.register("session-1", contexts);
+        registration.finishRegistration();
+        now[0] = 9L;
+        expiringRegistry.touch("session-1");
+        now[0] = 11L;
+
+        expiringRegistry.expire();
+
+        assertThat(expiringRegistry.retainedSessions(), equalTo(1));
+        assertFalse(searchContext.isClosed());
+
+        now[0] = 20L;
+        expiringRegistry.expire();
+        assertThat(expiringRegistry.retainedSessions(), equalTo(0));
+        assertTrue(searchContext.isClosed());
+    }
+
     public void testExpireSkipsActiveProducer() {
         long[] now = new long[] { 0L };
         RetainedSearchContextsRegistry expiringRegistry = new RetainedSearchContextsRegistry(() -> now[0], TimeValue.timeValueMillis(10));
@@ -262,7 +285,7 @@ public class RetainedSearchContextsRegistryTests extends ESTestCase {
         AcquiredSearchContexts contexts = createContexts(searchContext);
         DiscoveryNode node = DiscoveryNodeUtils.create("node-1");
         List<String> released = new ArrayList<>();
-        RemoteFetchService.RetainedSessionReleaser releaser = new RemoteFetchService.RetainedSessionReleaser((targetNode, sessionId) -> {
+        FetchService.RetainedSessionReleaser releaser = new FetchService.RetainedSessionReleaser((targetNode, sessionId) -> {
             released.add(targetNode.getId() + "/" + sessionId);
             registry.closeRegistration(sessionId);
         });
