@@ -22,10 +22,10 @@ import org.elasticsearch.xpack.esql.core.expression.NameId;
 import org.elasticsearch.xpack.esql.core.expression.NamedExpression;
 import org.elasticsearch.xpack.esql.evaluator.EvalMapper;
 import org.elasticsearch.xpack.esql.plan.logical.Eval;
+import org.elasticsearch.xpack.esql.plan.logical.FetchSource;
 import org.elasticsearch.xpack.esql.plan.logical.Filter;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.Project;
-import org.elasticsearch.xpack.esql.plan.logical.RemoteFetchSource;
 import org.elasticsearch.xpack.esql.plan.physical.FragmentExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
 import org.elasticsearch.xpack.esql.planner.EsPhysicalOperationProviders;
@@ -35,22 +35,24 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Validates and builds operators for the deliberately small post-fetch pushdown fragment supported by remote fetch.
+ * Validates and builds operators for a constrained post-fetch fragment.
  * <p>
- * At runtime, this class translates a supported pushdown {@link FragmentExec} into an operator pipeline that is
- * appended to the exchange server's data-node driver pipeline.
+ * Production planning currently creates a fragment that contains only {@link FetchSource}. The {@link Eval},
+ * {@link Filter}, and {@link Project} forms are scaffolding for future pushdown work and are not part of the current
+ * fetch contract. When a request contains a recognized {@link FragmentExec}, this class translates it into operators
+ * for the exchange server's data-node driver pipeline.
  * <p>
  * The source fragment's last output attribute is the synthetic position-mapping attribute. It corresponds to the final
  * {@link IntBlock} in the data-node pipeline and must remain the last output block after pushdown execution.
  */
-final class RemoteFetchPushdownOperatorBuilder {
+final class FetchPushdownOperatorBuilder {
     private record PushdownPipeline(Layout layout, NameId positionAttributeId) {}
 
     /**
-     * Validates the remote-fetch pushdown shape used on the wire.
+     * Validates a fetch fragment shape used on the wire.
      * <p>
      * Accepted forms are {@link FragmentExec} wrapping logical nodes from the constrained
-     * {@link RemoteFetchSource}/{@link Eval}/{@link Filter}/{@link Project} family.
+     * {@link FetchSource}/{@link Eval}/{@link Filter}/{@link Project} family.
      */
     static void validateSupportedPlan(PhysicalPlan plan) {
         if (plan == null) {
@@ -65,7 +67,7 @@ final class RemoteFetchPushdownOperatorBuilder {
 
     private static void validateSupportedFragment(LogicalPlan plan) {
         plan.forEachDown(node -> {
-            if (node instanceof RemoteFetchSource == false
+            if (node instanceof FetchSource == false
                 && node instanceof Eval == false
                 && node instanceof Filter == false
                 && node instanceof Project == false) {
@@ -75,11 +77,11 @@ final class RemoteFetchPushdownOperatorBuilder {
     }
 
     private static String unsupportedPlanMessage(Object plan) {
-        return "unsupported remote fetch pushdown plan [" + plan.getClass().getSimpleName() + "]";
+        return "unsupported fetch pushdown plan [" + plan.getClass().getSimpleName() + "]";
     }
 
     /**
-     * Builds runtime operators from a supported, non-null pushdown plan.
+     * Builds runtime operators from a recognized, non-null pushdown plan.
      * <p>
      * Callers should validate request-time payloads with {@link #validateSupportedPlan(PhysicalPlan)} before invoking
      * this method, and skip the call entirely when the request carries no pushdown plan.
@@ -91,7 +93,7 @@ final class RemoteFetchPushdownOperatorBuilder {
         DriverContext driverContext
     ) {
         if (pushdownPlan == null) {
-            throw new IllegalArgumentException("remote fetch pushdown plan must not be null");
+            throw new IllegalArgumentException("fetch pushdown plan must not be null");
         }
         List<Operator.OperatorFactory> factories = new ArrayList<>();
         PushdownPipeline pipeline = buildPipeline(pushdownPlan, factories, shardContexts, foldContext);
@@ -130,7 +132,7 @@ final class RemoteFetchPushdownOperatorBuilder {
         }
         Layout.ChannelAndType position = pipeline.layout().get(positionAttributeId);
         if (position == null) {
-            throw new IllegalStateException("remote fetch pushdown lost position-mapping attribute");
+            throw new IllegalStateException("fetch pushdown lost position-mapping attribute");
         }
         int positionChannel = position.channel();
         int totalChannels = pipeline.layout().numberOfChannels();
@@ -153,7 +155,7 @@ final class RemoteFetchPushdownOperatorBuilder {
         IndexedByShardId<? extends EsPhysicalOperationProviders.ShardContext> shardContexts,
         FoldContext foldContext
     ) {
-        if (plan instanceof RemoteFetchSource sourcePlan) {
+        if (plan instanceof FetchSource sourcePlan) {
             Layout.Builder builder = new Layout.Builder();
             builder.append(sourcePlan.output());
             List<Attribute> output = sourcePlan.output();
@@ -161,10 +163,10 @@ final class RemoteFetchPushdownOperatorBuilder {
             // instead of trusting the position alone so a malformed fragment fails fast rather than mapping the
             // wrong channel.
             Attribute positionAttribute = output.isEmpty() ? null : output.getLast();
-            if (positionAttribute == null || positionAttribute.name().equals(RemoteFetchSource.POSITION_ATTRIBUTE_NAME) == false) {
+            if (positionAttribute == null || positionAttribute.name().equals(FetchSource.POSITION_ATTRIBUTE_NAME) == false) {
                 throw new IllegalStateException(
-                    "remote fetch pushdown source must end with the position-mapping attribute ["
-                        + RemoteFetchSource.POSITION_ATTRIBUTE_NAME
+                    "fetch pushdown source must end with the position-mapping attribute ["
+                        + FetchSource.POSITION_ATTRIBUTE_NAME
                         + "] but ends with ["
                         + (positionAttribute == null ? "nothing" : positionAttribute.name())
                         + "]"
@@ -176,6 +178,8 @@ final class RemoteFetchPushdownOperatorBuilder {
             PushdownPipeline child = buildFragmentPipeline(evalPlan.child(), factories, shardContexts, foldContext);
             Layout childLayout = child.layout();
             Layout.Builder builder = childLayout.builder();
+            // TODO: Before enabling Eval pushdowns, build each evaluator against the progressively extended layout so
+            // a later alias can reference an alias declared earlier in the same Eval.
             for (Alias field : evalPlan.fields()) {
                 factories.add(new EvalOperatorFactory(EvalMapper.toEvaluator(foldContext, field.child(), childLayout, shardContexts)));
                 builder.append(field.toAttribute());
@@ -210,7 +214,7 @@ final class RemoteFetchPushdownOperatorBuilder {
             if (child.positionAttributeId() != null) {
                 Layout.ChannelAndType positionInput = childLayout.get(child.positionAttributeId());
                 if (positionInput == null) {
-                    throw new IllegalStateException("remote fetch pushdown lost position-mapping attribute");
+                    throw new IllegalStateException("fetch pushdown lost position-mapping attribute");
                 }
                 projectionList.add(positionInput.channel());
                 builder.append(childLayout.inverse().get(positionInput.channel()));
@@ -227,7 +231,7 @@ final class RemoteFetchPushdownOperatorBuilder {
                 return child.id();
             }
             throw new IllegalStateException(
-                "remote fetch pushdown project aliases must reference existing named expressions; use EvalExec for scalar alias ["
+                "fetch pushdown project aliases must reference existing named expressions; use EvalExec for scalar alias ["
                     + projection
                     + "]"
             );

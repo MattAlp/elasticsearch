@@ -90,13 +90,14 @@ import org.elasticsearch.xpack.esql.core.type.EsField;
 import org.elasticsearch.xpack.esql.evaluator.mapper.EvaluatorMapper;
 import org.elasticsearch.xpack.esql.expression.predicate.operator.comparison.GreaterThan;
 import org.elasticsearch.xpack.esql.plan.logical.Eval;
+import org.elasticsearch.xpack.esql.plan.logical.FetchSource;
 import org.elasticsearch.xpack.esql.plan.logical.Filter;
 import org.elasticsearch.xpack.esql.plan.logical.Project;
-import org.elasticsearch.xpack.esql.plan.logical.RemoteFetchSource;
 import org.elasticsearch.xpack.esql.plan.physical.FragmentExec;
 import org.elasticsearch.xpack.esql.plan.physical.LimitExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
 import org.elasticsearch.xpack.esql.planner.EsPhysicalOperationProviders;
+import org.elasticsearch.xpack.esql.planner.FieldExtractionSpec;
 import org.elasticsearch.xpack.esql.planner.PlannerSettings;
 import org.elasticsearch.xpack.esql.planner.PlannerUtils;
 import org.elasticsearch.xpack.esql.session.Configuration;
@@ -114,16 +115,16 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
 
-public class RemoteFetchServiceTests extends MapperServiceTestCase {
+public class FetchServiceTests extends MapperServiceTestCase {
     private Directory directory;
     private IndexReader reader;
     private BlockFactory blockFactory;
 
     public void testInputPagePreservesHandleCoordinates() {
         blockFactory = blockFactory();
-        List<RemoteFetchHandle> handles = List.of(
-            new RemoteFetchHandle("node-1", "session-1", 3, 7, 11),
-            new RemoteFetchHandle("node-1", "session-1", 5, 13, 17)
+        List<FetchHandle> handles = List.of(
+            new FetchHandle("node-1", "session-1", 3, 7, 11),
+            new FetchHandle("node-1", "session-1", 5, 13, 17)
         );
 
         Page page = inputPage(blockFactory, handles);
@@ -191,9 +192,9 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
 
         List<Page> pages = runFieldLoadOperatorChain(
             List.of(
-                new RemoteFetchHandle("node-1", "session-1", 0, 0, 2),
-                new RemoteFetchHandle("node-1", "session-1", 0, 0, 0),
-                new RemoteFetchHandle("node-1", "session-1", 0, 0, 1)
+                new FetchHandle("node-1", "session-1", 0, 0, 2),
+                new FetchHandle("node-1", "session-1", 0, 0, 0),
+                new FetchHandle("node-1", "session-1", 0, 0, 1)
             ),
             fieldInfos,
             new IndexedByShardIdFromSingleton<>(
@@ -223,18 +224,18 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
 
     public void testPushdownForExchangeSupportsFilterExec() {
         blockFactory = blockFactory();
-        RemoteFetchPushdownOperatorBuilder pushdownBuilder = new RemoteFetchPushdownOperatorBuilder();
+        FetchPushdownOperatorBuilder pushdownBuilder = new FetchPushdownOperatorBuilder();
         ReferenceAttribute fetchedAttribute = new ReferenceAttribute(Source.EMPTY, null, "n", DataType.LONG);
         ReferenceAttribute positionAttribute = new ReferenceAttribute(
             Source.EMPTY,
             null,
-            RemoteFetchSource.POSITION_ATTRIBUTE_NAME,
+            FetchSource.POSITION_ATTRIBUTE_NAME,
             DataType.INTEGER
         );
         PhysicalPlan pushdownPlan = new FragmentExec(
             new Filter(
                 Source.EMPTY,
-                new RemoteFetchSource(Source.EMPTY, List.of(fetchedAttribute, positionAttribute)),
+                new FetchSource(Source.EMPTY, List.of(fetchedAttribute, positionAttribute)),
                 new GreaterThan(Source.EMPTY, fetchedAttribute, new Literal(Source.EMPTY, 15L, DataType.LONG))
             )
         );
@@ -269,14 +270,14 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
         ReferenceAttribute positionAttribute = new ReferenceAttribute(
             Source.EMPTY,
             null,
-            RemoteFetchSource.POSITION_ATTRIBUTE_NAME,
+            FetchSource.POSITION_ATTRIBUTE_NAME,
             DataType.INTEGER
         );
         expectThrows(
             AssertionError.class,
             () -> new Project(
                 Source.EMPTY,
-                new RemoteFetchSource(Source.EMPTY, List.of(fetchedAttribute, positionAttribute)),
+                new FetchSource(Source.EMPTY, List.of(fetchedAttribute, positionAttribute)),
                 List.of(new Alias(Source.EMPTY, "constant", new Literal(Source.EMPTY, 1, DataType.INTEGER)))
             )
         );
@@ -284,12 +285,12 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
 
     public void testPushdownProjectPreservesPositionMapping() {
         blockFactory = blockFactory();
-        RemoteFetchPushdownOperatorBuilder pushdownBuilder = new RemoteFetchPushdownOperatorBuilder();
+        FetchPushdownOperatorBuilder pushdownBuilder = new FetchPushdownOperatorBuilder();
         ReferenceAttribute fetchedAttribute = new ReferenceAttribute(Source.EMPTY, null, "n", DataType.LONG);
         ReferenceAttribute positionAttribute = new ReferenceAttribute(
             Source.EMPTY,
             null,
-            RemoteFetchSource.POSITION_ATTRIBUTE_NAME,
+            FetchSource.POSITION_ATTRIBUTE_NAME,
             DataType.INTEGER
         );
         PhysicalPlan pushdownPlan = new FragmentExec(
@@ -297,7 +298,7 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
                 Source.EMPTY,
                 new Filter(
                     Source.EMPTY,
-                    new RemoteFetchSource(Source.EMPTY, List.of(fetchedAttribute, positionAttribute)),
+                    new FetchSource(Source.EMPTY, List.of(fetchedAttribute, positionAttribute)),
                     new GreaterThan(Source.EMPTY, fetchedAttribute, new Literal(Source.EMPTY, 15L, DataType.LONG))
                 ),
                 List.of(fetchedAttribute)
@@ -337,18 +338,18 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
             LocalCircuitBreaker.SizeSettings.DEFAULT_SETTINGS.maxOverReservedBytes()
         );
         BlockFactory exchangeBlockFactory = blockFactory.newChildFactory(localBreaker);
-        RemoteFetchPushdownOperatorBuilder pushdownBuilder = new RemoteFetchPushdownOperatorBuilder();
+        FetchPushdownOperatorBuilder pushdownBuilder = new FetchPushdownOperatorBuilder();
         ReferenceAttribute fetchedAttribute = new ReferenceAttribute(Source.EMPTY, null, "n", DataType.LONG);
         ReferenceAttribute positionAttribute = new ReferenceAttribute(
             Source.EMPTY,
             null,
-            RemoteFetchSource.POSITION_ATTRIBUTE_NAME,
+            FetchSource.POSITION_ATTRIBUTE_NAME,
             DataType.INTEGER
         );
         PhysicalPlan pushdownPlan = new FragmentExec(
             new Eval(
                 Source.EMPTY,
-                new RemoteFetchSource(Source.EMPTY, List.of(fetchedAttribute, positionAttribute)),
+                new FetchSource(Source.EMPTY, List.of(fetchedAttribute, positionAttribute)),
                 List.of(new Alias(Source.EMPTY, "tracked", new FoldContextTrackingExpression(Source.EMPTY, new AtomicLong(-1L))))
             )
         );
@@ -375,12 +376,12 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
 
     public void testPushdownUsesSuppliedFoldContext() {
         blockFactory = blockFactory();
-        RemoteFetchPushdownOperatorBuilder pushdownBuilder = new RemoteFetchPushdownOperatorBuilder();
+        FetchPushdownOperatorBuilder pushdownBuilder = new FetchPushdownOperatorBuilder();
         ReferenceAttribute fetchedAttribute = new ReferenceAttribute(Source.EMPTY, null, "n", DataType.LONG);
         ReferenceAttribute positionAttribute = new ReferenceAttribute(
             Source.EMPTY,
             null,
-            RemoteFetchSource.POSITION_ATTRIBUTE_NAME,
+            FetchSource.POSITION_ATTRIBUTE_NAME,
             DataType.INTEGER
         );
         FoldContext foldContext = new FoldContext(1234L);
@@ -388,7 +389,7 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
         PhysicalPlan pushdownPlan = new FragmentExec(
             new Eval(
                 Source.EMPTY,
-                new RemoteFetchSource(Source.EMPTY, List.of(fetchedAttribute, positionAttribute)),
+                new FetchSource(Source.EMPTY, List.of(fetchedAttribute, positionAttribute)),
                 List.of(new Alias(Source.EMPTY, "tracked", new FoldContextTrackingExpression(Source.EMPTY, observedFoldLimit)))
             )
         );
@@ -418,10 +419,10 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
             new EsField("n", DataType.LONG, Map.of(), false, EsField.TimeSeriesFieldType.NONE)
         );
         Configuration configuration = ConfigurationTestUtils.randomConfiguration();
-        PhysicalPlan pushdownPlan = new FragmentExec(new RemoteFetchSource(Source.EMPTY, List.of(fieldAttribute)));
-        RemoteFetchService.ExchangeSetupRequest request = new RemoteFetchService.ExchangeSetupRequest(
+        PhysicalPlan pushdownPlan = new FragmentExec(new FetchSource(Source.EMPTY, List.of(fieldAttribute)));
+        FetchService.ExchangeSetupRequest request = new FetchService.ExchangeSetupRequest(
             "session-1",
-            List.of(new RemoteFetchService.FetchField("n", DataType.LONG)),
+            List.of(FieldExtractionSpec.direct("n", DataType.LONG)),
             pushdownPlan,
             configuration,
             "clientToServer-1",
@@ -433,11 +434,11 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
             try (
                 StreamInput in = new NamedWriteableAwareStreamInput(out.bytes().streamInput(), SerializationTestUtils.writableRegistry())
             ) {
-                RemoteFetchService.ExchangeSetupRequest copy = new RemoteFetchService.ExchangeSetupRequest(in);
+                FetchService.ExchangeSetupRequest copy = new FetchService.ExchangeSetupRequest(in);
                 assertThat(copy.retainedSessionId(), equalTo("session-1"));
-                assertThat(copy.fields(), equalTo(List.of(new RemoteFetchService.FetchField("n", DataType.LONG))));
+                assertThat(copy.extractionSpecs(), equalTo(List.of(FieldExtractionSpec.direct("n", DataType.LONG))));
                 assertThat(
-                    copy.pushdownPlan() instanceof FragmentExec fragmentExec && fragmentExec.fragment() instanceof RemoteFetchSource,
+                    copy.pushdownPlan() instanceof FragmentExec fragmentExec && fragmentExec.fragment() instanceof FetchSource,
                     equalTo(true)
                 );
                 assertThat(copy.configuration(), equalTo(configuration.withoutTables()));
@@ -447,26 +448,81 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
         }
     }
 
+    public void testDirectExtractionHonorsConfiguredPreference() {
+        MappedFieldType.FieldExtractPreference preference = MappedFieldType.FieldExtractPreference.STORED;
+        EsPhysicalOperationProviders.ShardContext shardContext = Mockito.mock(EsPhysicalOperationProviders.ShardContext.class);
+        BlockLoader blockLoader = Mockito.mock(BlockLoader.class, Mockito.withSettings().stubOnly());
+        Mockito.when(
+            shardContext.blockLoader(
+                "n",
+                false,
+                preference,
+                null,
+                null,
+                PlannerSettings.DEFAULTS.blockLoaderSizeOrdinals(),
+                PlannerSettings.DEFAULTS.blockLoaderSizeScript()
+            )
+        ).thenReturn(blockLoader);
+
+        List<ValuesSourceReaderOperator.FieldInfo> fieldInfos = FetchService.buildFieldInfos(
+            List.of(FieldExtractionSpec.direct("n", DataType.LONG, preference)),
+            new IndexedByShardIdFromSingleton<>(shardContext),
+            PlannerSettings.DEFAULTS
+        );
+        fieldInfos.getFirst().buildLoader().build(null, 0);
+
+        Mockito.verify(shardContext)
+            .blockLoader(
+                "n",
+                false,
+                preference,
+                null,
+                null,
+                PlannerSettings.DEFAULTS.blockLoaderSizeOrdinals(),
+                PlannerSettings.DEFAULTS.blockLoaderSizeScript()
+            );
+    }
+
+    public void testDirectExtractionTypesHavePreferenceIndependentElementTypes() {
+        for (DataType dataType : DataType.values()) {
+            if (FieldExtractionSpec.isSupportedByDirectOperation(dataType)) {
+                var expectedElementType = PlannerUtils.toElementType(dataType);
+                for (MappedFieldType.FieldExtractPreference preference : MappedFieldType.FieldExtractPreference.values()) {
+                    assertThat(PlannerUtils.toElementType(dataType, preference), equalTo(expectedElementType));
+                }
+            }
+        }
+    }
+
+    public void testDirectExtractionRejectsSpatialFieldsWithConfiguredPreference() {
+        IllegalArgumentException exception = expectThrows(
+            IllegalArgumentException.class,
+            () -> FieldExtractionSpec.direct("location", DataType.GEO_POINT, MappedFieldType.FieldExtractPreference.DOC_VALUES)
+        );
+
+        assertThat(exception.getMessage(), containsString("requires a specialized extraction operation"));
+    }
+
     public void testExchangeSetupRequestRejectsUnsupportedPushdownPlan() {
         ReferenceAttribute fetchedAttribute = new ReferenceAttribute(Source.EMPTY, null, "n", DataType.LONG);
         ReferenceAttribute positionAttribute = new ReferenceAttribute(
             Source.EMPTY,
             null,
-            RemoteFetchSource.POSITION_ATTRIBUTE_NAME,
+            FetchSource.POSITION_ATTRIBUTE_NAME,
             DataType.INTEGER
         );
         PhysicalPlan pushdownPlan = new LimitExec(
             Source.EMPTY,
-            new FragmentExec(new RemoteFetchSource(Source.EMPTY, List.of(fetchedAttribute, positionAttribute))),
+            new FragmentExec(new FetchSource(Source.EMPTY, List.of(fetchedAttribute, positionAttribute))),
             new Literal(Source.EMPTY, 10, DataType.INTEGER),
             null
         );
 
         IllegalArgumentException exception = expectThrows(
             IllegalArgumentException.class,
-            () -> new RemoteFetchService.ExchangeSetupRequest(
+            () -> new FetchService.ExchangeSetupRequest(
                 "session-1",
-                List.of(new RemoteFetchService.FetchField("n", DataType.LONG)),
+                List.of(FieldExtractionSpec.direct("n", DataType.LONG)),
                 pushdownPlan,
                 ConfigurationTestUtils.randomConfiguration(),
                 "clientToServer-1",
@@ -474,15 +530,15 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
             )
         );
         assertThat(exception.getMessage(), containsString("request_build"));
-        assertThat(exception.getMessage(), containsString("unsupported remote fetch pushdown plan [LimitExec]"));
+        assertThat(exception.getMessage(), containsString("unsupported fetch pushdown plan [LimitExec]"));
     }
 
     public void testExchangeSetupRequestRejectsBlankExchangeIds() {
         IllegalArgumentException blankClientToServer = expectThrows(
             IllegalArgumentException.class,
-            () -> new RemoteFetchService.ExchangeSetupRequest(
+            () -> new FetchService.ExchangeSetupRequest(
                 "session-1",
-                List.of(new RemoteFetchService.FetchField("n", DataType.LONG)),
+                List.of(FieldExtractionSpec.direct("n", DataType.LONG)),
                 null,
                 ConfigurationTestUtils.randomConfiguration(),
                 " ",
@@ -493,9 +549,9 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
 
         IllegalArgumentException blankServerToClient = expectThrows(
             IllegalArgumentException.class,
-            () -> new RemoteFetchService.ExchangeSetupRequest(
+            () -> new FetchService.ExchangeSetupRequest(
                 "session-1",
-                List.of(new RemoteFetchService.FetchField("n", DataType.LONG)),
+                List.of(FieldExtractionSpec.direct("n", DataType.LONG)),
                 null,
                 ConfigurationTestUtils.randomConfiguration(),
                 "clientToServer-1",
@@ -511,9 +567,9 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
         IntBlock values = blockFactory.newConstantIntBlockWith(1, 1);
         try (Column column = new Column(DataType.INTEGER, values)) {
             configuration = ConfigurationTestUtils.randomConfiguration("from test", Map.of("t", Map.of("v", column)));
-            RemoteFetchService.ExchangeSetupRequest request = new RemoteFetchService.ExchangeSetupRequest(
+            FetchService.ExchangeSetupRequest request = new FetchService.ExchangeSetupRequest(
                 "session-1",
-                List.of(new RemoteFetchService.FetchField("n", DataType.LONG)),
+                List.of(FieldExtractionSpec.direct("n", DataType.LONG)),
                 null,
                 configuration,
                 "clientToServer-1",
@@ -528,7 +584,7 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
                         SerializationTestUtils.writableRegistry()
                     )
                 ) {
-                    RemoteFetchService.ExchangeSetupRequest copy = new RemoteFetchService.ExchangeSetupRequest(in);
+                    FetchService.ExchangeSetupRequest copy = new FetchService.ExchangeSetupRequest(in);
                     assertThat(copy.configuration().tables(), equalTo(Map.of()));
                     assertThat(copy.configuration(), equalTo(configuration.withoutTables()));
                 }
@@ -538,9 +594,9 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
 
     public void testExchangeSetupRequestCreatesCancellableChildTask() {
         Configuration configuration = ConfigurationTestUtils.randomConfiguration();
-        RemoteFetchService.ExchangeSetupRequest request = new RemoteFetchService.ExchangeSetupRequest(
+        FetchService.ExchangeSetupRequest request = new FetchService.ExchangeSetupRequest(
             "session-1",
-            List.of(new RemoteFetchService.FetchField("n", DataType.LONG)),
+            List.of(FieldExtractionSpec.direct("n", DataType.LONG)),
             null,
             configuration,
             "clientToServer-1",
@@ -548,16 +604,16 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
         );
 
         TaskId parentTaskId = new TaskId("coordinator-node", randomNonNegativeLong());
-        Task task = request.createTask(1L, "transport", RemoteFetchService.EXCHANGE_SETUP_ACTION_NAME, parentTaskId, Map.of());
+        Task task = request.createTask(1L, "transport", FetchService.EXCHANGE_SETUP_ACTION_NAME, parentTaskId, Map.of());
 
         assertThat(task instanceof CancellableTask, equalTo(true));
         assertThat(task.getParentTaskId(), equalTo(parentTaskId));
     }
 
-    public void testExchangeSetupRequestRejectsEmptyFields() {
+    public void testExchangeSetupRequestRejectsEmptyExtractionSpecs() {
         IllegalArgumentException exception = expectThrows(
             IllegalArgumentException.class,
-            () -> new RemoteFetchService.ExchangeSetupRequest(
+            () -> new FetchService.ExchangeSetupRequest(
                 "session-1",
                 List.of(),
                 null,
@@ -566,13 +622,13 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
                 "serverToClient-1"
             )
         );
-        assertThat(exception.getMessage(), containsString("remote fetch requires at least one request field"));
+        assertThat(exception.getMessage(), containsString("fetch requires at least one extraction specification"));
     }
 
     public void testRetainedSessionReleaserDeduplicatesReleases() {
         DiscoveryNode node = DiscoveryNodeUtils.create("node-1");
         List<String> released = new ArrayList<>();
-        RemoteFetchService.RetainedSessionReleaser releaser = new RemoteFetchService.RetainedSessionReleaser(
+        FetchService.RetainedSessionReleaser releaser = new FetchService.RetainedSessionReleaser(
             (targetNode, sessionId) -> released.add(targetNode.getId() + "/" + sessionId)
         );
 
@@ -588,7 +644,7 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
     public void testRetainedSessionReleaserCanReleaseOneTrackedSession() {
         DiscoveryNode node = DiscoveryNodeUtils.create("node-1");
         List<String> released = new ArrayList<>();
-        RemoteFetchService.RetainedSessionReleaser releaser = new RemoteFetchService.RetainedSessionReleaser(
+        FetchService.RetainedSessionReleaser releaser = new FetchService.RetainedSessionReleaser(
             (targetNode, sessionId) -> released.add(targetNode.getId() + "/" + sessionId)
         );
 
@@ -601,10 +657,31 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
         assertThat(released, equalTo(List.of("node-1/session-1", "node-1/session-2")));
     }
 
+    public void testRetainedSessionReleaserHeartbeatsTrackedSessions() {
+        DiscoveryNode node = DiscoveryNodeUtils.create("node-1");
+        List<String> touched = new ArrayList<>();
+        boolean[] heartbeatCancelled = new boolean[1];
+        FetchService.RetainedSessionReleaser releaser = new FetchService.RetainedSessionReleaser(
+            (targetNode, sessionId) -> {},
+            (targetNode, sessionId) -> touched.add(targetNode.getId() + "/" + sessionId)
+        );
+        releaser.setHeartbeatCancellation(() -> heartbeatCancelled[0] = true);
+        releaser.track(node, "session-1");
+        releaser.track(node, "session-2");
+
+        releaser.heartbeat();
+        releaser.release(node, "session-1");
+        releaser.heartbeat();
+        releaser.close();
+
+        assertThat(touched, equalTo(List.of("node-1/session-1", "node-1/session-2", "node-1/session-2")));
+        assertTrue(heartbeatCancelled[0]);
+    }
+
     public void testRetainedSessionReleaserReleasesImmediatelyAfterClose() {
         DiscoveryNode node = DiscoveryNodeUtils.create("node-1");
         List<String> released = new ArrayList<>();
-        RemoteFetchService.RetainedSessionReleaser releaser = new RemoteFetchService.RetainedSessionReleaser(
+        FetchService.RetainedSessionReleaser releaser = new FetchService.RetainedSessionReleaser(
             (targetNode, sessionId) -> released.add(targetNode.getId() + "/" + sessionId)
         );
 
@@ -617,13 +694,13 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
     public void testBatchExchangeClientCloseReleasesTrackedSessions() {
         DiscoveryNode node = DiscoveryNodeUtils.create("node-1");
         List<String> released = new ArrayList<>();
-        RemoteFetchService.RetainedSessionReleaser releaser = new RemoteFetchService.RetainedSessionReleaser(
+        FetchService.RetainedSessionReleaser releaser = new FetchService.RetainedSessionReleaser(
             (targetNode, sessionId) -> released.add(targetNode.getId() + "/" + sessionId)
         );
         releaser.track(node, "session-1");
         releaser.track(node, "session-1");
 
-        RemoteFetchService.Client client = remoteFetchService().newBatchExchangeClient(Mockito.mock(CancellableTask.class), releaser);
+        FetchService.Client client = fetchService().newBatchExchangeClient(Mockito.mock(CancellableTask.class), releaser);
         client.close();
         client.close();
 
@@ -634,7 +711,7 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
         long[] now = new long[] { 0L };
         RetainedSearchContextsRegistry registry = new RetainedSearchContextsRegistry(() -> now[0], TimeValue.timeValueMillis(10));
         List<Runnable> scheduledCommands = new ArrayList<>();
-        RemoteFetchService service = remoteFetchService(registry, scheduledCommands);
+        FetchService service = fetchService(registry, scheduledCommands);
         SearchContext searchContext = new TestSearchContext(Mockito.mock(SearchExecutionContext.class, Mockito.withSettings().stubOnly()));
 
         RetainedSearchContextsRegistry.Handle registration = service.retainSearchContexts("session-1", createContexts(searchContext));
@@ -650,7 +727,7 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
         long[] now = new long[] { 0L };
         RetainedSearchContextsRegistry registry = new RetainedSearchContextsRegistry(() -> now[0], TimeValue.timeValueMillis(10));
         List<Runnable> scheduledCommands = new ArrayList<>();
-        RemoteFetchService service = remoteFetchService(registry, scheduledCommands);
+        FetchService service = fetchService(registry, scheduledCommands);
         SearchContext searchContext = new TestSearchContext(Mockito.mock(SearchExecutionContext.class, Mockito.withSettings().stubOnly()));
         RetainedSearchContextsRegistry.Handle registration = service.retainSearchContexts("session-1", createContexts(searchContext));
 
@@ -666,32 +743,21 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
     public void testStartExchangeFetchServerReleasesLeaseWhenSetupFails() {
         RetainedSearchContextsRegistry registry = new RetainedSearchContextsRegistry();
         RuntimeException setupFailure = new RuntimeException("setup failed");
-        RemoteFetchService service = remoteFetchService(
-            registry,
-            new ArrayList<>(),
-            (a, b, c, d, e, f, g, h, i, j) -> { throw setupFailure; }
-        );
+        FetchService service = fetchService(registry, new ArrayList<>(), (a, b, c, d, e, f, g, h, i, j) -> { throw setupFailure; });
         SearchContext searchContext = new TestSearchContext(Mockito.mock(SearchExecutionContext.class, Mockito.withSettings().stubOnly()));
         RetainedSearchContextsRegistry.Handle registration = service.retainSearchContexts("session-1", createContexts(searchContext));
         AtomicReference<Exception> failure = new AtomicReference<>();
 
         service.startExchangeFetchServer(
-            new RemoteFetchService.ExchangeSetupRequest(
+            new FetchService.ExchangeSetupRequest(
                 "session-1",
-                List.of(new RemoteFetchService.FetchField("n", DataType.LONG)),
+                List.of(FieldExtractionSpec.direct("n", DataType.LONG)),
                 null,
                 ConfigurationTestUtils.randomConfiguration(),
                 "clientToServer-1",
                 "serverToClient-1"
             ),
-            new CancellableTask(
-                1,
-                "transport",
-                RemoteFetchService.EXCHANGE_SETUP_ACTION_NAME,
-                "",
-                new TaskId("coordinator-node", 1),
-                Map.of()
-            ),
+            new CancellableTask(1, "transport", FetchService.EXCHANGE_SETUP_ACTION_NAME, "", new TaskId("coordinator-node", 1), Map.of()),
             ActionListener.wrap(ignored -> fail("setup should have failed"), failure::set)
         );
 
@@ -721,7 +787,7 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
      * Runs pushdown using the same shape as production: build operators first, then execute the operator chain.
      */
     private static List<Page> runPushdownThroughDriver(
-        RemoteFetchPushdownOperatorBuilder pushdownBuilder,
+        FetchPushdownOperatorBuilder pushdownBuilder,
         List<Page> inputPages,
         PhysicalPlan pushdownPlan,
         IndexedByShardId<? extends EsPhysicalOperationProviders.ShardContext> shardContexts,
@@ -732,7 +798,7 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
             executionBlockFactory.bigArrays(),
             executionBlockFactory,
             LocalCircuitBreaker.SizeSettings.DEFAULT_SETTINGS,
-            "remote_fetch_pushdown_test"
+            "fetch_pushdown_test"
         );
         List<Operator> operators = pushdownBuilder.buildOperators(pushdownPlan, shardContexts, foldContext, driverContext);
         return runOperatorChain(inputPages, operators);
@@ -783,18 +849,18 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
         return BlockFactory.builder(bigArrays).build();
     }
 
-    private static RemoteFetchService remoteFetchService() {
-        return remoteFetchService(new RetainedSearchContextsRegistry(), new ArrayList<>());
+    private static FetchService fetchService() {
+        return fetchService(new RetainedSearchContextsRegistry(), new ArrayList<>());
     }
 
-    private static RemoteFetchService remoteFetchService(RetainedSearchContextsRegistry registry, List<Runnable> scheduledCommands) {
-        return remoteFetchService(registry, scheduledCommands, BidirectionalBatchExchangeServer::new);
+    private static FetchService fetchService(RetainedSearchContextsRegistry registry, List<Runnable> scheduledCommands) {
+        return fetchService(registry, scheduledCommands, BidirectionalBatchExchangeServer::new);
     }
 
-    private static RemoteFetchService remoteFetchService(
+    private static FetchService fetchService(
         RetainedSearchContextsRegistry registry,
         List<Runnable> scheduledCommands,
-        RemoteFetchService.ExchangeServerFactory exchangeServerFactory
+        FetchService.ExchangeServerFactory exchangeServerFactory
     ) {
         TransportService transportService = Mockito.mock(TransportService.class);
         ThreadPool threadPool = Mockito.mock(ThreadPool.class);
@@ -836,7 +902,7 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
             Mockito.mock(PlannerSettings.Holder.class),
             null
         );
-        return new RemoteFetchService(
+        return new FetchService(
             services,
             BigArrays.NON_RECYCLING_INSTANCE,
             TestBlockFactory.getNonBreakingInstance(),
@@ -852,11 +918,11 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
     }
 
     /**
-     * Test helper that builds a doc-only page from remote fetch handles.
+     * Test helper that builds a doc-only page from fetch handles.
      */
-    private static Page inputPage(BlockFactory blockFactory, List<RemoteFetchHandle> handles) {
+    private static Page inputPage(BlockFactory blockFactory, List<FetchHandle> handles) {
         try (DocVector.FixedBuilder builder = DocVector.newFixedBuilder(blockFactory, handles.size())) {
-            for (RemoteFetchHandle handle : handles) {
+            for (FetchHandle handle : handles) {
                 builder.append(handle.shard(), handle.segment(), handle.doc());
             }
             return new Page(builder.build(DocVector.config()).asBlock());
@@ -867,7 +933,7 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
      * Test helper that runs the field-reading operator chain against handle-derived doc blocks.
      */
     private static List<Page> runFieldLoadOperatorChain(
-        List<RemoteFetchHandle> handles,
+        List<FetchHandle> handles,
         List<ValuesSourceReaderOperator.FieldInfo> fieldInfos,
         IndexedByShardId<ValuesSourceReaderOperator.ShardContext> shardContexts,
         BigArrays bigArrays,
@@ -879,7 +945,7 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
             return List.of();
         }
         if (fieldInfos.isEmpty()) {
-            throw new IllegalArgumentException("remote fetch requires at least one field");
+            throw new IllegalArgumentException("fetch requires at least one field");
         }
 
         final LocalCircuitBreaker localBreaker = new LocalCircuitBreaker(
@@ -891,7 +957,7 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
             bigArrays,
             blockFactory.newChildFactory(localBreaker),
             localBreakerSettings,
-            "remote_fetch"
+            "fetch"
         );
         final Operator operator = new ValuesSourceReaderOperator.Factory(
             plannerSettings.valuesLoadingJumboSize(),
@@ -918,7 +984,7 @@ public class RemoteFetchServiceTests extends MapperServiceTestCase {
             while (operator.isFinished() == false) {
                 Page page = operator.getOutput();
                 if (page == null) {
-                    throw new IllegalStateException("remote fetch operator stalled without producing output");
+                    throw new IllegalStateException("fetch operator stalled without producing output");
                 }
                 Page projected = page.projectBlocks(projection);
                 page.releaseBlocks();

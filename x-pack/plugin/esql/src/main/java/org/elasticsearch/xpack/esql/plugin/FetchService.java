@@ -18,7 +18,6 @@ import org.elasticsearch.common.breaker.CircuitBreaker;
 import org.elasticsearch.common.breaker.NoopCircuitBreaker;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
-import org.elasticsearch.common.io.stream.Writeable;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.BigArrays;
 import org.elasticsearch.common.util.concurrent.ThreadContext;
@@ -37,11 +36,10 @@ import org.elasticsearch.compute.operator.ProjectOperator.ProjectOperatorFactory
 import org.elasticsearch.compute.operator.exchange.BidirectionalBatchExchangeClient;
 import org.elasticsearch.compute.operator.exchange.BidirectionalBatchExchangeServer;
 import org.elasticsearch.compute.operator.exchange.ExchangeService;
+import org.elasticsearch.compute.querydsl.query.QueryWarnings;
 import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.core.TimeValue;
-import org.elasticsearch.index.mapper.BlockLoader;
-import org.elasticsearch.index.mapper.MappedFieldType;
 import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
 import org.elasticsearch.tasks.CancellableTask;
@@ -54,13 +52,12 @@ import org.elasticsearch.transport.TransportRequestHandler;
 import org.elasticsearch.transport.TransportRequestOptions;
 import org.elasticsearch.transport.TransportService;
 import org.elasticsearch.xpack.esql.action.EsqlQueryAction;
-import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.io.stream.PlanStreamInput;
 import org.elasticsearch.xpack.esql.io.stream.PlanStreamOutput;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
 import org.elasticsearch.xpack.esql.planner.EsPhysicalOperationProviders;
+import org.elasticsearch.xpack.esql.planner.FieldExtractionSpec;
 import org.elasticsearch.xpack.esql.planner.PlannerSettings;
-import org.elasticsearch.xpack.esql.planner.PlannerUtils;
 import org.elasticsearch.xpack.esql.session.Configuration;
 
 import java.io.IOException;
@@ -77,16 +74,18 @@ import java.util.stream.Collectors;
 /**
  * Internal transport service that fetches field values for coordinator-selected rows from the owning data node.
  * <p>
- * This is the transport half of the remote late-materialization prototype. It intentionally works on a narrow v1
- * contract: a batch of {@link RemoteFetchHandle}s plus a list of plain field specifications to load.
+ * This is the transport half of experimental deferred fetch. Each request carries a batch of {@link FetchHandle}s and complete
+ * {@link FieldExtractionSpec} instances. The service binds those specifications to the retained shard contexts on the target node.
  */
-public final class RemoteFetchService {
-    private static final String ACTION_PREFIX = EsqlQueryAction.NAME + "/remote_fetch";
+public final class FetchService {
+    private static final String ACTION_PREFIX = EsqlQueryAction.NAME + "/fetch";
     static final String RELEASE_ACTION_NAME = ACTION_PREFIX + "/release";
+    static final String TOUCH_ACTION_NAME = ACTION_PREFIX + "/touch";
     static final String EXCHANGE_SETUP_ACTION_NAME = ACTION_PREFIX + "/exchange_setup";
     private static final TimeValue RETAINED_CONTEXTS_REAPER_INTERVAL = TimeValue.timeValueMinutes(1);
+    private static final TimeValue RETAINED_CONTEXTS_HEARTBEAT_INTERVAL = TimeValue.timeValueMinutes(1);
 
-    private static final Logger logger = LogManager.getLogger(RemoteFetchService.class);
+    private static final Logger logger = LogManager.getLogger(FetchService.class);
     private static final AtomicLong exchangeIdGenerator = new AtomicLong();
 
     private final ClusterService clusterService;
@@ -96,11 +95,11 @@ public final class RemoteFetchService {
     private final BlockFactory blockFactory;
     private final PlannerSettings.Holder plannerSettings;
     private final LocalCircuitBreaker.SizeSettings localBreakerSettings;
-    private final RemoteFetchPushdownOperatorBuilder pushdownOperatorBuilder;
+    private final FetchPushdownOperatorBuilder pushdownOperatorBuilder;
     private final RetainedSearchContextsRegistry retainedSearchContexts;
     private final ExchangeServerFactory exchangeServerFactory;
 
-    RemoteFetchService(TransportActionServices transportActionServices, BigArrays bigArrays, BlockFactory blockFactory) {
+    FetchService(TransportActionServices transportActionServices, BigArrays bigArrays, BlockFactory blockFactory) {
         this(
             transportActionServices,
             bigArrays,
@@ -109,7 +108,7 @@ public final class RemoteFetchService {
         );
     }
 
-    RemoteFetchService(
+    FetchService(
         TransportActionServices transportActionServices,
         BigArrays bigArrays,
         BlockFactory blockFactory,
@@ -118,7 +117,7 @@ public final class RemoteFetchService {
         this(transportActionServices, bigArrays, blockFactory, retainedSearchContexts, BidirectionalBatchExchangeServer::new);
     }
 
-    RemoteFetchService(
+    FetchService(
         TransportActionServices transportActionServices,
         BigArrays bigArrays,
         BlockFactory blockFactory,
@@ -132,7 +131,7 @@ public final class RemoteFetchService {
         this.blockFactory = blockFactory;
         this.plannerSettings = transportActionServices.plannerSettings();
         this.localBreakerSettings = new LocalCircuitBreaker.SizeSettings(clusterService.getSettings());
-        this.pushdownOperatorBuilder = new RemoteFetchPushdownOperatorBuilder();
+        this.pushdownOperatorBuilder = new FetchPushdownOperatorBuilder();
         this.retainedSearchContexts = Objects.requireNonNull(retainedSearchContexts);
         this.exchangeServerFactory = Objects.requireNonNull(exchangeServerFactory);
         transportService.registerRequestHandler(
@@ -140,6 +139,12 @@ public final class RemoteFetchService {
             transportService.getThreadPool().executor(EsqlPlugin.ESQL_WORKER_THREAD_POOL_NAME),
             ReleaseRequest::new,
             new ReleaseTransportHandler()
+        );
+        transportService.registerRequestHandler(
+            TOUCH_ACTION_NAME,
+            transportService.getThreadPool().executor(EsqlPlugin.ESQL_WORKER_THREAD_POOL_NAME),
+            TouchRequest::new,
+            new TouchTransportHandler()
         );
         transportService.registerRequestHandler(
             EXCHANGE_SETUP_ACTION_NAME,
@@ -183,6 +188,20 @@ public final class RemoteFetchService {
         );
     }
 
+    void touchAsync(DiscoveryNode targetNode, String retainedSessionId, ActionListener<Void> listener) {
+        transportService.sendRequest(
+            targetNode,
+            TOUCH_ACTION_NAME,
+            new TouchRequest(retainedSessionId),
+            TransportRequestOptions.EMPTY,
+            new ActionListenerResponseHandler<>(
+                listener.map(ignored -> null),
+                in -> ActionResponse.Empty.INSTANCE,
+                transportService.getThreadPool().executor(ThreadPool.Names.SEARCH)
+            )
+        );
+    }
+
     public ThreadContext threadContext() {
         return transportService.getThreadPool().getThreadContext();
     }
@@ -201,17 +220,36 @@ public final class RemoteFetchService {
         return new BatchExchangeFetchClient(parentTask, retainedSessionReleaser);
     }
 
-    RetainedSessionReleaser newRetainedSessionReleaser() {
-        return new RetainedSessionReleaser(
-            (targetNode, retainedSessionId) -> releaseAsync(targetNode, retainedSessionId, ActionListener.wrap(ignored -> {}, e -> {
-                logger.debug("failed to release retained remote fetch session [{}] on node [{}]", retainedSessionId, targetNode.getId(), e);
-            }))
-        );
+    /**
+     * Creates a batch exchange client for runtime fetch operators that releases retained remote search contexts once
+     * a fetch session is no longer needed.
+     */
+    public Client newReleasingBatchExchangeClient(CancellableTask parentTask) {
+        return newBatchExchangeClient(parentTask, newRetainedSessionReleaser());
     }
 
-    private Page buildHandlesPage(List<RemoteFetchHandle> handles, long batchId) {
+    RetainedSessionReleaser newRetainedSessionReleaser() {
+        RetainedSessionReleaser releaser = new RetainedSessionReleaser(
+            (targetNode, retainedSessionId) -> releaseAsync(targetNode, retainedSessionId, ActionListener.wrap(ignored -> {}, e -> {
+                logger.debug("failed to release retained fetch session [{}] on node [{}]", retainedSessionId, targetNode.getId(), e);
+            })),
+            (targetNode, retainedSessionId) -> touchAsync(targetNode, retainedSessionId, ActionListener.wrap(ignored -> {}, e -> {
+                logger.debug("failed to refresh retained fetch session [{}] on node [{}]", retainedSessionId, targetNode.getId(), e);
+            }))
+        );
+        var heartbeat = transportService.getThreadPool()
+            .scheduleWithFixedDelay(
+                releaser::heartbeat,
+                RETAINED_CONTEXTS_HEARTBEAT_INTERVAL,
+                transportService.getThreadPool().executor(EsqlPlugin.ESQL_WORKER_THREAD_POOL_NAME)
+            );
+        releaser.setHeartbeatCancellation(heartbeat::cancel);
+        return releaser;
+    }
+
+    private Page buildHandlesPage(List<FetchHandle> handles, long batchId) {
         try (BytesRefBlock.Builder builder = blockFactory.newBytesRefBlockBuilder(handles.size())) {
-            for (RemoteFetchHandle handle : handles) {
+            for (FetchHandle handle : handles) {
                 builder.appendBytesRef(handle.toBytesRef());
             }
             return new Page(new BatchMetadata(batchId, 0, true), builder.build());
@@ -233,7 +271,7 @@ public final class RemoteFetchService {
         TargetExchange openTargetExchange(
             String nodeId,
             String retainedSessionId,
-            List<FetchField> fields,
+            List<FieldExtractionSpec> extractionSpecs,
             PhysicalPlan pushdownPlan,
             Configuration configuration
         );
@@ -249,7 +287,7 @@ public final class RemoteFetchService {
      * through it belong to that same target session.
      */
     public interface TargetExchange extends Releasable {
-        void sendBatch(long batchId, List<RemoteFetchHandle> handles) throws Exception;
+        void sendBatch(long batchId, List<FetchHandle> handles) throws Exception;
 
         Page pollPage();
 
@@ -315,21 +353,21 @@ public final class RemoteFetchService {
         public TargetExchange openTargetExchange(
             String nodeId,
             String retainedSessionId,
-            List<FetchField> fields,
+            List<FieldExtractionSpec> extractionSpecs,
             PhysicalPlan pushdownPlan,
             Configuration configuration
         ) {
             TargetSession target = new TargetSession(nodeId, retainedSessionId);
             synchronized (this) {
                 if (closed) {
-                    throw new IllegalStateException("remote fetch exchange client is closed");
+                    throw new IllegalStateException("fetch exchange client is closed");
                 }
                 TargetExchangeChannel existing = targetExchanges.get(target);
                 if (existing != null) {
-                    existing.validate(fields, pushdownPlan, configuration);
+                    existing.validate(extractionSpecs, pushdownPlan, configuration);
                     return existing;
                 }
-                TargetExchangeChannel created = createTargetExchange(target, fields, pushdownPlan, configuration);
+                TargetExchangeChannel created = createTargetExchange(target, extractionSpecs, pushdownPlan, configuration);
                 targetExchanges.put(target, created);
                 return created;
             }
@@ -354,13 +392,13 @@ public final class RemoteFetchService {
 
         private TargetExchangeChannel createTargetExchange(
             TargetSession target,
-            List<FetchField> fields,
+            List<FieldExtractionSpec> extractionSpecs,
             PhysicalPlan pushdownPlan,
             Configuration configuration
         ) {
             DiscoveryNode node = clusterService.state().nodes().get(target.nodeId());
             if (node == null) {
-                throw new IllegalStateException("remote fetch target node [" + target.nodeId() + "] not found");
+                throw new IllegalStateException("fetch target node [" + target.nodeId() + "] not found");
             }
             BidirectionalBatchExchangeClient.ServerSetupCallback setupCallback = (
                 serverNode,
@@ -369,7 +407,7 @@ public final class RemoteFetchService {
                 setupListener) -> {
                 ExchangeSetupRequest setupRequest = new ExchangeSetupRequest(
                     target.retainedSessionId(),
-                    fields,
+                    extractionSpecs,
                     pushdownPlan,
                     configuration,
                     clientToServerId,
@@ -389,12 +427,12 @@ public final class RemoteFetchService {
                 );
             };
             BidirectionalBatchExchangeClient client = new BidirectionalBatchExchangeClient(
-                target.retainedSessionId() + "/remote-fetch/" + exchangeIdGenerator.incrementAndGet(),
+                target.retainedSessionId() + "/fetch/" + exchangeIdGenerator.incrementAndGet(),
                 exchangeService,
                 transportService.getThreadPool().executor(EsqlPlugin.ESQL_WORKER_THREAD_POOL_NAME),
                 // Keep one extra response slot on the coordinator side so setup/metadata traffic does not
                 // starve the field-value pages flowing back from the data node.
-                Math.max(1, fields.size() + 1),
+                Math.max(1, extractionSpecs.size() + 1),
                 transportService,
                 parentTask,
                 ActionListener.noop(),
@@ -405,7 +443,7 @@ public final class RemoteFetchService {
                 () -> node
             );
             retainedSessionReleaser.track(node, target.retainedSessionId());
-            return new TargetExchangeChannel(target, node, retainedSessionReleaser, client, fields, pushdownPlan, configuration);
+            return new TargetExchangeChannel(target, node, retainedSessionReleaser, client, extractionSpecs, pushdownPlan, configuration);
         }
     }
 
@@ -414,7 +452,7 @@ public final class RemoteFetchService {
         private final DiscoveryNode targetNode;
         private final RetainedSessionReleaser retainedSessionReleaser;
         private final BidirectionalBatchExchangeClient client;
-        private final List<FetchField> fields;
+        private final List<FieldExtractionSpec> extractionSpecs;
         private final PhysicalPlan pushdownPlan;
         private final Configuration configuration;
         private final Object lock = new Object();
@@ -427,7 +465,7 @@ public final class RemoteFetchService {
             DiscoveryNode targetNode,
             RetainedSessionReleaser retainedSessionReleaser,
             BidirectionalBatchExchangeClient client,
-            List<FetchField> fields,
+            List<FieldExtractionSpec> extractionSpecs,
             PhysicalPlan pushdownPlan,
             Configuration configuration
         ) {
@@ -435,28 +473,28 @@ public final class RemoteFetchService {
             this.targetNode = targetNode;
             this.retainedSessionReleaser = retainedSessionReleaser;
             this.client = client;
-            this.fields = List.copyOf(fields);
+            this.extractionSpecs = List.copyOf(extractionSpecs);
             this.pushdownPlan = pushdownPlan;
             this.configuration = configuration;
         }
 
-        void validate(List<FetchField> fields, PhysicalPlan pushdownPlan, Configuration configuration) {
-            if (this.fields.equals(fields) == false) {
-                throw new IllegalStateException("remote fetch fields differ for reused target session channel");
+        void validate(List<FieldExtractionSpec> extractionSpecs, PhysicalPlan pushdownPlan, Configuration configuration) {
+            if (this.extractionSpecs.equals(extractionSpecs) == false) {
+                throw new IllegalStateException("fetch extraction specifications differ for reused target session channel");
             }
             if (Objects.equals(this.pushdownPlan, pushdownPlan) == false) {
-                throw new IllegalStateException("remote fetch pushdown plan differs for reused target session channel");
+                throw new IllegalStateException("fetch pushdown plan differs for reused target session channel");
             }
             if (this.configuration.equals(configuration) == false) {
-                throw new IllegalStateException("remote fetch configuration differs for reused target session channel");
+                throw new IllegalStateException("fetch configuration differs for reused target session channel");
             }
         }
 
         @Override
-        public void sendBatch(long batchId, List<RemoteFetchHandle> handles) throws Exception {
+        public void sendBatch(long batchId, List<FetchHandle> handles) throws Exception {
             synchronized (lock) {
                 if (closed) {
-                    throw new IllegalStateException("remote fetch target exchange is closed");
+                    throw new IllegalStateException("fetch target exchange is closed");
                 }
                 validateHandlesForTarget(handles);
                 Page page = buildHandlesPage(handles, batchId);
@@ -537,18 +575,18 @@ public final class RemoteFetchService {
                     finish();
                     client.close();
                 } catch (Exception e) {
-                    logger.debug("failed to close remote fetch target exchange", e);
+                    logger.debug("failed to close fetch target exchange", e);
                 } finally {
                     releaseTarget();
                 }
             }
         }
 
-        private void validateHandlesForTarget(List<RemoteFetchHandle> handles) {
-            for (RemoteFetchHandle handle : handles) {
+        private void validateHandlesForTarget(List<FetchHandle> handles) {
+            for (FetchHandle handle : handles) {
                 if (target.nodeId().equals(handle.nodeId()) == false
                     || target.retainedSessionId().equals(handle.retainedSessionId()) == false) {
-                    throw new IllegalStateException("remote fetch handle does not match target session [" + target + "]");
+                    throw new IllegalStateException("fetch handle does not match target session [" + target + "]");
                 }
             }
         }
@@ -582,6 +620,10 @@ public final class RemoteFetchService {
         retainedSearchContexts.closeRegistration(sessionId);
     }
 
+    private void touchSession(String sessionId) {
+        retainedSearchContexts.touch(sessionId);
+    }
+
     void startExchangeFetchServer(ExchangeSetupRequest request, CancellableTask task, ActionListener<Void> listener) {
         RetainedSearchContextsRegistry.Handle lease = null;
         LocalCircuitBreaker localBreaker = null;
@@ -593,7 +635,7 @@ public final class RemoteFetchService {
             final DiscoveryNode clientNode = determineClientNode(task);
             final PlannerSettings settings = plannerSettings.get();
             final IndexedByShardId<? extends EsPhysicalOperationProviders.ShardContext> shardContexts = lease.searchContexts()
-                .map(ComputeSearchContext::newDetachedShardContext);
+                .map(csc -> csc.newDetachedShardContext(QueryWarnings.NOOP));
             localBreaker = new LocalCircuitBreaker(
                 blockFactory.breaker(),
                 localBreakerSettings.overReservedBytes(),
@@ -603,7 +645,7 @@ public final class RemoteFetchService {
                 bigArrays,
                 blockFactory.newChildFactory(localBreaker),
                 localBreakerSettings,
-                "remote_fetch_exchange"
+                "fetch_exchange"
             );
             server = exchangeServerFactory.create(
                 request.retainedSessionId(),
@@ -611,8 +653,8 @@ public final class RemoteFetchService {
                 request.serverToClientId(),
                 exchangeService,
                 transportService.getThreadPool().executor(EsqlPlugin.ESQL_WORKER_THREAD_POOL_NAME),
-                // Data-node server responses are bounded by requested fetch fields.
-                Math.max(1, request.fields().size()),
+                // Data-node server responses are bounded by requested extraction specifications.
+                Math.max(1, request.extractionSpecs().size()),
                 transportService,
                 task,
                 clientNode,
@@ -624,15 +666,13 @@ public final class RemoteFetchService {
                 intermediate = buildDataNodeOperators(request, shardContexts, settings, driverContext);
             } catch (Exception e) {
                 throw new IllegalStateException(
-                    "remote fetch exchange setup failed while building data-node operators for session ["
-                        + request.retainedSessionId()
-                        + "]",
+                    "fetch exchange setup failed while building data-node operators for session [" + request.retainedSessionId() + "]",
                     e
                 );
             }
             logger.debug(
                 () -> Strings.format(
-                    "starting remote fetch exchange setup [%s] with operator chain [%s]",
+                    "starting fetch exchange setup [%s] with operator chain [%s]",
                     request.retainedSessionId(),
                     describeOperatorChain(intermediate)
                 )
@@ -669,9 +709,9 @@ public final class RemoteFetchService {
         List<Operator> operators = new ArrayList<>();
         boolean success = false;
         try {
-            operators.add(new RemoteFetchHandleDecodeOperator(driverContext.blockFactory(), includePositionMapping));
+            operators.add(new FetchHandleDecodeOperator(driverContext.blockFactory(), includePositionMapping));
 
-            List<ValuesSourceReaderOperator.FieldInfo> fieldInfos = buildFieldInfos(request.fields(), shardContexts, settings);
+            List<ValuesSourceReaderOperator.FieldInfo> fieldInfos = buildFieldInfos(request.extractionSpecs(), shardContexts, settings);
             IndexedByShardId<ValuesSourceReaderOperator.ShardContext> readerContexts = shardContexts.map(
                 c -> new ValuesSourceReaderOperator.ShardContext(
                     c.searcher().getIndexReader(),
@@ -706,9 +746,7 @@ public final class RemoteFetchService {
                     );
                 } catch (Exception e) {
                     throw new IllegalStateException(
-                        "failed to build remote fetch pushdown operators for plan ["
-                            + request.pushdownPlan().getClass().getSimpleName()
-                            + "]",
+                        "failed to build fetch pushdown operators for plan [" + request.pushdownPlan().getClass().getSimpleName() + "]",
                         e
                     );
                 }
@@ -722,31 +760,19 @@ public final class RemoteFetchService {
         }
     }
 
-    private static List<ValuesSourceReaderOperator.FieldInfo> buildFieldInfos(
-        List<FetchField> fields,
+    static List<ValuesSourceReaderOperator.FieldInfo> buildFieldInfos(
+        List<FieldExtractionSpec> extractionSpecs,
         IndexedByShardId<? extends EsPhysicalOperationProviders.ShardContext> shardContexts,
         PlannerSettings plannerSettings
     ) {
-        List<ValuesSourceReaderOperator.FieldInfo> fieldInfos = new ArrayList<>(fields.size());
-        for (FetchField field : fields) {
+        List<ValuesSourceReaderOperator.FieldInfo> fieldInfos = new ArrayList<>(extractionSpecs.size());
+        for (FieldExtractionSpec extractionSpec : extractionSpecs) {
             fieldInfos.add(
                 new ValuesSourceReaderOperator.FieldInfo(
-                    field.fieldName(),
-                    PlannerUtils.toElementType(field.dataType()),
+                    extractionSpec.fieldName(),
+                    extractionSpec.elementType(),
                     false,
-                    (warningsMode, shardIdx) -> {
-                        BlockLoader loader = shardContexts.get(shardIdx)
-                            .blockLoader(
-                                field.fieldName(),
-                                field.dataType() == DataType.UNSUPPORTED,
-                                MappedFieldType.FieldExtractPreference.NONE,
-                                null,
-                                null,
-                                plannerSettings.blockLoaderSizeOrdinals(),
-                                plannerSettings.blockLoaderSizeScript()
-                            );
-                        return ValuesSourceReaderOperator.load(loader);
-                    }
+                    (warningsMode, shardIdx) -> extractionSpec.bind(shardContexts.get(shardIdx), plannerSettings, null)
                 )
             );
         }
@@ -771,67 +797,17 @@ public final class RemoteFetchService {
 
     private DiscoveryNode determineClientNode(CancellableTask task) {
         if (task == null) {
-            throw new IllegalStateException("cannot determine remote fetch exchange client node: task is null");
+            throw new IllegalStateException("cannot determine fetch exchange client node: task is null");
         }
         if (task.getParentTaskId().isSet() == false) {
-            throw new IllegalStateException("cannot determine remote fetch exchange client node: parent task is not set");
+            throw new IllegalStateException("cannot determine fetch exchange client node: parent task is not set");
         }
         String nodeId = task.getParentTaskId().getNodeId();
         DiscoveryNode node = clusterService.state().nodes().get(nodeId);
         if (node == null) {
-            throw new IllegalStateException("remote fetch exchange client node [" + nodeId + "] not found");
+            throw new IllegalStateException("fetch exchange client node [" + nodeId + "] not found");
         }
         return node;
-    }
-
-    public static final class FetchField implements Writeable {
-        private final String fieldName;
-        private final DataType dataType;
-
-        public FetchField(String fieldName, DataType dataType) {
-            this.fieldName = Objects.requireNonNull(fieldName, "fieldName");
-            this.dataType = Objects.requireNonNull(dataType, "dataType");
-        }
-
-        FetchField(StreamInput in) throws IOException {
-            this(in.readString(), DataType.fromTypeName(in.readString()));
-        }
-
-        public String fieldName() {
-            return fieldName;
-        }
-
-        public DataType dataType() {
-            return dataType;
-        }
-
-        @Override
-        public void writeTo(StreamOutput out) throws IOException {
-            out.writeString(fieldName);
-            out.writeString(dataType.typeName());
-        }
-
-        @Override
-        public boolean equals(Object obj) {
-            if (obj == this) {
-                return true;
-            }
-            if (obj instanceof FetchField == false) {
-                return false;
-            }
-            FetchField other = (FetchField) obj;
-            return fieldName.equals(other.fieldName) && dataType == other.dataType;
-        }
-
-        @Override
-        public int hashCode() {
-            return Objects.hash(fieldName, dataType);
-        }
-
-        @Override
-        public String toString() {
-            return fieldName + ":" + dataType.typeName();
-        }
     }
 
     static final class ReleaseRequest extends AbstractTransportRequest {
@@ -857,9 +833,32 @@ public final class RemoteFetchService {
         }
     }
 
+    static final class TouchRequest extends AbstractTransportRequest {
+        private final String retainedSessionId;
+
+        TouchRequest(String retainedSessionId) {
+            this.retainedSessionId = Objects.requireNonNull(retainedSessionId, "retainedSessionId");
+        }
+
+        TouchRequest(StreamInput in) throws IOException {
+            super(in);
+            this.retainedSessionId = in.readString();
+        }
+
+        String retainedSessionId() {
+            return retainedSessionId;
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            super.writeTo(out);
+            out.writeString(retainedSessionId);
+        }
+    }
+
     static final class ExchangeSetupRequest extends AbstractTransportRequest {
         private final String retainedSessionId;
-        private final List<FetchField> fields;
+        private final List<FieldExtractionSpec> extractionSpecs;
         private final PhysicalPlan pushdownPlan;
         private final Configuration configuration;
         private final String clientToServerId;
@@ -867,16 +866,16 @@ public final class RemoteFetchService {
 
         ExchangeSetupRequest(
             String retainedSessionId,
-            List<FetchField> fields,
+            List<FieldExtractionSpec> extractionSpecs,
             PhysicalPlan pushdownPlan,
             Configuration configuration,
             String clientToServerId,
             String serverToClientId
         ) {
             this.retainedSessionId = Objects.requireNonNull(retainedSessionId, "retainedSessionId");
-            this.fields = List.copyOf(fields);
-            if (this.fields.isEmpty()) {
-                throw new IllegalArgumentException("remote fetch requires at least one request field");
+            this.extractionSpecs = List.copyOf(extractionSpecs);
+            if (this.extractionSpecs.isEmpty()) {
+                throw new IllegalArgumentException("fetch requires at least one extraction specification");
             }
             this.pushdownPlan = validatePushdownPlan(pushdownPlan, "request_build");
             this.configuration = Objects.requireNonNull(configuration, "configuration");
@@ -887,9 +886,9 @@ public final class RemoteFetchService {
         ExchangeSetupRequest(StreamInput in) throws IOException {
             super(in);
             this.retainedSessionId = in.readString();
-            this.fields = in.readCollectionAsList(FetchField::new);
-            if (this.fields.isEmpty()) {
-                throw new IllegalArgumentException("remote fetch requires at least one request field");
+            this.extractionSpecs = in.readCollectionAsList(FieldExtractionSpec::new);
+            if (this.extractionSpecs.isEmpty()) {
+                throw new IllegalArgumentException("fetch requires at least one extraction specification");
             }
             this.configuration = readConfiguration(in);
             PlanStreamInput pin = new PlanStreamInput(in, in.namedWriteableRegistry(), configuration);
@@ -902,8 +901,8 @@ public final class RemoteFetchService {
             return retainedSessionId;
         }
 
-        List<FetchField> fields() {
-            return fields;
+        List<FieldExtractionSpec> extractionSpecs() {
+            return extractionSpecs;
         }
 
         PhysicalPlan pushdownPlan() {
@@ -926,7 +925,7 @@ public final class RemoteFetchService {
         public void writeTo(StreamOutput out) throws IOException {
             super.writeTo(out);
             out.writeString(retainedSessionId);
-            out.writeCollection(fields);
+            out.writeCollection(extractionSpecs);
             Configuration serializedConfiguration = configuration.withoutTables();
             serializedConfiguration.writeTo(out);
             new PlanStreamOutput(out, serializedConfiguration).writeOptionalNamedWriteable(
@@ -939,20 +938,20 @@ public final class RemoteFetchService {
         @Override
         public Task createTask(long id, String type, String action, TaskId parentTaskId, Map<String, String> headers) {
             if (parentTaskId.isSet() == false) {
-                assert false : "remote fetch exchange setup must have a parent task";
-                throw new IllegalStateException("remote fetch exchange setup must have a parent task");
+                assert false : "fetch exchange setup must have a parent task";
+                throw new IllegalStateException("fetch exchange setup must have a parent task");
             }
             return new CancellableTask(id, type, action, "", parentTaskId, headers) {
                 @Override
                 public String getDescription() {
-                    return "remote fetch exchange setup [" + retainedSessionId + "]";
+                    return "fetch exchange setup [" + retainedSessionId + "]";
                 }
             };
         }
 
         private static String requireNonBlank(String value, String fieldName) {
             if (value == null || value.isBlank()) {
-                throw new IllegalArgumentException("remote fetch exchange setup requires a non-empty [" + fieldName + "]");
+                throw new IllegalArgumentException("fetch exchange setup requires a non-empty [" + fieldName + "]");
             }
             return value;
         }
@@ -962,10 +961,10 @@ public final class RemoteFetchService {
          */
         private static PhysicalPlan validatePushdownPlan(PhysicalPlan pushdownPlan, String phase) {
             try {
-                RemoteFetchPushdownOperatorBuilder.validateSupportedPlan(pushdownPlan);
+                FetchPushdownOperatorBuilder.validateSupportedPlan(pushdownPlan);
                 return pushdownPlan;
             } catch (IllegalArgumentException e) {
-                throw new IllegalArgumentException("remote fetch pushdown plan is invalid during [" + phase + "]: " + e.getMessage(), e);
+                throw new IllegalArgumentException("fetch pushdown plan is invalid during [" + phase + "]: " + e.getMessage(), e);
             }
         }
     }
@@ -974,6 +973,14 @@ public final class RemoteFetchService {
         @Override
         public void messageReceived(ReleaseRequest request, TransportChannel channel, Task task) throws Exception {
             releaseSession(request.retainedSessionId());
+            channel.sendResponse(ActionResponse.Empty.INSTANCE);
+        }
+    }
+
+    private class TouchTransportHandler implements TransportRequestHandler<TouchRequest> {
+        @Override
+        public void messageReceived(TouchRequest request, TransportChannel channel, Task task) throws Exception {
+            touchSession(request.retainedSessionId());
             channel.sendResponse(ActionResponse.Empty.INSTANCE);
         }
     }
@@ -994,15 +1001,27 @@ public final class RemoteFetchService {
         void release(DiscoveryNode targetNode, String retainedSessionId);
     }
 
+    @FunctionalInterface
+    interface TouchAction {
+        void touch(DiscoveryNode targetNode, String retainedSessionId);
+    }
+
     static final class RetainedSessionReleaser implements Releasable {
         private static final RetainedSessionReleaser NOOP = new RetainedSessionReleaser((targetNode, retainedSessionId) -> {});
 
         private final ReleaseAction releaseAction;
+        private final TouchAction touchAction;
         private final Map<TrackedSessionKey, DiscoveryNode> sessions = new LinkedHashMap<>();
+        private Releasable heartbeatCancellation;
         private boolean closed;
 
         RetainedSessionReleaser(ReleaseAction releaseAction) {
+            this(releaseAction, (targetNode, retainedSessionId) -> {});
+        }
+
+        RetainedSessionReleaser(ReleaseAction releaseAction, TouchAction touchAction) {
             this.releaseAction = releaseAction;
+            this.touchAction = touchAction;
         }
 
         void track(DiscoveryNode targetNode, String retainedSessionId) {
@@ -1032,9 +1051,34 @@ public final class RemoteFetchService {
             }
         }
 
+        void setHeartbeatCancellation(Releasable heartbeatCancellation) {
+            boolean cancelNow;
+            synchronized (this) {
+                cancelNow = closed;
+                if (cancelNow == false) {
+                    this.heartbeatCancellation = heartbeatCancellation;
+                }
+            }
+            if (cancelNow) {
+                heartbeatCancellation.close();
+            }
+        }
+
+        void heartbeat() {
+            Map<TrackedSessionKey, DiscoveryNode> tracked;
+            synchronized (this) {
+                if (closed) {
+                    return;
+                }
+                tracked = new LinkedHashMap<>(sessions);
+            }
+            tracked.forEach((session, targetNode) -> touchBestEffort(targetNode, session.retainedSessionId()));
+        }
+
         @Override
         public void close() {
             Map<TrackedSessionKey, DiscoveryNode> tracked;
+            Releasable heartbeat;
             synchronized (this) {
                 if (closed) {
                     return;
@@ -1042,6 +1086,11 @@ public final class RemoteFetchService {
                 closed = true;
                 tracked = new LinkedHashMap<>(sessions);
                 sessions.clear();
+                heartbeat = heartbeatCancellation;
+                heartbeatCancellation = null;
+            }
+            if (heartbeat != null) {
+                heartbeat.close();
             }
             tracked.forEach((session, targetNode) -> releaseBestEffort(targetNode, session.retainedSessionId()));
         }
@@ -1050,7 +1099,15 @@ public final class RemoteFetchService {
             try {
                 releaseAction.release(targetNode, retainedSessionId);
             } catch (Exception e) {
-                logger.debug("failed to release retained remote fetch session [{}] on node [{}]", retainedSessionId, targetNode.getId(), e);
+                logger.debug("failed to release retained fetch session [{}] on node [{}]", retainedSessionId, targetNode.getId(), e);
+            }
+        }
+
+        private void touchBestEffort(DiscoveryNode targetNode, String retainedSessionId) {
+            try {
+                touchAction.touch(targetNode, retainedSessionId);
+            } catch (Exception e) {
+                logger.debug("failed to refresh retained fetch session [{}] on node [{}]", retainedSessionId, targetNode.getId(), e);
             }
         }
 

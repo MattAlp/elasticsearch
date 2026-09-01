@@ -10,12 +10,18 @@ package org.elasticsearch.xpack.esql.plan.physical;
 import org.elasticsearch.common.io.stream.NamedWriteableRegistry;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.AttributeSet;
 import org.elasticsearch.xpack.esql.core.tree.NodeInfo;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.io.stream.PlanStreamInput;
-import org.elasticsearch.xpack.esql.plan.logical.RemoteFetchSource;
+import org.elasticsearch.xpack.esql.plan.logical.Eval;
+import org.elasticsearch.xpack.esql.plan.logical.FetchSource;
+import org.elasticsearch.xpack.esql.plan.logical.Filter;
+import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
+import org.elasticsearch.xpack.esql.plan.logical.Project;
+import org.elasticsearch.xpack.esql.planner.FieldExtractionSpec;
 
 import java.io.IOException;
 import java.util.List;
@@ -26,21 +32,22 @@ import static org.elasticsearch.xpack.esql.expression.NamedExpressions.mergeOutp
 /**
  * Fetches deferred fields on the coordinator from remote shard owners using a transport-safe handle.
  * <p>
- * Remote fetch keeps two attribute lists because they represent different contracts:
+ * Fetch keeps two attribute lists because they represent different contracts:
  * <ul>
  *     <li>{@code attributesToFetch}: remote request schema (what the data node must load to execute fetch/pushdown)</li>
  *     <li>{@code fetchedOutputAttributes}: coordinator output schema (what this node appends to its child output)</li>
  * </ul>
  * <p>
- * The right-hand side of this {@link BinaryExec} is a {@link FragmentExec} that carries a {@link RemoteFetchSource}
- * logical plan. This follows the same architectural pattern as lookup planning: logical plans are serialized and
- * shipped, while physical planning remains local to the target node.
+ * The right-hand side of this {@link BinaryExec} is a {@link FragmentExec} that carries a constrained
+ * {@link FetchSource}/{@link Eval}/{@link Filter}/{@link Project} logical plan. This follows the same
+ * architectural pattern as lookup planning: logical plans are serialized and shipped, while physical planning remains
+ * local to the target node.
  */
-public class RemoteFetchExec extends BinaryExec implements EstimatesRowSize {
+public class FetchExec extends BinaryExec implements EstimatesRowSize {
     public static final NamedWriteableRegistry.Entry ENTRY = new NamedWriteableRegistry.Entry(
         PhysicalPlan.class,
-        "RemoteFetchExec",
-        RemoteFetchExec::new
+        "FetchExec",
+        FetchExec::new
     );
 
     private final Attribute handleAttribute;
@@ -49,17 +56,22 @@ public class RemoteFetchExec extends BinaryExec implements EstimatesRowSize {
      */
     private final List<Attribute> attributesToFetch;
     /**
+     * Complete extraction semantics for {@link #attributesToFetch}, in the same order.
+     */
+    private final List<FieldExtractionSpec> extractionSpecs;
+    /**
      * Attributes appended to this node's output on the coordinator.
      */
     private final List<Attribute> fetchedOutputAttributes;
     private final PhysicalPlan fetchPlan;
     private List<Attribute> lazyOutput;
 
-    public RemoteFetchExec(
+    public FetchExec(
         Source source,
         PhysicalPlan child,
         Attribute handleAttribute,
         List<Attribute> attributesToFetch,
+        List<FieldExtractionSpec> extractionSpecs,
         List<Attribute> fetchedOutputAttributes,
         PhysicalPlan fetchPlan
     ) {
@@ -67,22 +79,64 @@ public class RemoteFetchExec extends BinaryExec implements EstimatesRowSize {
         this.fetchPlan = requireFetchPlan(fetchPlan);
         this.handleAttribute = handleAttribute;
         this.attributesToFetch = List.copyOf(attributesToFetch);
+        this.extractionSpecs = List.copyOf(extractionSpecs);
         this.fetchedOutputAttributes = List.copyOf(fetchedOutputAttributes);
+        validateExtractionSpecs();
     }
 
-    private RemoteFetchExec(StreamInput in) throws IOException {
+    private void validateExtractionSpecs() {
+        if (this.attributesToFetch.size() != this.extractionSpecs.size()) {
+            throw new IllegalArgumentException(
+                "fetch attributes ["
+                    + this.attributesToFetch.size()
+                    + "] must match extraction specifications ["
+                    + this.extractionSpecs.size()
+                    + "]"
+            );
+        }
+        for (int i = 0; i < this.attributesToFetch.size(); i++) {
+            if (this.attributesToFetch.get(i).dataType() != this.extractionSpecs.get(i).dataType()) {
+                throw new IllegalArgumentException(
+                    "fetch attribute ["
+                        + this.attributesToFetch.get(i)
+                        + "] has type ["
+                        + this.attributesToFetch.get(i).dataType().typeName()
+                        + "] but extraction specification has type ["
+                        + this.extractionSpecs.get(i).dataType().typeName()
+                        + "]"
+                );
+            }
+        }
+    }
+
+    private FetchExec(StreamInput in) throws IOException {
         super(Source.readFrom((PlanStreamInput) in), in.readNamedWriteable(PhysicalPlan.class), in.readNamedWriteable(PhysicalPlan.class));
         this.fetchPlan = requireFetchPlan(right());
         this.handleAttribute = in.readNamedWriteable(Attribute.class);
         this.attributesToFetch = in.readNamedWriteableCollectionAsList(Attribute.class);
+        this.extractionSpecs = in.readCollectionAsList(FieldExtractionSpec::new);
         this.fetchedOutputAttributes = in.readNamedWriteableCollectionAsList(Attribute.class);
+        validateExtractionSpecs();
     }
 
     private static FragmentExec requireFetchPlan(PhysicalPlan plan) {
-        if (plan instanceof FragmentExec fragmentExec && fragmentExec.fragment() instanceof RemoteFetchSource) {
-            return fragmentExec;
+        if ((plan instanceof FragmentExec) == false) {
+            throw new IllegalArgumentException("fetch plan must be a FragmentExec");
         }
-        throw new IllegalArgumentException("remote fetch plan must be a FragmentExec containing RemoteFetchSource");
+        FragmentExec fragmentExec = (FragmentExec) plan;
+        LogicalPlan fragment = fragmentExec.fragment();
+        if (fragment.anyMatch(FetchSource.class::isInstance) == false) {
+            throw new IllegalArgumentException("fetch plan must contain FetchSource");
+        }
+        fragment.forEachDown(node -> {
+            if (node instanceof FetchSource == false
+                && node instanceof Eval == false
+                && node instanceof Filter == false
+                && node instanceof Project == false) {
+                throw new IllegalArgumentException("unsupported fetch pushdown plan [" + node.nodeName() + "]");
+            }
+        });
+        return fragmentExec;
     }
 
     @Override
@@ -90,6 +144,7 @@ public class RemoteFetchExec extends BinaryExec implements EstimatesRowSize {
         super.writeTo(out);
         out.writeNamedWriteable(handleAttribute);
         out.writeNamedWriteableCollection(attributesToFetch);
+        out.writeCollection(extractionSpecs);
         out.writeNamedWriteableCollection(fetchedOutputAttributes);
     }
 
@@ -99,13 +154,22 @@ public class RemoteFetchExec extends BinaryExec implements EstimatesRowSize {
     }
 
     @Override
-    protected NodeInfo<RemoteFetchExec> info() {
-        return NodeInfo.create(this, RemoteFetchExec::new, left(), handleAttribute, attributesToFetch, fetchedOutputAttributes, fetchPlan);
+    protected NodeInfo<FetchExec> info() {
+        return NodeInfo.create(
+            this,
+            FetchExec::new,
+            left(),
+            handleAttribute,
+            attributesToFetch,
+            extractionSpecs,
+            fetchedOutputAttributes,
+            fetchPlan
+        );
     }
 
     @Override
-    public RemoteFetchExec replaceChildren(PhysicalPlan newLeft, PhysicalPlan newRight) {
-        return new RemoteFetchExec(source(), newLeft, handleAttribute, attributesToFetch, fetchedOutputAttributes, newRight);
+    public FetchExec replaceChildren(PhysicalPlan newLeft, PhysicalPlan newRight) {
+        return new FetchExec(source(), newLeft, handleAttribute, attributesToFetch, extractionSpecs, fetchedOutputAttributes, newRight);
     }
 
     /**
@@ -118,8 +182,8 @@ public class RemoteFetchExec extends BinaryExec implements EstimatesRowSize {
     /**
      * Compatibility helper while this class migrates from {@link UnaryExec} to {@link BinaryExec}.
      */
-    public RemoteFetchExec replaceChild(PhysicalPlan newChild) {
-        return new RemoteFetchExec(source(), newChild, handleAttribute, attributesToFetch, fetchedOutputAttributes, fetchPlan);
+    public FetchExec replaceChild(PhysicalPlan newChild) {
+        return new FetchExec(source(), newChild, handleAttribute, attributesToFetch, extractionSpecs, fetchedOutputAttributes, fetchPlan);
     }
 
     @Override
@@ -150,8 +214,19 @@ public class RemoteFetchExec extends BinaryExec implements EstimatesRowSize {
         return attributesToFetch;
     }
 
+    /** Complete extraction specifications, in the same order as {@link #attributesToFetch()}. */
+    public List<FieldExtractionSpec> extractionSpecs() {
+        return extractionSpecs;
+    }
+
+    /**
+     * The plan the fetch target must execute in addition to loading the fetched fields, or {@code null} when the fetch
+     * plan is a bare {@link FetchSource} that only describes the fields to fetch.
+     */
+    @Nullable
     public PhysicalPlan pushdownPlan() {
-        return fetchPlan;
+        FragmentExec fragmentExec = fetchPlan();
+        return fragmentExec.fragment() instanceof FetchSource ? null : fragmentExec;
     }
 
     public FragmentExec fetchPlan() {
@@ -178,7 +253,7 @@ public class RemoteFetchExec extends BinaryExec implements EstimatesRowSize {
 
     @Override
     public int hashCode() {
-        return Objects.hash(super.hashCode(), handleAttribute, attributesToFetch, fetchedOutputAttributes);
+        return Objects.hash(super.hashCode(), handleAttribute, attributesToFetch, extractionSpecs, fetchedOutputAttributes);
     }
 
     @Override
@@ -186,9 +261,10 @@ public class RemoteFetchExec extends BinaryExec implements EstimatesRowSize {
         if (super.equals(obj) == false) {
             return false;
         }
-        RemoteFetchExec other = (RemoteFetchExec) obj;
+        FetchExec other = (FetchExec) obj;
         return Objects.equals(handleAttribute, other.handleAttribute)
             && Objects.equals(attributesToFetch, other.attributesToFetch)
+            && Objects.equals(extractionSpecs, other.extractionSpecs)
             && Objects.equals(fetchedOutputAttributes, other.fetchedOutputAttributes);
     }
 }

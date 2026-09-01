@@ -27,6 +27,7 @@ import org.elasticsearch.search.internal.AliasFilter;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.test.TransportVersionUtils;
 import org.elasticsearch.test.junit.listeners.ReproduceInfoPrinter;
+import org.elasticsearch.transport.RemoteClusterAware;
 import org.elasticsearch.xpack.esql.CsvTestsDataLoader;
 import org.elasticsearch.xpack.esql.EsqlTestUtils;
 import org.elasticsearch.xpack.esql.LoadMapping;
@@ -54,6 +55,7 @@ import org.elasticsearch.xpack.esql.index.IndexResolution;
 import org.elasticsearch.xpack.esql.plan.EsqlStatement;
 import org.elasticsearch.xpack.esql.plan.IndexPattern;
 import org.elasticsearch.xpack.esql.plan.QueryPlan;
+import org.elasticsearch.xpack.esql.plan.logical.EsRelation;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSinkExec;
@@ -228,7 +230,17 @@ public abstract class GoldenTestCase extends ESTestCase {
         }
 
         TestBuilder(String esqlQuery) {
-            this(esqlQuery, EnumSet.allOf(Stage.class), EsqlTestUtils.TEST_SEARCH_STATS, new String[0], null, null);
+            // Keep distributed reduction opt-in while the role and lifetime of this planning stage are still being evaluated.
+            // Enabling it here would commit every golden suite to the current approach for distributed rewrites and require a
+            // fetch_physical_optimization snapshot, with suitable planning configuration, for every default test.
+            this(
+                esqlQuery,
+                EnumSet.complementOf(EnumSet.of(Stage.FETCH_PHYSICAL_OPTIMIZATION)),
+                EsqlTestUtils.TEST_SEARCH_STATS,
+                new String[0],
+                null,
+                null
+            );
         }
 
         public TestBuilder optimizer(Function<LogicalOptimizerContext, LogicalPlanOptimizer> factory) {
@@ -707,6 +719,7 @@ public abstract class GoldenTestCase extends ESTestCase {
                 || stages.contains(Stage.LOCAL_PHYSICAL_OPTIMIZATION)
                 || stages.contains(Stage.LOOKUP_LOGICAL_OPTIMIZATION)
                 || stages.contains(Stage.LOOKUP_PHYSICAL_OPTIMIZATION)
+                || stages.contains(Stage.FETCH_PHYSICAL_OPTIMIZATION)
                 || stages.contains(Stage.NODE_REDUCE)
                 || stages.contains(Stage.NODE_REDUCE_LOCAL_PHYSICAL_OPTIMIZATION)) {
                 // When query approximation is enabled, the logical plan can contain
@@ -721,6 +734,36 @@ public abstract class GoldenTestCase extends ESTestCase {
                 );
                 if (stages.contains(Stage.PHYSICAL_OPTIMIZATION)) {
                     result.add(Tuple.tuple(Stage.PHYSICAL_OPTIMIZATION, verifyOrWrite(physicalPlan, Stage.PHYSICAL_OPTIMIZATION)));
+                }
+                if (stages.contains(Stage.FETCH_PHYSICAL_OPTIMIZATION)) {
+                    Configuration fetchConfiguration = EsqlTestUtils.configuration(
+                        new QueryPragmas(Settings.builder().put(QueryPragmas.FETCH_TOPN.getKey(), true).build()),
+                        esqlQuery,
+                        statement
+                    );
+                    var fetchOptimizer = new PhysicalPlanOptimizer(new PhysicalOptimizerContext(fetchConfiguration, transportVersion));
+                    LogicalPlan fetchLogicalPlan = logicallyOptimized.transformUp(EsRelation.class, relation -> {
+                        List<String> concreteIndices = List.copyOf(relation.indexProperties().keySet());
+                        if (concreteIndices.isEmpty()) {
+                            return relation;
+                        }
+                        Map<String, List<String>> resolvedIndices = Map.of(RemoteClusterAware.LOCAL_CLUSTER_GROUP_KEY, concreteIndices);
+                        return new EsRelation(
+                            relation.source(),
+                            relation.indexPattern(),
+                            relation.indexMode(),
+                            resolvedIndices,
+                            resolvedIndices,
+                            relation.indexProperties(),
+                            relation.output()
+                        );
+                    });
+                    PhysicalPlan fetchPhysicalPlan = fetchOptimizer.optimize(
+                        new Mapper().map(new Versioned<>(fetchLogicalPlan, transportVersion))
+                    );
+                    result.add(
+                        Tuple.tuple(Stage.FETCH_PHYSICAL_OPTIMIZATION, verifyOrWrite(fetchPhysicalPlan, Stage.FETCH_PHYSICAL_OPTIMIZATION))
+                    );
                 }
                 PhysicalPlan localPhysicalPlan = null;
                 boolean needsLocalPlan = stages.contains(Stage.LOCAL_PHYSICAL_OPTIMIZATION)
@@ -1083,6 +1126,8 @@ public abstract class GoldenTestCase extends ESTestCase {
         LOGICAL_OPTIMIZATION(new SingleFileOutput("logical_optimization")),
         /** See {@link PhysicalPlanOptimizer}. */
         PHYSICAL_OPTIMIZATION(new SingleFileOutput("physical_optimization")),
+        /** Physical optimization with distributed fetch enabled. */
+        FETCH_PHYSICAL_OPTIMIZATION(new SingleFileOutput("fetch_physical_optimization")),
         /**
          * See {@link LocalPhysicalPlanOptimizer}. There's no LOCAL_LOGICAL here since in production we use PlannerUtils.localPlan to
          * produce the local physical plan directly from non-local physical plan.

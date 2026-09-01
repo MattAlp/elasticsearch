@@ -24,34 +24,34 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 
 /**
- * Decodes remote fetch handles into a doc-location page suitable for
+ * Decodes fetch handles into a doc-location page suitable for
  * {@link org.elasticsearch.compute.lucene.read.ValuesSourceReaderOperator}.
  * <p>
  * This is a strict one-to-one page mapping: each input page produces exactly one output page, so the operator never
- * accumulates pages. Input pages contain exactly one bytes block with one serialized {@link RemoteFetchHandle} per row.
+ * accumulates pages. Input pages contain exactly one bytes block with one serialized {@link FetchHandle} per row.
  * Output pages contain:
  * <ul>
  *     <li>channel 0: doc block (shard, segment, doc)</li>
  *     <li>channel 1 (optional): position mapping used by pushdown filtering</li>
  * </ul>
  */
-final class RemoteFetchHandleDecodeOperator extends AbstractPageMappingOperator {
+final class FetchHandleDecodeOperator extends AbstractPageMappingOperator {
     record Factory(boolean includePositionMapping) implements Operator.OperatorFactory {
         @Override
         public Operator get(DriverContext driverContext) {
-            return new RemoteFetchHandleDecodeOperator(driverContext.blockFactory(), includePositionMapping);
+            return new FetchHandleDecodeOperator(driverContext.blockFactory(), includePositionMapping);
         }
 
         @Override
         public String describe() {
-            return "RemoteFetchHandleDecodeOperator[include_position_mapping=" + includePositionMapping + "]";
+            return "FetchHandleDecodeOperator[include_position_mapping=" + includePositionMapping + "]";
         }
     }
 
     private final BlockFactory blockFactory;
     private final boolean includePositionMapping;
 
-    RemoteFetchHandleDecodeOperator(BlockFactory blockFactory, boolean includePositionMapping) {
+    FetchHandleDecodeOperator(BlockFactory blockFactory, boolean includePositionMapping) {
         this.blockFactory = blockFactory;
         this.includePositionMapping = includePositionMapping;
     }
@@ -65,7 +65,7 @@ final class RemoteFetchHandleDecodeOperator extends AbstractPageMappingOperator 
 
     @Override
     public String toString() {
-        return "RemoteFetchHandleDecodeOperator[include_position_mapping=" + includePositionMapping + "]";
+        return "FetchHandleDecodeOperator[include_position_mapping=" + includePositionMapping + "]";
     }
 
     private Page decodeHandles(Page page) {
@@ -84,27 +84,25 @@ final class RemoteFetchHandleDecodeOperator extends AbstractPageMappingOperator 
         ) {
             for (int position = 0; position < page.getPositionCount(); position++) {
                 if (handlesBlock.isNull(position)) {
-                    throw new IllegalStateException("remote fetch handle block cannot contain nulls");
+                    throw new IllegalStateException("fetch handle block cannot contain nulls");
                 }
                 if (handlesBlock.getValueCount(position) != 1) {
-                    throw new IllegalStateException("remote fetch handle block must have exactly one value per row");
+                    throw new IllegalStateException("fetch handle block must have exactly one value per row");
                 }
                 BytesRef handleBytes = handlesBlock.getBytesRef(handlesBlock.getFirstValueIndex(position), scratch);
                 if (expectedTargetSessionPrefix == null) {
-                    RemoteFetchHandle first = RemoteFetchHandle.fromBytesRef(handleBytes);
-                    expectedTargetSessionPrefix = RemoteFetchHandle.encodeTargetSessionPrefix(first.nodeId(), first.retainedSessionId());
+                    FetchHandle first = FetchHandle.fromBytesRef(handleBytes);
+                    expectedTargetSessionPrefix = FetchHandle.encodeTargetSessionPrefix(first.nodeId(), first.retainedSessionId());
                     docBuilder.append(first.shard(), first.segment(), first.doc());
-                } else if (RemoteFetchHandle.startsWithTargetSessionPrefix(handleBytes, expectedTargetSessionPrefix)) {
+                } else if (FetchHandle.startsWithTargetSessionPrefix(handleBytes, expectedTargetSessionPrefix)) {
                     appendDocAfterPrefix(docBuilder, handleBytes, expectedTargetSessionPrefix.length);
                 } else {
-                    RemoteFetchHandle expected = RemoteFetchHandle.fromBytesRef(
-                        handlesBlock.getBytesRef(handlesBlock.getFirstValueIndex(0), scratch)
-                    );
-                    RemoteFetchHandle actual = RemoteFetchHandle.fromBytesRef(
+                    FetchHandle expected = FetchHandle.fromBytesRef(handlesBlock.getBytesRef(handlesBlock.getFirstValueIndex(0), scratch));
+                    FetchHandle actual = FetchHandle.fromBytesRef(
                         handlesBlock.getBytesRef(handlesBlock.getFirstValueIndex(position), scratch)
                     );
                     throw new IllegalStateException(
-                        "remote fetch batch must contain handles from a single target session but saw ["
+                        "fetch batch must contain handles from a single target session but saw ["
                             + expected.nodeId()
                             + "/"
                             + expected.retainedSessionId()
@@ -138,7 +136,7 @@ final class RemoteFetchHandleDecodeOperator extends AbstractPageMappingOperator 
         try (StreamInput in = StreamInput.wrap(handleBytes.bytes, handleBytes.offset + prefixLength, handleBytes.length - prefixLength)) {
             docBuilder.append(in.readVInt(), in.readVInt(), in.readVInt());
         } catch (IOException e) {
-            throw new UncheckedIOException("failed to decode remote fetch handle", e);
+            throw new UncheckedIOException("failed to decode fetch handle", e);
         }
     }
 }

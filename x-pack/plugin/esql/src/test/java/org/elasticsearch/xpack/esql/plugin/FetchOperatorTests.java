@@ -30,12 +30,13 @@ import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.expression.predicate.operator.comparison.GreaterThan;
+import org.elasticsearch.xpack.esql.plan.logical.FetchSource;
 import org.elasticsearch.xpack.esql.plan.logical.Filter;
 import org.elasticsearch.xpack.esql.plan.logical.Project;
-import org.elasticsearch.xpack.esql.plan.logical.RemoteFetchSource;
 import org.elasticsearch.xpack.esql.plan.physical.FragmentExec;
 import org.elasticsearch.xpack.esql.plan.physical.LimitExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
+import org.elasticsearch.xpack.esql.planner.FieldExtractionSpec;
 import org.elasticsearch.xpack.esql.session.Configuration;
 import org.hamcrest.Matcher;
 
@@ -53,7 +54,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 
-public class RemoteFetchOperatorTests extends OperatorTestCase {
+public class FetchOperatorTests extends OperatorTestCase {
     /**
      * The {@link #simple} harness fetches one integer field whose value the {@link EchoFetchClient} derives
      * deterministically from each handle's doc id, spread over a few target sessions to exercise grouping.
@@ -65,10 +66,10 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
         return new Operator.OperatorFactory() {
             @Override
             public Operator get(DriverContext driverContext) {
-                return new RemoteFetchOperator(
+                return new FetchOperator(
                     driverContext,
                     0,
-                    List.of(new RemoteFetchService.FetchField("salary", DataType.INTEGER)),
+                    List.of(FieldExtractionSpec.direct("salary", DataType.INTEGER)),
                     List.of(new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER)),
                     null,
                     ConfigurationAware.CONFIGURATION_MARKER,
@@ -79,14 +80,14 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
 
             @Override
             public String describe() {
-                return "RemoteFetchOperator[channel=0, requestFields=[salary:integer]]";
+                return "FetchOperator[channel=0, extractionSpecs=[DIRECT[salary:integer->INT, preference=NONE]]]";
             }
         };
     }
 
     @Override
     protected Matcher<String> expectedDescriptionOfSimple() {
-        return equalTo("RemoteFetchOperator[channel=0, requestFields=[salary:integer]]");
+        return equalTo("FetchOperator[channel=0, extractionSpecs=[DIRECT[salary:integer->INT, preference=NONE]]]");
     }
 
     @Override
@@ -99,7 +100,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
         List<BytesRef> handles = new ArrayList<>(size);
         for (int i = 0; i < size; i++) {
             int target = i % SIMPLE_TARGET_SESSIONS;
-            handles.add(new RemoteFetchHandle("node-" + target, "session-" + target, target, 0, i).toBytesRef());
+            handles.add(new FetchHandle("node-" + target, "session-" + target, target, 0, i).toBytesRef());
         }
         return new BytesRefBlockSourceOperator(blockFactory, handles);
     }
@@ -116,15 +117,13 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             BytesRefBlock inputHandles = inputPage.getBlock(0);
             IntBlock fetched = outputPage.getBlock(1);
             for (int position = 0; position < inputPage.getPositionCount(); position++) {
-                RemoteFetchHandle handle = RemoteFetchHandle.fromBytesRef(
-                    inputHandles.getBytesRef(inputHandles.getFirstValueIndex(position), scratch)
-                );
+                FetchHandle handle = FetchHandle.fromBytesRef(inputHandles.getBytesRef(inputHandles.getFirstValueIndex(position), scratch));
                 assertThat(fetched.getInt(fetched.getFirstValueIndex(position)), equalTo(echoValue(handle)));
             }
         }
     }
 
-    private static int echoValue(RemoteFetchHandle handle) {
+    private static int echoValue(FetchHandle handle) {
         return handle.doc() * 7;
     }
 
@@ -133,7 +132,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
      * for the transport-backed exchange client that is wired up outside this operator. Response pages are built with
      * the driver's block factory because once polled from the exchange they are coordinator-local memory.
      */
-    private static class EchoFetchClient implements RemoteFetchService.Client {
+    private static class EchoFetchClient implements FetchService.Client {
         private final BlockFactory blockFactory;
         private final List<EchoExchange> exchanges = new ArrayList<>();
 
@@ -142,10 +141,10 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
         }
 
         @Override
-        public RemoteFetchService.TargetExchange openTargetExchange(
+        public FetchService.TargetExchange openTargetExchange(
             String nodeId,
             String sessionId,
-            List<RemoteFetchService.FetchField> fields,
+            List<FieldExtractionSpec> fields,
             PhysicalPlan pushdownPlan,
             Configuration configuration
         ) {
@@ -161,7 +160,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             }
         }
 
-        private static class EchoExchange implements RemoteFetchService.TargetExchange {
+        private static class EchoExchange implements FetchService.TargetExchange {
             private final BlockFactory blockFactory;
             private final Queue<Page> pages = new ArrayDeque<>();
 
@@ -170,9 +169,9 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             }
 
             @Override
-            public void sendBatch(long batchId, List<RemoteFetchHandle> handles) {
+            public void sendBatch(long batchId, List<FetchHandle> handles) {
                 try (IntBlock.Builder values = blockFactory.newIntBlockBuilder(handles.size())) {
-                    for (RemoteFetchHandle handle : handles) {
+                    for (FetchHandle handle : handles) {
                         values.appendInt(echoValue(handle));
                     }
                     pages.add(new Page(new BatchMetadata(batchId, 0, true), values.build()));
@@ -222,9 +221,9 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
 
     public void testFetchesAcrossNodesAndReassemblesInInputOrder() {
         DriverContext driverContext = driverContext();
-        List<RemoteFetchService.FetchField> fields = List.of(
-            new RemoteFetchService.FetchField("salary", DataType.INTEGER),
-            new RemoteFetchService.FetchField("name", DataType.KEYWORD)
+        List<FieldExtractionSpec> fields = List.of(
+            FieldExtractionSpec.direct("salary", DataType.INTEGER),
+            FieldExtractionSpec.direct("name", DataType.KEYWORD)
         );
         List<Attribute> outputFields = List.of(
             new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER),
@@ -233,18 +232,18 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
         AtomicInteger requests = new AtomicInteger();
         RecordingClient client = new RecordingClient(driverContext) {
             @Override
-            void onBatch(String nodeId, String sessionId, long batchId, List<RemoteFetchHandle> handles) {
+            void onBatch(String nodeId, String sessionId, long batchId, List<FetchHandle> handles) {
                 requests.incrementAndGet();
                 switch (nodeId) {
                     case "node-a" -> {
                         assertEquals("session-a", sessionId);
-                        assertEquals(List.of(11, 33), handles.stream().map(RemoteFetchHandle::doc).toList());
+                        assertEquals(List.of(11, 33), handles.stream().map(FetchHandle::doc).toList());
                         enqueue(batchId, page(driverContext, 10, "a"), false);
                         enqueue(batchId, page(driverContext, 30, "c"), true);
                     }
                     case "node-b" -> {
                         assertEquals("session-b", sessionId);
-                        assertEquals(List.of(22), handles.stream().map(RemoteFetchHandle::doc).toList());
+                        assertEquals(List.of(22), handles.stream().map(FetchHandle::doc).toList());
                         enqueue(batchId, page(driverContext, 20, "b"), true);
                     }
                     default -> throw new IllegalStateException("unexpected node [" + nodeId + "]");
@@ -255,7 +254,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
         Page input = null;
         Page output = null;
         try (
-            RemoteFetchOperator operator = new RemoteFetchOperator(
+            FetchOperator operator = new FetchOperator(
                 driverContext,
                 0,
                 fields,
@@ -290,8 +289,8 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             assertEquals("b", utf8(fetchedStrings, 1));
             assertEquals("c", utf8(fetchedStrings, 2));
 
-            RemoteFetchOperator.Status status = (RemoteFetchOperator.Status) operator.status();
-            assertThat(status, equalTo(new RemoteFetchOperator.Status(1, 1, 3, 3, 2, 2)));
+            FetchOperator.Status status = (FetchOperator.Status) operator.status();
+            assertThat(status, equalTo(new FetchOperator.Status(1, 1, 3, 3, 2, 2)));
         } finally {
             if (input != null) {
                 input.releaseBlocks();
@@ -308,18 +307,18 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
      */
     public void testEmptyInputPageEmitsEmptyPageWithFullSchema() {
         DriverContext driverContext = driverContext();
-        List<RemoteFetchService.FetchField> fields = List.of(new RemoteFetchService.FetchField("salary", DataType.INTEGER));
+        List<FieldExtractionSpec> fields = List.of(FieldExtractionSpec.direct("salary", DataType.INTEGER));
         List<Attribute> outputFields = List.of(new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER));
         RecordingClient client = new RecordingClient(driverContext) {
             @Override
-            void onBatch(String nodeId, String sessionId, long batchId, List<RemoteFetchHandle> handles) {
+            void onBatch(String nodeId, String sessionId, long batchId, List<FetchHandle> handles) {
                 throw new AssertionError("no batches expected for an empty input page");
             }
         };
 
         Page output = null;
         try (
-            RemoteFetchOperator operator = new RemoteFetchOperator(
+            FetchOperator operator = new FetchOperator(
                 driverContext,
                 0,
                 fields,
@@ -339,8 +338,8 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             assertEquals("empty pages must still carry the fetched columns", 2, output.getBlockCount());
             assertTrue(operator.isFinished());
 
-            RemoteFetchOperator.Status status = (RemoteFetchOperator.Status) operator.status();
-            assertThat(status, equalTo(new RemoteFetchOperator.Status(1, 1, 0, 0, 0, 0)));
+            FetchOperator.Status status = (FetchOperator.Status) operator.status();
+            assertThat(status, equalTo(new FetchOperator.Status(1, 1, 0, 0, 0, 0)));
         } finally {
             if (output != null) {
                 output.releaseBlocks();
@@ -354,11 +353,11 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
      */
     public void testPlainFetchRejectsEmptyBatchResponse() {
         DriverContext driverContext = driverContext();
-        List<RemoteFetchService.FetchField> fields = List.of(new RemoteFetchService.FetchField("salary", DataType.INTEGER));
+        List<FieldExtractionSpec> fields = List.of(FieldExtractionSpec.direct("salary", DataType.INTEGER));
         List<Attribute> outputFields = List.of(new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER));
         RecordingClient client = new RecordingClient(driverContext) {
             @Override
-            void onBatch(String nodeId, String sessionId, long batchId, List<RemoteFetchHandle> handles) {
+            void onBatch(String nodeId, String sessionId, long batchId, List<FetchHandle> handles) {
                 switch (nodeId) {
                     case "node-a" -> enqueueMarker(batchId);
                     case "node-b" -> enqueue(batchId, intPage(driverContext, 20), true);
@@ -369,7 +368,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
 
         Page input = null;
         try (
-            RemoteFetchOperator operator = new RemoteFetchOperator(
+            FetchOperator operator = new FetchOperator(
                 driverContext,
                 0,
                 fields,
@@ -385,7 +384,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             input = null;
 
             IllegalStateException exception = expectThrows(IllegalStateException.class, operator::getOutput);
-            assertThat(exception.getMessage(), containsString("remote fetch returned [0] rows but expected [2]"));
+            assertThat(exception.getMessage(), containsString("fetch returned [0] rows but expected [2]"));
         } finally {
             if (input != null) {
                 input.releaseBlocks();
@@ -399,11 +398,11 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
      */
     public void testFilteredMergePreservesConstantInputBlocks() {
         DriverContext driverContext = driverContext();
-        List<RemoteFetchService.FetchField> fields = List.of(new RemoteFetchService.FetchField("salary", DataType.INTEGER));
+        List<FieldExtractionSpec> fields = List.of(FieldExtractionSpec.direct("salary", DataType.INTEGER));
         List<Attribute> outputFields = List.of(new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER));
         RecordingClient client = new RecordingClient(driverContext) {
             @Override
-            void onBatch(String nodeId, String sessionId, long batchId, List<RemoteFetchHandle> handles) {
+            void onBatch(String nodeId, String sessionId, long batchId, List<FetchHandle> handles) {
                 switch (nodeId) {
                     case "node-a" -> enqueue(batchId, intPageWithPosition(driverContext, 30, 1), true);
                     case "node-b" -> enqueue(batchId, intPageWithPosition(driverContext, 20, 0), true);
@@ -415,7 +414,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
         Page input = null;
         Page output = null;
         try (
-            RemoteFetchOperator operator = new RemoteFetchOperator(
+            FetchOperator operator = new FetchOperator(
                 driverContext,
                 0,
                 fields,
@@ -455,9 +454,9 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
 
     public void testFilteredFetchDropsRowsAndRemapsPositions() {
         DriverContext driverContext = driverContext();
-        List<RemoteFetchService.FetchField> fields = List.of(
-            new RemoteFetchService.FetchField("salary", DataType.INTEGER),
-            new RemoteFetchService.FetchField("name", DataType.KEYWORD)
+        List<FieldExtractionSpec> fields = List.of(
+            FieldExtractionSpec.direct("salary", DataType.INTEGER),
+            FieldExtractionSpec.direct("name", DataType.KEYWORD)
         );
         List<Attribute> outputFields = List.of(
             new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER),
@@ -465,7 +464,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
         );
         RecordingClient client = new RecordingClient(driverContext) {
             @Override
-            void onBatch(String nodeId, String sessionId, long batchId, List<RemoteFetchHandle> handles) {
+            void onBatch(String nodeId, String sessionId, long batchId, List<FetchHandle> handles) {
                 switch (nodeId) {
                     case "node-a" -> {
                         // sent handles [h0, h1], filter keeps only h1 (original offset 1)
@@ -483,7 +482,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
         Page input = null;
         Page output = null;
         try (
-            RemoteFetchOperator operator = new RemoteFetchOperator(
+            FetchOperator operator = new FetchOperator(
                 driverContext,
                 0,
                 fields,
@@ -518,8 +517,8 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             assertEquals("c", utf8(fetchedStrings, 1));
 
             // The rows_received/rows_emitted gap is the number of rows the pushdown pruned on the data nodes.
-            RemoteFetchOperator.Status status = (RemoteFetchOperator.Status) operator.status();
-            assertThat(status, equalTo(new RemoteFetchOperator.Status(1, 1, 3, 2, 2, 2)));
+            FetchOperator.Status status = (FetchOperator.Status) operator.status();
+            assertThat(status, equalTo(new FetchOperator.Status(1, 1, 3, 2, 2, 2)));
         } finally {
             if (input != null) {
                 input.releaseBlocks();
@@ -532,11 +531,11 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
 
     public void testStreamingFetchWaitsForAllGroupsBeforeConservativeOutput() {
         DriverContext driverContext = driverContext();
-        List<RemoteFetchService.FetchField> fields = List.of(new RemoteFetchService.FetchField("salary", DataType.INTEGER));
+        List<FieldExtractionSpec> fields = List.of(FieldExtractionSpec.direct("salary", DataType.INTEGER));
         List<Attribute> outputFields = List.of(new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER));
         RecordingClient client = new RecordingClient(driverContext) {
             @Override
-            void onBatch(String nodeId, String sessionId, long batchId, List<RemoteFetchHandle> handles) {
+            void onBatch(String nodeId, String sessionId, long batchId, List<FetchHandle> handles) {
                 if (nodeId.equals("node-a")) {
                     enqueue(batchId, intPage(driverContext, 10, 10), true);
                 }
@@ -546,7 +545,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
         Page input = null;
         Page output = null;
         try (
-            RemoteFetchOperator operator = new RemoteFetchOperator(
+            FetchOperator operator = new FetchOperator(
                 driverContext,
                 0,
                 fields,
@@ -584,11 +583,11 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
 
     public void testFilteredFetchCanDropAllRowsInGroupAfterLastPageMarker() {
         DriverContext driverContext = driverContext();
-        List<RemoteFetchService.FetchField> fields = List.of(new RemoteFetchService.FetchField("salary", DataType.INTEGER));
+        List<FieldExtractionSpec> fields = List.of(FieldExtractionSpec.direct("salary", DataType.INTEGER));
         List<Attribute> outputFields = List.of(new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER));
         RecordingClient client = new RecordingClient(driverContext) {
             @Override
-            void onBatch(String nodeId, String sessionId, long batchId, List<RemoteFetchHandle> handles) {
+            void onBatch(String nodeId, String sessionId, long batchId, List<FetchHandle> handles) {
                 switch (nodeId) {
                     case "node-a" -> enqueueMarker(batchId);
                     case "node-b" -> enqueue(batchId, intPageWithPosition(driverContext, 20, 0), true);
@@ -600,7 +599,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
         Page input = null;
         Page output = null;
         try (
-            RemoteFetchOperator operator = new RemoteFetchOperator(
+            FetchOperator operator = new FetchOperator(
                 driverContext,
                 0,
                 fields,
@@ -636,11 +635,11 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
 
     public void testPushdownRequiresMappedResponsePages() {
         DriverContext driverContext = driverContext();
-        List<RemoteFetchService.FetchField> fields = List.of(new RemoteFetchService.FetchField("salary", DataType.INTEGER));
+        List<FieldExtractionSpec> fields = List.of(FieldExtractionSpec.direct("salary", DataType.INTEGER));
         List<Attribute> outputFields = List.of(new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER));
         RecordingClient client = new RecordingClient(driverContext) {
             @Override
-            void onBatch(String nodeId, String sessionId, long batchId, List<RemoteFetchHandle> handles) {
+            void onBatch(String nodeId, String sessionId, long batchId, List<FetchHandle> handles) {
                 switch (nodeId) {
                     case "node-a" -> enqueue(batchId, intPage(driverContext, 10, 30), true);
                     case "node-b" -> enqueue(batchId, intPage(driverContext, 20), true);
@@ -651,7 +650,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
 
         Page input = null;
         try (
-            RemoteFetchOperator operator = new RemoteFetchOperator(
+            FetchOperator operator = new FetchOperator(
                 driverContext,
                 0,
                 fields,
@@ -667,7 +666,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             input = null;
 
             IllegalStateException exception = expectThrows(IllegalStateException.class, operator::getOutput);
-            assertThat(exception.getMessage(), containsString("remote fetch returned plain response pages for a pushdown fetch"));
+            assertThat(exception.getMessage(), containsString("fetch returned plain response pages for a pushdown fetch"));
         } finally {
             if (input != null) {
                 input.releaseBlocks();
@@ -677,11 +676,11 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
 
     public void testPlainFetchRejectsMappedResponsePages() {
         DriverContext driverContext = driverContext();
-        List<RemoteFetchService.FetchField> fields = List.of(new RemoteFetchService.FetchField("salary", DataType.INTEGER));
+        List<FieldExtractionSpec> fields = List.of(FieldExtractionSpec.direct("salary", DataType.INTEGER));
         List<Attribute> outputFields = List.of(new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER));
         RecordingClient client = new RecordingClient(driverContext) {
             @Override
-            void onBatch(String nodeId, String sessionId, long batchId, List<RemoteFetchHandle> handles) {
+            void onBatch(String nodeId, String sessionId, long batchId, List<FetchHandle> handles) {
                 switch (nodeId) {
                     case "node-a" -> enqueue(batchId, intPageWithPosition(driverContext, 10, 0), false);
                     case "node-b" -> enqueue(batchId, intPageWithPosition(driverContext, 20, 0), true);
@@ -692,7 +691,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
 
         Page input = null;
         try (
-            RemoteFetchOperator operator = new RemoteFetchOperator(
+            FetchOperator operator = new FetchOperator(
                 driverContext,
                 0,
                 fields,
@@ -708,7 +707,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             input = null;
 
             IllegalStateException exception = expectThrows(IllegalStateException.class, operator::getOutput);
-            assertThat(exception.getMessage(), containsString("remote fetch returned mapped response pages for a plain fetch"));
+            assertThat(exception.getMessage(), containsString("fetch returned mapped response pages for a plain fetch"));
         } finally {
             if (input != null) {
                 input.releaseBlocks();
@@ -718,43 +717,31 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
 
     public void testInvalidRequestShapesRejected() {
         DriverContext driverContext = driverContext();
-        List<RemoteFetchService.FetchField> fields = List.of(new RemoteFetchService.FetchField("salary", DataType.INTEGER));
+        List<FieldExtractionSpec> fields = List.of(FieldExtractionSpec.direct("salary", DataType.INTEGER));
         List<Attribute> outputFields = List.of(new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER));
         RecordingClient client = new RecordingClient(driverContext) {
             @Override
-            void onBatch(String nodeId, String sessionId, long batchId, List<RemoteFetchHandle> handles) {}
+            void onBatch(String nodeId, String sessionId, long batchId, List<FetchHandle> handles) {}
         };
 
-        IllegalArgumentException noRequestFields = expectThrows(
+        IllegalArgumentException noExtractionSpecs = expectThrows(
             IllegalArgumentException.class,
-            () -> new RemoteFetchOperator(
-                driverContext,
-                0,
-                List.of(),
-                outputFields,
-                null,
-                ConfigurationAware.CONFIGURATION_MARKER,
-                2,
-                client
-            )
+            () -> new FetchOperator(driverContext, 0, List.of(), outputFields, null, ConfigurationAware.CONFIGURATION_MARKER, 2, client)
         );
-        assertThat(noRequestFields.getMessage(), containsString("remote fetch requires at least one request field"));
+        assertThat(noExtractionSpecs.getMessage(), containsString("fetch requires at least one extraction specification"));
 
         IllegalArgumentException noOutputFields = expectThrows(
             IllegalArgumentException.class,
-            () -> new RemoteFetchOperator(driverContext, 0, fields, List.of(), null, ConfigurationAware.CONFIGURATION_MARKER, 2, client)
+            () -> new FetchOperator(driverContext, 0, fields, List.of(), null, ConfigurationAware.CONFIGURATION_MARKER, 2, client)
         );
-        assertThat(noOutputFields.getMessage(), containsString("remote fetch requires at least one output field"));
+        assertThat(noOutputFields.getMessage(), containsString("fetch requires at least one output field"));
 
         IllegalArgumentException fewerOutputFields = expectThrows(
             IllegalArgumentException.class,
-            () -> new RemoteFetchOperator(
+            () -> new FetchOperator(
                 driverContext,
                 0,
-                List.of(
-                    new RemoteFetchService.FetchField("salary", DataType.INTEGER),
-                    new RemoteFetchService.FetchField("name", DataType.KEYWORD)
-                ),
+                List.of(FieldExtractionSpec.direct("salary", DataType.INTEGER), FieldExtractionSpec.direct("name", DataType.KEYWORD)),
                 outputFields,
                 null,
                 ConfigurationAware.CONFIGURATION_MARKER,
@@ -762,11 +749,11 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
                 client
             )
         );
-        assertThat(fewerOutputFields.getMessage(), containsString("request fields [2] must match output fields [1]"));
+        assertThat(fewerOutputFields.getMessage(), containsString("extraction specifications [2] must match output fields [1]"));
 
         IllegalArgumentException moreOutputFields = expectThrows(
             IllegalArgumentException.class,
-            () -> new RemoteFetchOperator(
+            () -> new FetchOperator(
                 driverContext,
                 0,
                 fields,
@@ -780,28 +767,28 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
                 client
             )
         );
-        assertThat(moreOutputFields.getMessage(), containsString("request fields [1] must match output fields [2]"));
+        assertThat(moreOutputFields.getMessage(), containsString("extraction specifications [1] must match output fields [2]"));
     }
 
     public void testUnsupportedPushdownRejectedAtOperatorConstruction() {
         DriverContext driverContext = driverContext();
-        List<RemoteFetchService.FetchField> fields = List.of(new RemoteFetchService.FetchField("salary", DataType.INTEGER));
+        List<FieldExtractionSpec> fields = List.of(FieldExtractionSpec.direct("salary", DataType.INTEGER));
         ReferenceAttribute outputField = new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER);
-        ReferenceAttribute positionAttribute = new ReferenceAttribute(Source.EMPTY, null, "_remote_fetch_position", DataType.INTEGER);
+        ReferenceAttribute positionAttribute = new ReferenceAttribute(Source.EMPTY, null, "_fetch_position", DataType.INTEGER);
         PhysicalPlan unsupportedPushdown = new LimitExec(
             Source.EMPTY,
-            new FragmentExec(new RemoteFetchSource(Source.EMPTY, List.of(outputField, positionAttribute))),
+            new FragmentExec(new FetchSource(Source.EMPTY, List.of(outputField, positionAttribute))),
             new Literal(Source.EMPTY, 10, DataType.INTEGER),
             null
         );
         RecordingClient client = new RecordingClient(driverContext) {
             @Override
-            void onBatch(String nodeId, String sessionId, long batchId, List<RemoteFetchHandle> handles) {}
+            void onBatch(String nodeId, String sessionId, long batchId, List<FetchHandle> handles) {}
         };
 
         IllegalArgumentException exception = expectThrows(
             IllegalArgumentException.class,
-            () -> new RemoteFetchOperator(
+            () -> new FetchOperator(
                 driverContext,
                 0,
                 fields,
@@ -812,7 +799,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
                 client
             )
         );
-        assertThat(exception.getMessage(), containsString("unsupported remote fetch pushdown plan [LimitExec]"));
+        assertThat(exception.getMessage(), containsString("unsupported fetch pushdown plan [LimitExec]"));
     }
 
     public void testMappedFetchRejectsInvalidPositionMappings() {
@@ -825,11 +812,11 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             new InvalidPositionCase("too_large", "out of range")
         )) {
             DriverContext driverContext = driverContext();
-            List<RemoteFetchService.FetchField> fields = List.of(new RemoteFetchService.FetchField("salary", DataType.INTEGER));
+            List<FieldExtractionSpec> fields = List.of(FieldExtractionSpec.direct("salary", DataType.INTEGER));
             List<Attribute> outputFields = List.of(new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER));
             RecordingClient client = new RecordingClient(driverContext) {
                 @Override
-                void onBatch(String nodeId, String sessionId, long batchId, List<RemoteFetchHandle> handles) {
+                void onBatch(String nodeId, String sessionId, long batchId, List<FetchHandle> handles) {
                     switch (nodeId) {
                         case "node-a" -> {
                             if (handles.size() == 2) {
@@ -846,7 +833,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
 
             Page input = null;
             try (
-                RemoteFetchOperator operator = new RemoteFetchOperator(
+                FetchOperator operator = new FetchOperator(
                     driverContext,
                     0,
                     fields,
@@ -873,18 +860,18 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
 
     public void testAddInputFailureKeepsOperatorUnfinishedUntilFailureIsThrown() {
         DriverContext driverContext = driverContext();
-        List<RemoteFetchService.FetchField> fields = List.of(new RemoteFetchService.FetchField("salary", DataType.INTEGER));
+        List<FieldExtractionSpec> fields = List.of(FieldExtractionSpec.direct("salary", DataType.INTEGER));
         List<Attribute> outputFields = List.of(new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER));
         RecordingClient client = new RecordingClient(driverContext) {
             @Override
-            void onBatch(String nodeId, String sessionId, long batchId, List<RemoteFetchHandle> handles) {
+            void onBatch(String nodeId, String sessionId, long batchId, List<FetchHandle> handles) {
                 throw new AssertionError("input decoding should fail before a batch is sent");
             }
         };
 
         Page input = null;
         try (
-            RemoteFetchOperator operator = new RemoteFetchOperator(
+            FetchOperator operator = new FetchOperator(
                 driverContext,
                 0,
                 fields,
@@ -911,19 +898,19 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
 
     public void testExchangeFailurePropagatesThroughDriver() {
         DriverContext driverContext = driverContext();
-        List<RemoteFetchService.FetchField> fields = List.of(new RemoteFetchService.FetchField("salary", DataType.INTEGER));
+        List<FieldExtractionSpec> fields = List.of(FieldExtractionSpec.direct("salary", DataType.INTEGER));
         List<Attribute> outputFields = List.of(new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER));
-        IllegalStateException expected = new IllegalStateException("remote fetch exchange failed");
+        IllegalStateException expected = new IllegalStateException("fetch exchange failed");
         RecordingClient client = new RecordingClient(driverContext) {
             @Override
-            void onBatch(String nodeId, String sessionId, long batchId, List<RemoteFetchHandle> handles) {}
+            void onBatch(String nodeId, String sessionId, long batchId, List<FetchHandle> handles) {}
 
             @Override
             Exception getFailure(String nodeId) {
                 return expected;
             }
         };
-        RemoteFetchOperator operator = new RemoteFetchOperator(
+        FetchOperator operator = new FetchOperator(
             driverContext,
             0,
             fields,
@@ -941,21 +928,21 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
 
     public void testDelayedExchangeFailureWakesDriverAndPropagates() throws InterruptedException {
         DriverContext driverContext = driverContext();
-        List<RemoteFetchService.FetchField> fields = List.of(new RemoteFetchService.FetchField("salary", DataType.INTEGER));
+        List<FieldExtractionSpec> fields = List.of(FieldExtractionSpec.direct("salary", DataType.INTEGER));
         List<Attribute> outputFields = List.of(new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER));
-        IllegalStateException expected = new IllegalStateException("delayed remote fetch exchange failure");
+        IllegalStateException expected = new IllegalStateException("delayed fetch exchange failure");
         // Observe when the Driver reaches the exchange's blocking path instead of exposing the failure immediately.
         CountDownLatch driverBlocked = new CountDownLatch(1);
         RecordingClient client = new RecordingClient(driverContext) {
             @Override
-            void onBatch(String nodeId, String sessionId, long batchId, List<RemoteFetchHandle> handles) {}
+            void onBatch(String nodeId, String sessionId, long batchId, List<FetchHandle> handles) {}
 
             @Override
             void onBlocked(String nodeId) {
                 driverBlocked.countDown();
             }
         };
-        RemoteFetchOperator operator = new RemoteFetchOperator(
+        FetchOperator operator = new FetchOperator(
             driverContext,
             0,
             fields,
@@ -971,13 +958,13 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             try {
                 // Completing the exchange's page-ready listener after this point must wake the Driver to observe the failure.
                 if (driverBlocked.await(10, TimeUnit.SECONDS) == false) {
-                    throw new AssertionError("driver did not block waiting for the remote fetch exchange");
+                    throw new AssertionError("driver did not block waiting for the fetch exchange");
                 }
                 client.fail("node-a", expected);
             } catch (Throwable t) {
                 failureThreadError.set(t);
             }
-        }, "remote-fetch-test-failure");
+        }, "fetch-test-failure");
         failureThread.start();
 
         try {
@@ -992,13 +979,13 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
         }
     }
 
-    public void testIsBlockedWaitsForRemoteFetchEvenWhenMoreInputCanBeAccepted() {
+    public void testIsBlockedWaitsForFetchEvenWhenMoreInputCanBeAccepted() {
         DriverContext driverContext = driverContext();
-        List<RemoteFetchService.FetchField> fields = List.of(new RemoteFetchService.FetchField("salary", DataType.INTEGER));
+        List<FieldExtractionSpec> fields = List.of(FieldExtractionSpec.direct("salary", DataType.INTEGER));
         List<Attribute> outputFields = List.of(new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER));
 
         try (
-            RemoteFetchOperator operator = new RemoteFetchOperator(
+            FetchOperator operator = new FetchOperator(
                 driverContext,
                 0,
                 fields,
@@ -1008,7 +995,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
                 2,
                 new RecordingClient(driverContext) {
                     @Override
-                    void onBatch(String nodeId, String sessionId, long batchId, List<RemoteFetchHandle> handles) {}
+                    void onBatch(String nodeId, String sessionId, long batchId, List<FetchHandle> handles) {}
                 }
             )
         ) {
@@ -1017,23 +1004,23 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
 
             IsBlockedResult blocked = operator.isBlocked();
             assertFalse(blocked.listener().isDone());
-            assertThat(blocked.reason(), containsString("remote fetch"));
+            assertThat(blocked.reason(), containsString("fetch"));
         }
     }
 
     public void testIsBlockedDrainsReadyPagesBeforeCheckingBlockState() {
         DriverContext driverContext = driverContext();
-        List<RemoteFetchService.FetchField> fields = List.of(new RemoteFetchService.FetchField("salary", DataType.INTEGER));
+        List<FieldExtractionSpec> fields = List.of(FieldExtractionSpec.direct("salary", DataType.INTEGER));
         List<Attribute> outputFields = List.of(new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER));
         RecordingClient client = new RecordingClient(driverContext) {
             @Override
-            void onBatch(String nodeId, String sessionId, long batchId, List<RemoteFetchHandle> handles) {
+            void onBatch(String nodeId, String sessionId, long batchId, List<FetchHandle> handles) {
                 enqueue(batchId, intPage(driverContext, new int[handles.size()]), true);
             }
         };
 
         try (
-            RemoteFetchOperator operator = new RemoteFetchOperator(
+            FetchOperator operator = new FetchOperator(
                 driverContext,
                 0,
                 fields,
@@ -1133,9 +1120,9 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
 
     private static BytesRefBlock handles(DriverContext driverContext) {
         try (BytesRefBlock.Builder builder = driverContext.blockFactory().newBytesRefBlockBuilder(3)) {
-            builder.appendBytesRef(new RemoteFetchHandle("node-a", "session-a", 1, 0, 11).toBytesRef());
-            builder.appendBytesRef(new RemoteFetchHandle("node-b", "session-b", 2, 0, 22).toBytesRef());
-            builder.appendBytesRef(new RemoteFetchHandle("node-a", "session-a", 1, 0, 33).toBytesRef());
+            builder.appendBytesRef(new FetchHandle("node-a", "session-a", 1, 0, 11).toBytesRef());
+            builder.appendBytesRef(new FetchHandle("node-b", "session-b", 2, 0, 22).toBytesRef());
+            builder.appendBytesRef(new FetchHandle("node-a", "session-a", 1, 0, 33).toBytesRef());
             return builder.build();
         }
     }
@@ -1168,11 +1155,11 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
 
     private static PhysicalPlan pushdownPlan() {
         ReferenceAttribute fetchedAttribute = new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER);
-        ReferenceAttribute positionAttribute = new ReferenceAttribute(Source.EMPTY, null, "_remote_fetch_position", DataType.INTEGER);
+        ReferenceAttribute positionAttribute = new ReferenceAttribute(Source.EMPTY, null, "_fetch_position", DataType.INTEGER);
         return new FragmentExec(
             new Filter(
                 Source.EMPTY,
-                new RemoteFetchSource(Source.EMPTY, List.of(fetchedAttribute, positionAttribute)),
+                new FetchSource(Source.EMPTY, List.of(fetchedAttribute, positionAttribute)),
                 new GreaterThan(Source.EMPTY, fetchedAttribute, new Literal(Source.EMPTY, 0, DataType.INTEGER))
             )
         );
@@ -1180,27 +1167,27 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
 
     private static PhysicalPlan nonFilteringPushdownPlan() {
         ReferenceAttribute fetchedAttribute = new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER);
-        ReferenceAttribute positionAttribute = new ReferenceAttribute(Source.EMPTY, null, "_remote_fetch_position", DataType.INTEGER);
+        ReferenceAttribute positionAttribute = new ReferenceAttribute(Source.EMPTY, null, "_fetch_position", DataType.INTEGER);
         return new FragmentExec(
             new Project(
                 Source.EMPTY,
-                new RemoteFetchSource(Source.EMPTY, List.of(fetchedAttribute, positionAttribute)),
+                new FetchSource(Source.EMPTY, List.of(fetchedAttribute, positionAttribute)),
                 List.of(fetchedAttribute)
             )
         );
     }
 
-    private abstract static class RecordingClient implements RemoteFetchService.Client {
+    private abstract static class RecordingClient implements FetchService.Client {
         private final Map<String, RecordingExchange> exchangesByNode = new HashMap<>();
         private RecordingExchange currentExchange;
 
         RecordingClient(DriverContext driverContext) {}
 
         @Override
-        public RemoteFetchService.TargetExchange openTargetExchange(
+        public FetchService.TargetExchange openTargetExchange(
             String nodeId,
             String sessionId,
-            List<RemoteFetchService.FetchField> fields,
+            List<FieldExtractionSpec> fields,
             PhysicalPlan pushdownPlan,
             Configuration configuration
         ) {
@@ -1239,12 +1226,12 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
 
         void onBlocked(String nodeId) {}
 
-        abstract void onBatch(String nodeId, String sessionId, long batchId, List<RemoteFetchHandle> handles);
+        abstract void onBatch(String nodeId, String sessionId, long batchId, List<FetchHandle> handles);
 
         @Override
         public void close() {}
 
-        private class RecordingExchange implements RemoteFetchService.TargetExchange {
+        private class RecordingExchange implements FetchService.TargetExchange {
             private final String nodeId;
             private final String sessionId;
             private final Queue<Page> pages = new ArrayDeque<>();
@@ -1258,7 +1245,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             }
 
             @Override
-            public void sendBatch(long batchId, List<RemoteFetchHandle> handles) {
+            public void sendBatch(long batchId, List<FetchHandle> handles) {
                 this.batchId = batchId;
                 currentExchange = this;
                 try {
@@ -1291,7 +1278,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             public IsBlockedResult isBlocked() {
                 if (pages.isEmpty()) {
                     onBlocked(nodeId);
-                    return new IsBlockedResult(pageReady, "remote fetch response");
+                    return new IsBlockedResult(pageReady, "fetch response");
                 }
                 return Operator.NOT_BLOCKED;
             }

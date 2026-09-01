@@ -173,6 +173,7 @@ import org.elasticsearch.xpack.esql.plan.physical.ExchangeSinkExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSourceExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExternalFieldExtractExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExternalSourceExec;
+import org.elasticsearch.xpack.esql.plan.physical.FetchExec;
 import org.elasticsearch.xpack.esql.plan.physical.FieldExtractExec;
 import org.elasticsearch.xpack.esql.plan.physical.FilterExec;
 import org.elasticsearch.xpack.esql.plan.physical.FragmentExec;
@@ -213,6 +214,9 @@ import org.elasticsearch.xpack.esql.plan.physical.inference.RerankExec;
 import org.elasticsearch.xpack.esql.planner.EsPhysicalOperationProviders.ShardContext;
 import org.elasticsearch.xpack.esql.planner.mapper.Mapper;
 import org.elasticsearch.xpack.esql.plugin.EsqlPlugin;
+import org.elasticsearch.xpack.esql.plugin.FetchHandle;
+import org.elasticsearch.xpack.esql.plugin.FetchOperator;
+import org.elasticsearch.xpack.esql.plugin.FetchService;
 import org.elasticsearch.xpack.esql.plugin.QueryPragmas;
 import org.elasticsearch.xpack.esql.score.ScoreMapper;
 import org.elasticsearch.xpack.esql.session.Configuration;
@@ -231,6 +235,7 @@ import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
@@ -271,6 +276,8 @@ public class LocalExecutionPlanner {
     private final AbstractPhysicalOperationProviders physicalOperationProviders;
     private final OperatorFactoryRegistry operatorFactoryRegistry;
     @Nullable
+    private final FetchService fetchService;
+    @Nullable
     private final Executor parallelWorkerExecutor;
     private final int esqlWorkerPoolSize;
     private final MatcherWatchdog grokMatcherWatchdog;
@@ -293,6 +300,7 @@ public class LocalExecutionPlanner {
         ProjectResolver projectResolver,
         AbstractPhysicalOperationProviders physicalOperationProviders,
         OperatorFactoryRegistry operatorFactoryRegistry,
+        @Nullable FetchService fetchService,
         @Nullable Executor parallelWorkerExecutor,
         int esqlWorkerPoolSize,
         MatcherWatchdog grokMatcherWatchdog
@@ -315,6 +323,7 @@ public class LocalExecutionPlanner {
         this.projectResolver = projectResolver;
         this.physicalOperationProviders = physicalOperationProviders;
         this.operatorFactoryRegistry = operatorFactoryRegistry;
+        this.fetchService = fetchService;
         this.parallelWorkerExecutor = parallelWorkerExecutor;
         this.esqlWorkerPoolSize = esqlWorkerPoolSize;
         // Resolved once by the caller from the live ClusterSettings (the setting is dynamic), then shared
@@ -391,6 +400,8 @@ public class LocalExecutionPlanner {
             return planUnpackDims(unpackDims, context);
         } else if (node instanceof ExternalFieldExtractExec extExtract) {
             return planExternalFieldExtract(extExtract, context);
+        } else if (node instanceof FetchExec fetch) {
+            return planFetch(fetch, context);
         } else if (node instanceof ExchangeExec exchangeExec) {
             return planExchange(exchangeExec, context);
         } else if (node instanceof TopNExec topNExec) {
@@ -796,6 +807,31 @@ public class LocalExecutionPlanner {
         return source.with(factory, newLayout);
     }
 
+    private PhysicalOperation planFetch(FetchExec exec, LocalExecutionPlannerContext context) {
+        if (fetchService == null) {
+            throw new IllegalStateException("FetchExec requires FetchService");
+        }
+        PhysicalOperation source = plan(exec.child(), context);
+        Layout.ChannelAndType handle = source.layout.get(exec.handleAttribute().id());
+        if (handle == null) {
+            throw new IllegalStateException("fetch handle attribute [" + exec.handleAttribute() + "] is not present in input layout");
+        }
+        PhysicalPlan pushdownPlan = exec.pushdownPlan();
+        Layout layout = source.layout.builder().append(exec.fetchedOutputAttributes()).build();
+        return source.with(
+            new FetchOperator.Factory(
+                handle.channel(),
+                exec.extractionSpecs(),
+                exec.fetchedOutputAttributes(),
+                pushdownPlan,
+                configuration,
+                Math.max(1, context.queryPragmas().exchangeBufferSize()),
+                () -> fetchService.newReleasingBatchExchangeClient(parentTask)
+            ),
+            layout
+        );
+    }
+
     private PhysicalOperation planOutput(OutputExec outputExec, LocalExecutionPlannerContext context) {
         PhysicalOperation source = plan(outputExec.child(), context);
         var output = outputExec.output();
@@ -880,7 +916,15 @@ public class LocalExecutionPlanner {
         if (numericFactory != null) {
             return source.with(numericFactory, source.layout);
         }
-        var common = topNCommon(rowSize, topNExec.order(), topNExec.limit(), topNExec.docValuesAttributes(), source, context);
+        var common = topNCommon(
+            rowSize,
+            topNExec.order(),
+            topNExec.limit(),
+            topNExec.docValuesAttributes(),
+            topNExec.child().output(),
+            source,
+            context
+        );
         TopNOperator.ParallelWorkerConfig parallelWorkerConfig = null;
         if (parallelWorkerExecutor != null) {
             int workerCount = Math.max(1, Math.min(context.plannerSettings.parallelTopNMaxWorkers(), esqlWorkerPoolSize / 2));
@@ -1178,7 +1222,15 @@ public class LocalExecutionPlanner {
     private PhysicalOperation planTopNBy(TopNByExec topNByExec, LocalExecutionPlannerContext context) {
         final Integer rowSize = topNByExec.estimatedRowSize();
         PhysicalOperation source = plan(topNByExec.child(), context);
-        var common = topNCommon(rowSize, topNByExec.order(), topNByExec.limitPerGroup(), topNByExec.docValuesAttributes(), source, context);
+        var common = topNCommon(
+            rowSize,
+            topNByExec.order(),
+            topNByExec.limitPerGroup(),
+            topNByExec.docValuesAttributes(),
+            topNByExec.child().output(),
+            source,
+            context
+        );
         List<Integer> groupKeys = topNByExec.groupings()
             .stream()
             .map(grouping -> getAttributeChannel(grouping, source.layout, "LIMIT BY expression must be an attribute"))
@@ -1208,6 +1260,7 @@ public class LocalExecutionPlanner {
         List<Order> order,
         Expression limitExpr,
         Set<Attribute> docValuesAttributes,
+        List<Attribute> inputAttributes,
         PhysicalOperation source,
         LocalExecutionPlannerContext context
     ) {
@@ -1215,11 +1268,20 @@ public class LocalExecutionPlanner {
 
         ElementType[] elementTypes = new ElementType[source.layout.numberOfChannels()];
         TopNEncoder[] encoders = new TopNEncoder[source.layout.numberOfChannels()];
+        Set<NameId> fetchHandleIds = inputAttributes.stream()
+            .filter(FetchHandle::isAttribute)
+            .map(Attribute::id)
+            .collect(Collectors.toSet());
         List<Layout.ChannelSet> inverse = source.layout.inverse();
         for (int channel = 0; channel < inverse.size(); channel++) {
-            var fieldExtractPreference = fieldExtractPreference(docValuesAttributes, inverse.get(channel).nameIds());
-            elementTypes[channel] = PlannerUtils.toElementType(inverse.get(channel).type(), fieldExtractPreference);
-            encoders[channel] = TopNExec.encoder(inverse.get(channel).type(), context.shardContexts);
+            Layout.ChannelSet channelSet = inverse.get(channel);
+            var fieldExtractPreference = fieldExtractPreference(docValuesAttributes, channelSet.nameIds());
+            elementTypes[channel] = PlannerUtils.toElementType(channelSet.type(), fieldExtractPreference);
+            boolean fetchHandleChannel = channelSet.nameIds().stream().anyMatch(fetchHandleIds::contains);
+            // Handles use a keyword-shaped block to cross generic exchanges, but their contents are binary StreamOutput payloads.
+            encoders[channel] = fetchHandleChannel
+                ? TopNEncoder.DEFAULT_UNSORTABLE
+                : TopNExec.encoder(channelSet.type(), context.shardContexts);
         }
         List<TopNOperator.SortOrder> orders = order.stream().map(o -> {
             int sortByChannel = getAttributeChannel(o.child(), source.layout, "order by expression must be an attribute");

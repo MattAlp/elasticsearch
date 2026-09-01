@@ -15,6 +15,7 @@ import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.compute.data.BatchMetadata;
 import org.elasticsearch.compute.data.Block;
 import org.elasticsearch.compute.data.BytesRefBlock;
+import org.elasticsearch.compute.data.ElementType;
 import org.elasticsearch.compute.data.IntBlock;
 import org.elasticsearch.compute.data.Page;
 import org.elasticsearch.compute.operator.DriverContext;
@@ -23,7 +24,9 @@ import org.elasticsearch.compute.operator.Operator;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
+import org.elasticsearch.xpack.esql.plan.logical.FetchSource;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
+import org.elasticsearch.xpack.esql.planner.FieldExtractionSpec;
 import org.elasticsearch.xpack.esql.planner.PlannerUtils;
 import org.elasticsearch.xpack.esql.session.Configuration;
 
@@ -41,52 +44,53 @@ import java.util.concurrent.atomic.AtomicLong;
  * Coordinator-side operator that fetches deferred field values from owning data nodes after the query has
  * narrowed the candidate row set.
  * <p>
- * Each input page carries a column of serialized {@link RemoteFetchHandle}s plus any coordinator columns that
+ * Each input page carries a column of serialized {@link FetchHandle}s plus any coordinator columns that
  * should be retained. For every input page the operator:
  * <ol>
  *     <li>decodes and groups handles by target session ({@code nodeId}, {@code retainedSessionId})</li>
- *     <li>opens a {@link RemoteFetchService.TargetExchange} per target session when needed</li>
+ *     <li>opens a {@link FetchService.TargetExchange} per target session when needed</li>
  *     <li>sends batches of handles to the data node via the exchange</li>
  *     <li>collects response pages from the exchange and merges fetched columns back onto the input rows</li>
  *     <li>emits one output page once every group for that input page has completed</li>
  * </ol>
- * An optional {@code pushdownPlan} may be supplied so filtering happens on the data node. Mapped responses
- * include a trailing position-mapping column ({@link org.elasticsearch.xpack.esql.plan.logical.RemoteFetchSource#POSITION_ATTRIBUTE_NAME})
- * so rows pruned by pushdown can be omitted from the merged output; see {@link RemoteFetchPushdownOperatorBuilder} for the
- * supported pushdown shape.
+ * The {@code pushdownPlan} contains the {@link FetchSource} for the current bare-fetch path. The {@code Eval},
+ * {@code Filter}, and {@code Project} forms are scaffolding for future pushdown work. They are not part of the current
+ * fetch contract. A response from a future pushdown has a trailing position-mapping column
+ * ({@link FetchSource#POSITION_ATTRIBUTE_NAME}). The operator uses this column to omit rows that the pushdown removed.
+ * See {@link FetchPushdownOperatorBuilder} for the recognized plan forms.
  * <p>
- * Transport and data-node execution are handled by {@link RemoteFetchService}; this operator owns the coordinator
+ * Transport and data-node execution are handled by {@link FetchService}; this operator owns the coordinator
  * merge and exchange lifecycle only.
  */
-public final class RemoteFetchOperator implements Operator {
+public final class FetchOperator implements Operator {
     record GroupPages(List<Page> pages, boolean hasPositionMapping, int handleCount) {}
 
     public record Factory(
         int handleChannel,
-        List<RemoteFetchService.FetchField> requestFields,
+        List<FieldExtractionSpec> extractionSpecs,
         List<Attribute> outputFields,
         PhysicalPlan pushdownPlan,
         Configuration configuration,
-        int maxOutstandingRequests,
-        RemoteFetchService.ClientFactory clientFactory
+        int maxPendingInputs,
+        FetchService.ClientFactory clientFactory
     ) implements OperatorFactory {
         @Override
         public Operator get(DriverContext driverContext) {
-            return new RemoteFetchOperator(
+            return new FetchOperator(
                 driverContext,
                 handleChannel,
-                requestFields,
+                extractionSpecs,
                 outputFields,
                 pushdownPlan,
                 configuration,
-                maxOutstandingRequests,
+                maxPendingInputs,
                 clientFactory.create()
             );
         }
 
         @Override
         public String describe() {
-            return "RemoteFetchOperator[channel=" + handleChannel + ", requestFields=" + requestFields + "]";
+            return "FetchOperator[channel=" + handleChannel + ", extractionSpecs=" + extractionSpecs + "]";
         }
     }
 
@@ -94,7 +98,7 @@ public final class RemoteFetchOperator implements Operator {
 
     private static final class Group {
         private final TargetSession target;
-        private final List<RemoteFetchHandle> handles = new ArrayList<>();
+        private final List<FetchHandle> handles = new ArrayList<>();
 
         private Group(TargetSession target) {
             this.target = target;
@@ -138,7 +142,7 @@ public final class RemoteFetchOperator implements Operator {
 
     private static final class PendingGroup {
         private final Group group;
-        private final RemoteFetchService.TargetExchange exchange;
+        private final FetchService.TargetExchange exchange;
         private final long batchId;
         private final List<Page> pages = new ArrayList<>();
         private boolean batchSent;
@@ -146,7 +150,7 @@ public final class RemoteFetchOperator implements Operator {
         private boolean complete;
         private boolean hasPositionMapping;
 
-        private PendingGroup(Group group, RemoteFetchService.TargetExchange exchange, long batchId) {
+        private PendingGroup(Group group, FetchService.TargetExchange exchange, long batchId) {
             this.group = group;
             this.exchange = exchange;
             this.batchId = batchId;
@@ -159,14 +163,14 @@ public final class RemoteFetchOperator implements Operator {
 
     private final DriverContext driverContext;
     private final int handleChannel;
-    private final List<RemoteFetchService.FetchField> requestFields;
+    private final List<FieldExtractionSpec> extractionSpecs;
     private final List<Attribute> outputFields;
     private final PhysicalPlan pushdownPlan;
     private final Configuration configuration;
-    private final int maxOutstandingRequests;
-    private final RemoteFetchService.Client client;
+    private final int maxPendingInputs;
+    private final FetchService.Client client;
     private final AtomicLong batchIds = new AtomicLong();
-    private final Map<TargetSession, RemoteFetchService.TargetExchange> exchanges = new HashMap<>();
+    private final Map<TargetSession, FetchService.TargetExchange> exchanges = new HashMap<>();
     private final Map<Long, PendingGroup> pendingByBatch = new HashMap<>();
     private final Deque<PendingInput> pendingInputs = new ArrayDeque<>();
     private boolean finishing;
@@ -181,41 +185,47 @@ public final class RemoteFetchOperator implements Operator {
     // Note: no ThreadContext parameter on purpose. This operator only interacts with its exchanges synchronously
     // on the driver thread; response-header propagation for the async transport work is owned by
     // BidirectionalBatchExchangeClient and replayed via TargetExchangeChannel#close.
-    RemoteFetchOperator(
+    FetchOperator(
         DriverContext driverContext,
         int handleChannel,
-        List<RemoteFetchService.FetchField> requestFields,
+        List<FieldExtractionSpec> extractionSpecs,
         List<Attribute> outputFields,
         PhysicalPlan pushdownPlan,
         Configuration configuration,
-        int maxOutstandingRequests,
-        RemoteFetchService.Client client
+        int maxPendingInputs,
+        FetchService.Client client
     ) {
-        if (requestFields.isEmpty()) {
-            throw new IllegalArgumentException("remote fetch requires at least one request field");
+        if (extractionSpecs.isEmpty()) {
+            throw new IllegalArgumentException("fetch requires at least one extraction specification");
         }
         if (outputFields.isEmpty()) {
-            throw new IllegalArgumentException("remote fetch requires at least one output field");
+            throw new IllegalArgumentException("fetch requires at least one output field");
         }
-        if (requestFields.size() != outputFields.size()) {
+        // TODO: Before enabling fetch pushdowns, replace this bare-fetch width check with separate validation of the
+        // FetchSource inputs against extractionSpecs and the final pushdown output against outputFields, excluding
+        // the synthetic position attribute.
+        if (extractionSpecs.size() != outputFields.size()) {
             throw new IllegalArgumentException(
-                "remote fetch request fields [" + requestFields.size() + "] must match output fields [" + outputFields.size() + "]"
+                "fetch extraction specifications [" + extractionSpecs.size() + "] must match output fields [" + outputFields.size() + "]"
             );
         }
         validatePushdownPlan(pushdownPlan);
         this.driverContext = driverContext;
         this.handleChannel = handleChannel;
-        this.requestFields = List.copyOf(requestFields);
+        this.extractionSpecs = List.copyOf(extractionSpecs);
         this.outputFields = List.copyOf(outputFields);
         this.pushdownPlan = pushdownPlan;
         this.configuration = configuration;
-        this.maxOutstandingRequests = maxOutstandingRequests;
+        this.maxPendingInputs = maxPendingInputs;
         this.client = client;
     }
 
     @Override
     public boolean needsInput() {
-        return finishing == false && failure == null && pendingInputs.size() < maxOutstandingRequests;
+        // TODO: Before increasing fetch concurrency or fan-out, queue undispatched groups and propagate each target
+        // exchange's write readiness into this operator. Add explicit global and per-target batch bounds so dispatch
+        // honors the exchange buffer capacity instead of relying only on the finite pending-input-page bound.
+        return finishing == false && failure == null && pendingInputs.size() < maxPendingInputs;
     }
 
     @Override
@@ -236,12 +246,12 @@ public final class RemoteFetchOperator implements Operator {
             pendingInput = new PendingInput(inputPage, groupedHandles.groupByPosition(), groupedHandles.offsetByPosition(), pendingGroups);
             pendingInputs.addLast(pendingInput);
             for (Group group : groupedHandles.groups()) {
-                RemoteFetchService.TargetExchange exchange = exchanges.get(group.target);
+                FetchService.TargetExchange exchange = exchanges.get(group.target);
                 if (exchange == null) {
                     exchange = client.openTargetExchange(
                         group.target.nodeId(),
                         group.target.retainedSessionId(),
-                        requestFields,
+                        extractionSpecs,
                         pushdownPlan,
                         configuration
                     );
@@ -274,7 +284,7 @@ public final class RemoteFetchOperator implements Operator {
     @Override
     public void finish() {
         finishing = true;
-        for (RemoteFetchService.TargetExchange exchange : exchanges.values()) {
+        for (FetchService.TargetExchange exchange : exchanges.values()) {
             exchange.finish();
         }
     }
@@ -289,7 +299,7 @@ public final class RemoteFetchOperator implements Operator {
         if (finishing == false || pendingInputs.isEmpty() == false) {
             return false;
         }
-        for (RemoteFetchService.TargetExchange exchange : exchanges.values()) {
+        for (FetchService.TargetExchange exchange : exchanges.values()) {
             if (exchange.isFinished() == false) {
                 return false;
             }
@@ -351,7 +361,7 @@ public final class RemoteFetchOperator implements Operator {
             if (needsInput()) {
                 return NOT_BLOCKED;
             }
-            for (RemoteFetchService.TargetExchange exchange : exchanges.values()) {
+            for (FetchService.TargetExchange exchange : exchanges.values()) {
                 if (exchange.isFinished() == false) {
                     return exchange.waitForCompletion();
                 }
@@ -376,7 +386,7 @@ public final class RemoteFetchOperator implements Operator {
         }
         pendingInputs.clear();
         pendingByBatch.clear();
-        for (RemoteFetchService.TargetExchange exchange : exchanges.values()) {
+        for (FetchService.TargetExchange exchange : exchanges.values()) {
             Releasables.closeExpectNoException(exchange);
         }
         client.close();
@@ -386,7 +396,7 @@ public final class RemoteFetchOperator implements Operator {
         boolean foundPage;
         do {
             foundPage = false;
-            for (RemoteFetchService.TargetExchange exchange : exchanges.values()) {
+            for (FetchService.TargetExchange exchange : exchanges.values()) {
                 Page page;
                 while ((page = exchange.pollPage()) != null) {
                     foundPage = true;
@@ -406,7 +416,7 @@ public final class RemoteFetchOperator implements Operator {
         if (failure != null) {
             return true;
         }
-        for (RemoteFetchService.TargetExchange exchange : exchanges.values()) {
+        for (FetchService.TargetExchange exchange : exchanges.values()) {
             Exception exchangeFailure = exchange.getFailure();
             if (exchangeFailure != null) {
                 setFailure(exchangeFailure);
@@ -421,11 +431,11 @@ public final class RemoteFetchOperator implements Operator {
         try {
             BatchMetadata metadata = page.batchMetadata();
             if (metadata == null) {
-                throw new IllegalStateException("remote fetch response page missing batch metadata");
+                throw new IllegalStateException("fetch response page missing batch metadata");
             }
             PendingGroup group = pendingByBatch.get(metadata.batchId());
             if (group == null) {
-                throw new IllegalStateException("received unexpected remote fetch batch [" + metadata.batchId() + "]");
+                throw new IllegalStateException("received unexpected fetch batch [" + metadata.batchId() + "]");
             }
             if (page.getPositionCount() > 0) {
                 page.allowPassingToDifferentDriver();
@@ -464,7 +474,7 @@ public final class RemoteFetchOperator implements Operator {
         if (e instanceof RuntimeException re) {
             throw re;
         }
-        throw new IllegalStateException("remote fetch operator failed", e);
+        throw new IllegalStateException("fetch operator failed", e);
     }
 
     private void releasePendingInput(PendingInput pendingInput) {
@@ -485,7 +495,7 @@ public final class RemoteFetchOperator implements Operator {
 
     @Override
     public String toString() {
-        return "RemoteFetchOperator[channel=" + handleChannel + ", requestFields=" + requestFields + "]";
+        return "FetchOperator[channel=" + handleChannel + ", extractionSpecs=" + extractionSpecs + "]";
     }
 
     @Override
@@ -494,7 +504,7 @@ public final class RemoteFetchOperator implements Operator {
     }
 
     /**
-     * Profile status for the coordinator-side remote fetch phase.
+     * Profile status for the coordinator-side fetch phase.
      * <p>
      * Because pushdown filtering happens on the data node, {@code rowsReceived - rowsEmitted} is the number of rows
      * the pushdown pruned before they crossed the wire, and {@code batchesSent}/{@code exchangesOpened} show how the
@@ -505,12 +515,10 @@ public final class RemoteFetchOperator implements Operator {
             Operator.Status {
         public static final NamedWriteableRegistry.Entry ENTRY = new NamedWriteableRegistry.Entry(
             Operator.Status.class,
-            "remote_fetch",
+            "fetch",
             Status::new
         );
-        private static final TransportVersion ESQL_REMOTE_FETCH_OPERATOR_STATUS = TransportVersion.fromName(
-            "esql_remote_fetch_operator_status"
-        );
+        private static final TransportVersion ESQL_FETCH_OPERATOR_STATUS = TransportVersion.fromName("esql_remote_fetch_operator_status");
 
         Status(StreamInput in) throws IOException {
             this(in.readVInt(), in.readVInt(), in.readVLong(), in.readVLong(), in.readVLong(), in.readVInt());
@@ -533,7 +541,7 @@ public final class RemoteFetchOperator implements Operator {
 
         @Override
         public TransportVersion getMinimalSupportedVersion() {
-            return ESQL_REMOTE_FETCH_OPERATOR_STATUS;
+            return ESQL_FETCH_OPERATOR_STATUS;
         }
 
         @Override
@@ -559,14 +567,12 @@ public final class RemoteFetchOperator implements Operator {
 
         for (int position = 0; position < inputPage.getPositionCount(); position++) {
             if (handlesBlock.isNull(position)) {
-                throw new IllegalStateException("remote fetch handle column cannot contain nulls");
+                throw new IllegalStateException("fetch handle column cannot contain nulls");
             }
             if (handlesBlock.getValueCount(position) != 1) {
-                throw new IllegalStateException("remote fetch handle column must contain exactly one handle per row");
+                throw new IllegalStateException("fetch handle column must contain exactly one handle per row");
             }
-            RemoteFetchHandle handle = RemoteFetchHandle.fromBytesRef(
-                handlesBlock.getBytesRef(handlesBlock.getFirstValueIndex(position), scratch)
-            );
+            FetchHandle handle = FetchHandle.fromBytesRef(handlesBlock.getBytesRef(handlesBlock.getFirstValueIndex(position), scratch));
             TargetSession target = new TargetSession(handle.nodeId(), handle.retainedSessionId());
             Integer groupIndex = groupLookup.get(target);
             if (groupIndex == null) {
@@ -601,14 +607,14 @@ public final class RemoteFetchOperator implements Operator {
         for (Page page : pages) {
             boolean pageHasPosition = page.getBlockCount() == outputFields.size() + 1;
             if (expectedPositionMapping == false && pageHasPosition) {
-                throw new IllegalStateException("remote fetch returned mapped response pages for a plain fetch");
+                throw new IllegalStateException("fetch returned mapped response pages for a plain fetch");
             }
             if (expectedPositionMapping && pageHasPosition == false) {
-                throw new IllegalStateException("remote fetch returned plain response pages for a pushdown fetch");
+                throw new IllegalStateException("fetch returned plain response pages for a pushdown fetch");
             }
             if (page.getBlockCount() != outputFields.size() + (expectedPositionMapping ? 1 : 0)) {
                 throw new IllegalStateException(
-                    "remote fetch returned ["
+                    "fetch returned ["
                         + page.getBlockCount()
                         + "] columns but expected ["
                         + (outputFields.size() + (expectedPositionMapping ? 1 : 0))
@@ -619,9 +625,7 @@ public final class RemoteFetchOperator implements Operator {
                 Block positionBlock = page.getBlock(page.getBlockCount() - 1);
                 if (positionBlock instanceof IntBlock == false) {
                     throw new IllegalStateException(
-                        "remote fetch position-mapping column must be an IntBlock but was ["
-                            + positionBlock.getClass().getSimpleName()
-                            + "]"
+                        "fetch position-mapping column must be an IntBlock but was [" + positionBlock.getClass().getSimpleName() + "]"
                     );
                 }
                 validatePositionMapping(group, page, (IntBlock) positionBlock, seenPositions);
@@ -629,7 +633,7 @@ public final class RemoteFetchOperator implements Operator {
             positions += page.getPositionCount();
         }
         if (expectedPositionMapping == false && positions != group.handles.size()) {
-            throw new IllegalStateException("remote fetch returned [" + positions + "] rows but expected [" + group.handles.size() + "]");
+            throw new IllegalStateException("fetch returned [" + positions + "] rows but expected [" + group.handles.size() + "]");
         }
         return expectedPositionMapping;
     }
@@ -637,26 +641,26 @@ public final class RemoteFetchOperator implements Operator {
     private static void validatePositionMapping(Group group, Page page, IntBlock positionBlock, boolean[] seenPositions) {
         for (int row = 0; row < page.getPositionCount(); row++) {
             if (positionBlock.isNull(row)) {
-                throw new IllegalStateException("remote fetch position-mapping column cannot contain nulls");
+                throw new IllegalStateException("fetch position-mapping column cannot contain nulls");
             }
             if (positionBlock.getValueCount(row) != 1) {
-                throw new IllegalStateException("remote fetch position-mapping column must contain exactly one position per row");
+                throw new IllegalStateException("fetch position-mapping column must contain exactly one position per row");
             }
             int position = positionBlock.getInt(positionBlock.getFirstValueIndex(row));
             if (position < 0 || position >= group.handles.size()) {
                 throw new IllegalStateException(
-                    "remote fetch position-mapping value [" + position + "] out of range [0, " + group.handles.size() + ")"
+                    "fetch position-mapping value [" + position + "] out of range [0, " + group.handles.size() + ")"
                 );
             }
             if (seenPositions[position]) {
-                throw new IllegalStateException("remote fetch returned duplicate position [" + position + "]");
+                throw new IllegalStateException("fetch returned duplicate position [" + position + "]");
             }
             seenPositions[position] = true;
         }
     }
 
     static void validatePushdownPlan(PhysicalPlan plan) {
-        RemoteFetchPushdownOperatorBuilder.validateSupportedPlan(plan);
+        FetchPushdownOperatorBuilder.validateSupportedPlan(plan);
     }
 
     private Page mergeFetchedPage(Page inputPage, int[] groupByPosition, int[] offsetByPosition, List<GroupPages> pagesByGroup) {
@@ -666,7 +670,7 @@ public final class RemoteFetchOperator implements Operator {
         FetchedRowRef[] fetchedRows = resolveFetchedRows(groupByPosition, offsetByPosition, buildGroupMappings(pagesByGroup));
         for (FetchedRowRef rowRef : fetchedRows) {
             if (rowRef == null) {
-                throw new IllegalStateException("remote fetch response did not contain the expected row");
+                throw new IllegalStateException("fetch response did not contain the expected row");
             }
         }
         Block[] outputBlocks = new Block[inputPage.getBlockCount() + outputFields.size()];
@@ -678,8 +682,10 @@ public final class RemoteFetchOperator implements Operator {
                 outputBlocks[block].incRef();
             }
             for (int field = 0; field < outputFields.size(); field++) {
-                builders[field] = PlannerUtils.toElementType(outputFields.get(field).dataType())
-                    .newBlockBuilder(inputPage.getPositionCount(), driverContext.blockFactory());
+                builders[field] = fetchedOutputElementType(field).newBlockBuilder(
+                    inputPage.getPositionCount(),
+                    driverContext.blockFactory()
+                );
                 for (FetchedRowRef rowRef : fetchedRows) {
                     Page fetchedPage = pagesByGroup.get(rowRef.group()).pages().get(rowRef.pageIndex());
                     builders[field].copyFrom(fetchedPage.getBlock(field), rowRef.position(), rowRef.position() + 1);
@@ -734,8 +740,7 @@ public final class RemoteFetchOperator implements Operator {
                 outputBlocks[i] = inputPage.getBlock(i).filter(false, survivingPositions, 0, survivors);
             }
             for (int field = 0; field < outputFields.size(); field++) {
-                Block.Builder builder = PlannerUtils.toElementType(outputFields.get(field).dataType())
-                    .newBlockBuilder(survivors, driverContext.blockFactory());
+                Block.Builder builder = fetchedOutputElementType(field).newBlockBuilder(survivors, driverContext.blockFactory());
                 builders[field] = builder;
                 for (FetchedRowRef rowRef : keptRows) {
                     Page fetchedPage = pagesByGroup.get(rowRef.group()).pages().get(rowRef.pageIndex());
@@ -756,6 +761,14 @@ public final class RemoteFetchOperator implements Operator {
         }
     }
 
+    private ElementType fetchedOutputElementType(int field) {
+        // A bare fetch returns the loader's physical block type. A pushdown can transform that input, so its declared
+        // output attributes, rather than the source extraction specifications, define the response block types.
+        return pushdownPlan == null
+            ? extractionSpecs.get(field).elementType()
+            : PlannerUtils.toElementType(outputFields.get(field).dataType());
+    }
+
     private static FetchedRowRef[][] buildGroupMappings(List<GroupPages> pagesByGroup) {
         FetchedRowRef[][] mappings = new FetchedRowRef[pagesByGroup.size()][];
         for (int group = 0; group < pagesByGroup.size(); group++) {
@@ -769,7 +782,7 @@ public final class RemoteFetchOperator implements Operator {
                 for (int row = 0; row < page.getPositionCount(); row++) {
                     int position = positionBlock == null ? runningOffset++ : positionBlock.getInt(positionBlock.getFirstValueIndex(row));
                     if (mapping[position] != null) {
-                        throw new IllegalStateException("remote fetch returned duplicate position [" + position + "]");
+                        throw new IllegalStateException("fetch returned duplicate position [" + position + "]");
                     }
                     mapping[position] = new FetchedRowRef(group, pageIndex, row);
                 }
