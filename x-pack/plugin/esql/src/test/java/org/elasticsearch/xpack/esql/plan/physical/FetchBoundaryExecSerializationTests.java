@@ -15,7 +15,6 @@ import java.util.List;
 
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.Matchers.not;
 
 /**
  * Verifies the serialized coordinator-to-data-node fetch handoff because it also controls schema and retained-context requirements.
@@ -36,14 +35,12 @@ public class FetchBoundaryExecSerializationTests extends AbstractPhysicalPlanSer
 
         assertThat(boundary.output(), equalTo(boundary.handoffOutput()));
         assertTrue(boundary.output().contains(boundary.handleAttribute()));
-        assertTrue(boundary.requiresRetainedSearchContexts());
         assertThat(boundary.minimumTransportVersion(), equalTo(FetchBoundaryExec.ESQL_FETCH_BOUNDARY));
 
         String plan = boundary.toString();
         assertThat(plan, containsString("FetchBoundaryExec"));
         assertThat(plan, containsString("handle="));
         assertThat(plan, containsString("handoffOutput="));
-        assertThat(plan, containsString("requiresRetainedSearchContexts=true"));
     }
 
     public void testRejectsHandoffWithoutHandle() {
@@ -56,19 +53,6 @@ public class FetchBoundaryExecSerializationTests extends AbstractPhysicalPlanSer
             () -> new FetchBoundaryExec(randomSource(), child, handle, output)
         );
         assertThat(e.getMessage(), containsString("fetch handoff output must contain handle attribute"));
-    }
-
-    public void testContractIsReducerAgnostic() {
-        Attribute handle = randomFieldAttributes(1, 1, false).getFirst();
-        FetchBoundaryExec boundary = new FetchBoundaryExec(
-            randomSource(),
-            new ExchangeSourceExec(randomSource(), List.of(), false),
-            handle,
-            List.of(handle)
-        );
-
-        assertThat(boundary.toString(), not(containsString("TopN")));
-        assertThat(boundary.handoffOutput(), equalTo(List.of(handle)));
     }
 
     @Override

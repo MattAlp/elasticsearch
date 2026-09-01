@@ -78,10 +78,6 @@ public final class FetchBoundaryExec extends UnaryExec {
         return handoffOutput;
     }
 
-    public boolean requiresRetainedSearchContexts() {
-        return true;
-    }
-
     public TransportVersion minimumTransportVersion() {
         return ESQL_FETCH_BOUNDARY;
     }
@@ -111,7 +107,7 @@ public final class FetchBoundaryExec extends UnaryExec {
         sb.append(nodeName());
         sb.append("[handle=").append(handleAttribute.toString(format, mapper));
         sb.append(", handoffOutput=").append(handoffOutput.stream().map(attribute -> attribute.toString(format, mapper)).toList());
-        sb.append(", requiresRetainedSearchContexts=true]");
+        sb.append("]");
     }
 
     @Override

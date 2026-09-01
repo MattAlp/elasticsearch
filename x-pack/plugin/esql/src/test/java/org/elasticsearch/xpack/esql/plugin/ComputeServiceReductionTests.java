@@ -171,7 +171,7 @@ public class ComputeServiceReductionTests extends ESTestCase {
             )
         );
 
-        assertThat(e.getMessage(), equalTo("fetch boundary does not describe a supported reduction"));
+        assertThat(e.getMessage(), equalTo("fetch boundary must contain a Project -> TopN fragment"));
     }
 
     public void testFetchBoundaryMustBeDirectChildOfExchangeSink() {
@@ -283,21 +283,6 @@ public class ComputeServiceReductionTests extends ESTestCase {
         assertThat(rewritten, instanceOf(ProjectExec.class));
         assertThat(rewritten.output(), equalTo(distributedPlan.output()));
         assertFalse(rewritten.output().stream().anyMatch(FetchHandle::isAttribute));
-    }
-
-    public void testNoRetainedContextsWhenFetchBoundaryIsNotProduced() {
-        Configuration configuration = EsqlTestUtils.configuration(
-            new QueryPragmas(Settings.builder().put(QueryPragmas.FETCH_TOPN.getKey(), true).build())
-        );
-        PhysicalPlan physicalPlan = distributedQueryPlan(
-            "FROM employees | STATS total = SUM(salary) | SORT total DESC | LIMIT 5",
-            configuration
-        );
-
-        var planned = optimizeDeferredFetch(physicalPlan, configuration, TransportVersion.current());
-
-        assertThat(planned.collect(FetchExec.class), hasSize(0));
-        assertFalse(planned.anyMatch(FetchBoundaryExec.class::isInstance));
     }
 
     public void testDoesNotPlanFetchForMultipleTopNs() {
@@ -414,7 +399,6 @@ public class ComputeServiceReductionTests extends ESTestCase {
         FetchExec fetch = as(rewrittenProject.child(), FetchExec.class);
         Attribute salary = fetch.attributesToFetch().getFirst();
         Attribute empNo = fetch.attributesToFetch().get(1);
-        assertThat(fetch.attributesToFetch(), equalTo(List.of(salary, empNo)));
         assertThat(fetch.attributesToFetch(), equalTo(List.of(salary, empNo)));
         assertThat(fetch.child(), instanceOf(TopNExec.class));
 

@@ -49,7 +49,7 @@ import static org.elasticsearch.xpack.core.security.authz.IndicesAndAliasesResol
 
 final class DataNodeRequest extends AbstractTransportRequest implements IndicesRequest.Replaceable {
     private static final TransportVersion REDUCE_LATE_MATERIALIZATION = TransportVersion.fromName("esql_reduce_late_materialization");
-    public static final TransportVersion ESQL_FETCH_RETAINED_CONTEXTS = TransportVersion.fromName("esql_remote_fetch_retained_contexts");
+    public static final TransportVersion ESQL_FETCH_RETAINED_CONTEXTS = TransportVersion.fromName("esql_fetch_boundary");
     private static final TransportVersion EXTERNAL_SPLITS_IN_DATA_NODE_REQUEST = TransportVersion.fromName(
         "esql_external_splits_in_data_node_request"
     );

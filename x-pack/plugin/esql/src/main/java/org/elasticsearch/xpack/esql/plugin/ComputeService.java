@@ -1679,11 +1679,6 @@ public class ComputeService {
             stats
         );
 
-        PlannerUtils.PlanReduction planReduction = PlannerUtils.reductionPlan(originalPlan);
-        if (fetchBoundary != null && planReduction instanceof PlannerUtils.TopNReduction == false) {
-            throw new IllegalStateException("fetch boundary does not describe a supported reduction");
-        }
-
         ReductionPlan reductionPlan;
         if (fetchBoundary != null) {
             reductionPlan = LateMaterializationPlanner.planFetchTopN(
@@ -1695,6 +1690,7 @@ public class ComputeService {
                 retainedSessionId
             );
         } else {
+            PlannerUtils.PlanReduction planReduction = PlannerUtils.reductionPlan(originalPlan);
             reductionPlan = switch (planReduction) {
                 case PlannerUtils.TopNReduction topN when reduceNodeLateMaterialization -> LateMaterializationPlanner.planReduceDriverTopN(
                     contextFactory,

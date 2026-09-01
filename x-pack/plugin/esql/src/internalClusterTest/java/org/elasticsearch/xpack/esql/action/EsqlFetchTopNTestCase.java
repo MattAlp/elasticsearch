@@ -229,7 +229,7 @@ public abstract class EsqlFetchTopNTestCase extends AbstractEsqlIntegTestCase {
         }
         bulk.setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE).get();
 
-        // Remote-fetch handles are arbitrary binary values. This regression test sends enough handles through TopN to ensure that
+        // Fetch handles are arbitrary binary values. This regression test sends enough handles through TopN to ensure that
         // they are not interpreted or corrupted as UTF-8. The secondary sort key also gives the profile a normal eagerly loaded field.
         try (
             EsqlQueryResponse response = runQuery(

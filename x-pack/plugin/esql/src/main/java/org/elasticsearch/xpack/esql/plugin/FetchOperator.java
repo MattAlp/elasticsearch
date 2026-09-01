@@ -513,7 +513,7 @@ public final class FetchOperator implements Operator {
             "fetch",
             Status::new
         );
-        private static final TransportVersion ESQL_FETCH_OPERATOR_STATUS = TransportVersion.fromName("esql_remote_fetch_operator_status");
+        private static final TransportVersion ESQL_FETCH_OPERATOR_STATUS = TransportVersion.fromName("esql_fetch_boundary");
 
         Status(StreamInput in) throws IOException {
             this(in.readVInt(), in.readVInt(), in.readVLong(), in.readVLong(), in.readVLong(), in.readVInt());

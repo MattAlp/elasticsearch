@@ -20,7 +20,6 @@ import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.BigArrays;
-import org.elasticsearch.common.util.concurrent.ThreadContext;
 import org.elasticsearch.compute.data.BatchMetadata;
 import org.elasticsearch.compute.data.BlockFactory;
 import org.elasticsearch.compute.data.BlockStreamInput;
@@ -199,20 +198,6 @@ public final class FetchService {
                 transportService.getThreadPool().executor(ThreadPool.Names.SEARCH)
             )
         );
-    }
-
-    public ThreadContext threadContext() {
-        return transportService.getThreadPool().getThreadContext();
-    }
-
-    /**
-     * Creates a batch exchange client without automatic retained-session release.
-     * <p>
-     * Callers that use this overload are responsible for releasing remote retained search contexts themselves
-     * (e.g. via {@link #releaseAsync}); otherwise the contexts will leak until they expire.
-     */
-    public Client newBatchExchangeClient(CancellableTask parentTask) {
-        return newBatchExchangeClient(parentTask, RetainedSessionReleaser.NOOP);
     }
 
     Client newBatchExchangeClient(CancellableTask parentTask, RetainedSessionReleaser retainedSessionReleaser) {
@@ -1007,8 +992,6 @@ public final class FetchService {
     }
 
     static final class RetainedSessionReleaser implements Releasable {
-        private static final RetainedSessionReleaser NOOP = new RetainedSessionReleaser((targetNode, retainedSessionId) -> {});
-
         private final ReleaseAction releaseAction;
         private final TouchAction touchAction;
         private final Map<TrackedSessionKey, DiscoveryNode> sessions = new LinkedHashMap<>();
