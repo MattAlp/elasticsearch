@@ -30,8 +30,8 @@ import org.elasticsearch.transport.TransportService;
 import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xcontent.json.JsonXContent;
 import org.elasticsearch.xpack.esql.VerificationException;
+import org.elasticsearch.xpack.esql.plugin.FetchOperator;
 import org.elasticsearch.xpack.esql.plugin.QueryPragmas;
-import org.elasticsearch.xpack.esql.plugin.RemoteFetchOperator;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -137,14 +137,14 @@ public class CrossClusterQueryIT extends AbstractCrossClusterTestCase {
         }
     }
 
-    public void testRemoteFetchTopNIsDisabledForCrossClusterSearch() throws Exception {
-        assumeTrue("remote_fetch_topn is an experimental query pragma", Build.current().isSnapshot());
+    public void testFetchTopNIsDisabledForCrossClusterSearch() throws Exception {
+        assumeTrue("fetch_topn is an experimental query pragma", Build.current().isSnapshot());
         setupTwoClusters();
         QueryPragmas pragmas = new QueryPragmas(
             Settings.builder()
                 .put(QueryPragmas.TASK_CONCURRENCY.getKey(), 1)
                 .put(QueryPragmas.DATA_PARTITIONING.getKey(), DataPartitioning.SHARD)
-                .put(QueryPragmas.REMOTE_FETCH_TOPN.getKey(), true)
+                .put(QueryPragmas.FETCH_TOPN.getKey(), true)
                 .build()
         );
         // Test a pushable field sort and an expression sort that guarantees a coordinator TopN.
@@ -160,7 +160,7 @@ public class CrossClusterQueryIT extends AbstractCrossClusterTestCase {
                         .drivers()
                         .stream()
                         .flatMap(driver -> driver.operators().stream())
-                        .anyMatch(operator -> operator.status() instanceof RemoteFetchOperator.Status)
+                        .anyMatch(operator -> operator.status() instanceof FetchOperator.Status)
                 );
             }
         }

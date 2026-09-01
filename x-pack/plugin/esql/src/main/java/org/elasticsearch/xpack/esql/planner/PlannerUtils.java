@@ -67,12 +67,12 @@ import org.elasticsearch.xpack.esql.plan.physical.ExchangeExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSinkExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSourceExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExternalSourceExec;
+import org.elasticsearch.xpack.esql.plan.physical.FetchExec;
 import org.elasticsearch.xpack.esql.plan.physical.FragmentExec;
 import org.elasticsearch.xpack.esql.plan.physical.LookupJoinExec;
 import org.elasticsearch.xpack.esql.plan.physical.MergeExec;
 import org.elasticsearch.xpack.esql.plan.physical.MetricsInfoExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
-import org.elasticsearch.xpack.esql.plan.physical.RemoteFetchExec;
 import org.elasticsearch.xpack.esql.plan.physical.TopNExec;
 import org.elasticsearch.xpack.esql.plan.physical.TsInfoExec;
 import org.elasticsearch.xpack.esql.planner.mapper.LocalMapper;
@@ -450,13 +450,13 @@ public class PlannerUtils {
             .stream()
             .map(x -> ((LookupJoinExec) x).right())
             .collect(Collectors.toSet());
-        Set<PhysicalPlan> remoteFetchExecRightChildren = plan.collect(RemoteFetchExec.class::isInstance)
+        Set<PhysicalPlan> fetchExecRightChildren = plan.collect(FetchExec.class::isInstance)
             .stream()
-            .map(x -> ((RemoteFetchExec) x).right())
+            .map(x -> ((FetchExec) x).right())
             .collect(Collectors.toSet());
 
         PhysicalPlan localPhysicalPlan = plan.transformUp(FragmentExec.class, f -> {
-            if (lookupJoinExecRightChildren.contains(f) || remoteFetchExecRightChildren.contains(f)) {
+            if (lookupJoinExecRightChildren.contains(f) || fetchExecRightChildren.contains(f)) {
                 // These fragments are shipped as logical plans and planned on the target node, where the right stats and
                 // execution context are available.
                 return f;

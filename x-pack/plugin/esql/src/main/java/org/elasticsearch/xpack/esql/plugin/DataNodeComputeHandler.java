@@ -56,6 +56,7 @@ import org.elasticsearch.xpack.esql.core.expression.FoldContext;
 import org.elasticsearch.xpack.esql.datasources.Federation;
 import org.elasticsearch.xpack.esql.datasources.spi.ExternalSplit;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSinkExec;
+import org.elasticsearch.xpack.esql.plan.physical.FetchBoundaryExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
 import org.elasticsearch.xpack.esql.planner.PlanConcurrencyCalculator;
 import org.elasticsearch.xpack.esql.planner.PlannerSettings;
@@ -131,10 +132,15 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
         ExchangeSourceHandler exchangeSource,
         boolean retainSearchContexts,
         // Non-null iff retainSearchContexts: every request that asks a data node to retain contexts must have a releaser tracking it.
-        @Nullable RemoteFetchService.RetainedSessionReleaser remoteFetchRetainedSessionReleaser,
+        @Nullable FetchService.RetainedSessionReleaser fetchRetainedSessionReleaser,
         Runnable runOnTaskFailure,
         ActionListener<ComputeResponse> outListener
     ) {
+        if (dataNodePlan.anyMatch(FetchBoundaryExec.class::isInstance) && retainSearchContexts == false) {
+            outListener.onFailure(new IllegalStateException("fetch boundary requires retained search contexts"));
+            return;
+        }
+        boolean allowPartialResults = allowPartialResults(configuration, retainSearchContexts);
         Integer maxConcurrentNodesPerCluster = PlanConcurrencyCalculator.INSTANCE.calculateNodesConcurrency(dataNodePlan, configuration);
 
         new DataNodeRequestSender(
@@ -146,7 +152,7 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
             originalIndices,
             PlannerUtils.canMatchFilter(flags, configuration, clusterService.state().getMinTransportVersion(), dataNodePlan),
             clusterAlias,
-            configuration.allowPartialResults(),
+            allowPartialResults,
             maxConcurrentNodesPerCluster == null ? -1 : maxConcurrentNodesPerCluster,
             configuration.pragmas().unavailableShardResolutionAttempts()
         ) {
@@ -167,6 +173,7 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                 final Transport.Connection connection;
                 try {
                     connection = transportService.getConnection(node);
+                    validateFetchBoundaryCompatibility(dataNodePlan, connection.getTransportVersion(), connection.getNode().getName());
                 } catch (Exception e) {
                     listener.onFailure(e);
                     return;
@@ -184,7 +191,7 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                     listener.delegateFailureAndWrap((l, unused) -> {
                         final Runnable onGroupFailure;
                         final CancellableTask groupTask;
-                        if (configuration.allowPartialResults()) {
+                        if (allowPartialResults) {
                             try {
                                 groupTask = computeService.createGroupTask(
                                     parentTask,
@@ -207,30 +214,9 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                                 .equals(connection.getNode().getId());
                             boolean enableReduceNodeLateMaterialization = EsqlCapabilities.Cap.ENABLE_REDUCE_NODE_LATE_MATERIALIZATION
                                 .isEnabled();
-                            if (retainSearchContexts
-                                && connection.getTransportVersion().supports(DataNodeRequest.ESQL_REMOTE_FETCH_TOPN_REDUCTION) == false) {
-                                /*
-                                 * The coordinator only plans remote-fetch TopN when the cluster-wide minimum transport version supports
-                                 * it. Reaching this branch means the connection view changed after planning, or otherwise disagrees with
-                                 * the coordinator's cluster-state view. We cannot degrade here because the data-node and coordinator plans
-                                 * have already been rewritten to exchange remote-fetch handles.
-                                 */
-                                l.onFailure(
-                                    new IllegalStateException(
-                                        "remote fetch TopN requires transport version ["
-                                            + DataNodeRequest.ESQL_REMOTE_FETCH_TOPN_REDUCTION
-                                            + "] but node ["
-                                            + connection.getNode().getName()
-                                            + "] has ["
-                                            + connection.getTransportVersion()
-                                            + "]"
-                                    )
-                                );
-                                return;
-                            }
                             if (retainSearchContexts) {
-                                assert remoteFetchRetainedSessionReleaser != null : "retainSearchContexts requires a session releaser";
-                                remoteFetchRetainedSessionReleaser.track(connection.getNode(), nodeReduceSessionId(childSessionId));
+                                assert fetchRetainedSessionReleaser != null : "retainSearchContexts requires a session releaser";
+                                fetchRetainedSessionReleaser.track(connection.getNode(), nodeReduceSessionId(childSessionId));
                             }
                             var dataNodeRequest = new DataNodeRequest(
                                 childSessionId,
@@ -263,7 +249,7 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                             final var remoteSink = exchangeService.newRemoteSink(groupTask, childSessionId, transportService, connection);
                             exchangeSource.addRemoteSink(
                                 remoteSink,
-                                configuration.allowPartialResults() == false,
+                                allowPartialResults == false,
                                 pagesFetched::incrementAndGet,
                                 queryPragmas.concurrentExchangeClients(),
                                 computeListener.acquireAvoid()
@@ -277,6 +263,27 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
             runOnTaskFailure,
             ActionListener.releaseAfter(outListener, exchangeSource.addEmptySink())
         );
+    }
+
+    static void validateFetchBoundaryCompatibility(PhysicalPlan plan, TransportVersion transportVersion, String nodeName) {
+        for (FetchBoundaryExec boundary : plan.collect(FetchBoundaryExec.class)) {
+            if (transportVersion.supports(boundary.minimumTransportVersion()) == false) {
+                throw new IllegalStateException(
+                    "fetch boundary requires transport version ["
+                        + boundary.minimumTransportVersion()
+                        + "] but node ["
+                        + nodeName
+                        + "] has ["
+                        + transportVersion
+                        + "]"
+                );
+            }
+        }
+    }
+
+    static boolean allowPartialResults(Configuration configuration, boolean retainSearchContexts) {
+        // Once a data node produces opaque fetch handles, losing any shard can invalidate the global TopN or its later fetch.
+        return configuration.allowPartialResults() && retainSearchContexts == false;
     }
 
     void startExternalComputeOnDataNodes(
@@ -839,14 +846,16 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
             return;
         }
 
+        if (request.plan().anyMatch(FetchBoundaryExec.class::isInstance) && request.retainSearchContexts() == false) {
+            listener.onFailure(new IllegalStateException("fetch boundary requires retained search contexts"));
+            return;
+        }
+
         ReductionPlan reductionPlan;
         final String sessionId = request.sessionId();
         final String nodeReduceSessionId = nodeReduceSessionId(sessionId);
         if (request.plan() instanceof ExchangeSinkExec plan) {
-            var remoteFetchContext = request.retainSearchContexts()
-                ? new RemoteFetchReductionPlanner.RemoteFetchContext(clusterService.localNode().getId(), nodeReduceSessionId)
-                : null;
-            reductionPlan = ReductionPlanner.plan(
+            reductionPlan = ComputeService.reductionPlan(
                 computeService.plannerSettings().get(),
                 computeService.createFlags(),
                 configuration,
@@ -854,7 +863,8 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                 plan,
                 request.runNodeLevelReduction(),
                 request.reductionLateMaterialization(),
-                remoteFetchContext,
+                clusterService.localNode().getId(),
+                nodeReduceSessionId,
                 planTimeProfile
             );
         } else {
@@ -882,8 +892,7 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
         if (request.retainSearchContexts()) {
             final RetainedSearchContextsRegistry.Handle retainedSearchContexts;
             try {
-                retainedSearchContexts = computeService.remoteFetchService()
-                    .retainSearchContexts(nodeReduceSessionId, computeSearchContexts);
+                retainedSearchContexts = computeService.fetchService().retainSearchContexts(nodeReduceSessionId, computeSearchContexts);
             } catch (Exception e) {
                 computeSearchContexts.close();
                 listener.onFailure(e);
@@ -897,7 +906,7 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
              */
             final RetainedSearchContextsRegistry.Handle computeLease;
             try {
-                computeLease = computeService.remoteFetchService().acquireRetainedContexts(nodeReduceSessionId);
+                computeLease = computeService.fetchService().acquireRetainedContexts(nodeReduceSessionId);
             } catch (Exception e) {
                 retainedSearchContexts.close();
                 listener.onFailure(e);
@@ -907,9 +916,8 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
             responseListener = ActionListener.wrap(response -> {
                 boolean success = false;
                 try {
-                    // TODO: Keep a coordinator-owned lease or refresh this registration while global TopN is active. The idle reaper
-                    // must still clean abandoned sessions, but it currently cannot distinguish abandonment from waiting on a slower
-                    // data node.
+                    // The coordinator refreshes this idle registration while global TopN is active. If the coordinator disappears,
+                    // those heartbeats stop and the idle reaper closes the abandoned search contexts.
                     retainedSearchContexts.finishRegistration();
                     listener.onResponse(response);
                     success = true;
@@ -920,6 +928,11 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                     }
                 }
             }, e -> {
+                // Retained TopN fetch is intentionally fail-closed, even when partial results are otherwise allowed. Rows may already
+                // have escaped this data node as opaque handles, and after a node failure we can neither establish a complete global
+                // TopN nor fetch every selected row. Closing the registration makes those handles fail instead of returning an
+                // apparently complete result from incomplete inputs. A generalized fetch contract can define different partial-result
+                // and retention semantics in the future.
                 try (retainedSearchContexts; computeLease) {
                     listener.onFailure(e);
                 }

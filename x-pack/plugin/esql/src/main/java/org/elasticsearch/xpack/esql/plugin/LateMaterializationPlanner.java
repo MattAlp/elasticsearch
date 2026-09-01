@@ -8,11 +8,13 @@
 package org.elasticsearch.xpack.esql.plugin;
 
 import org.elasticsearch.index.IndexMode;
+import org.elasticsearch.xpack.esql.core.expression.Alias;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.AttributeSet;
 import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.util.CollectionUtils;
+import org.elasticsearch.xpack.esql.expression.function.scalar.FetchHandleFunction;
 import org.elasticsearch.xpack.esql.optimizer.LocalLogicalOptimizerContext;
 import org.elasticsearch.xpack.esql.optimizer.LocalPhysicalOptimizerContext;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.local.ReplaceFieldWithConstantOrNull;
@@ -21,14 +23,18 @@ import org.elasticsearch.xpack.esql.optimizer.rules.physical.local.PushTopNToSou
 import org.elasticsearch.xpack.esql.optimizer.rules.physical.local.ReplaceSourceAttributes;
 import org.elasticsearch.xpack.esql.plan.logical.EsRelation;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
+import org.elasticsearch.xpack.esql.plan.logical.PipelineBreaker;
 import org.elasticsearch.xpack.esql.plan.logical.Project;
 import org.elasticsearch.xpack.esql.plan.logical.TopN;
 import org.elasticsearch.xpack.esql.plan.physical.EsQueryExec;
 import org.elasticsearch.xpack.esql.plan.physical.EstimatesRowSize;
+import org.elasticsearch.xpack.esql.plan.physical.EvalExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSinkExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSourceExec;
+import org.elasticsearch.xpack.esql.plan.physical.FetchBoundaryExec;
 import org.elasticsearch.xpack.esql.plan.physical.FragmentExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
+import org.elasticsearch.xpack.esql.plan.physical.ProjectExec;
 import org.elasticsearch.xpack.esql.plan.physical.TopNExec;
 import org.elasticsearch.xpack.esql.planner.mapper.LocalMapper;
 import org.elasticsearch.xpack.esql.stats.SearchStats;
@@ -78,7 +84,7 @@ import java.util.function.Function;
 *  The above actually reads the {@code x} field "unnecessarily", since it's only needed to conform to the output schema of the original
 *  plan. See #134363 for a way to optimize this little problem.
 */
-class LateMaterializationPlanner {
+public class LateMaterializationPlanner {
     public static Optional<ReductionPlan> planReduceDriverTopN(
         Function<SearchStats, LocalPhysicalOptimizerContext> contextFactory,
         ExchangeSinkExec originalPlan
@@ -145,6 +151,79 @@ class LateMaterializationPlanner {
         // The TopN reduction plan should not be further optimized locally on the node reduce driver, since we took great pains to
         // preplan in advance, including all the necessary field extractions!
         return Optional.of(new ReductionPlan(reductionPlanWithSize, updatedDataPlan));
+    }
+
+    /**
+     * Consumes a fetch boundary and builds the node-reduce and shard-data plans for its TopN.
+     */
+    static ReductionPlan planFetchTopN(
+        Function<SearchStats, LocalPhysicalOptimizerContext> contextFactory,
+        ExchangeSinkExec originalPlan,
+        FetchBoundaryExec fetchBoundary,
+        String localNodeId,
+        String retainedSessionId
+    ) {
+        if (originalPlan.output().equals(fetchBoundary.handoffOutput()) == false) {
+            throw new IllegalStateException(
+                "fetch boundary handoff output "
+                    + fetchBoundary.handoffOutput()
+                    + " does not match exchange output "
+                    + originalPlan.output()
+            );
+        }
+        FragmentExec fragmentExec = fetchBoundary.child() instanceof FragmentExec fe ? fe : null;
+        Project topLevelProject = fragmentExec != null && fragmentExec.fragment() instanceof Project p ? p : null;
+        TopN topN = topLevelProject != null && topLevelProject.child() instanceof TopN tn ? tn : null;
+        if (topN == null) {
+            throw new IllegalStateException("fetch boundary does not contain a supported TopN fragment");
+        }
+        if (topN.child().anyMatch(PipelineBreaker.class::isInstance)) {
+            throw new IllegalStateException("fetch boundary TopN contains another pipeline breaker");
+        }
+
+        LocalPhysicalOptimizerContext context = contextFactory.apply(SEARCH_STATS_TOP_N_REPLACEMENT);
+        List<Attribute> physicalPlanOutput = toNonOptimizedPhysicalDataPlan(topN, context).output();
+        Attribute doc = physicalPlanOutput.stream().filter(EsQueryExec::isDocAttribute).findFirst().orElse(null);
+        if (doc == null) {
+            throw new IllegalStateException("fetch boundary TopN does not expose a document reference");
+        }
+        LogicalPlan withAddedDocToRelation = topN.transformUp(EsRelation.class, relation -> {
+            if (relation.indexMode() == IndexMode.LOOKUP || relation.outputSet().contains(doc)) {
+                return relation;
+            }
+            return relation.withAttributes(CollectionUtils.prependToCopy(doc, relation.output()));
+        });
+        if (withAddedDocToRelation.output().stream().noneMatch(EsQueryExec::isDocAttribute)) {
+            throw new IllegalStateException("fetch boundary TopN does not preserve its document reference");
+        }
+
+        AttributeSet orderRefsSet = AttributeSet.of(topN.order().stream().flatMap(order -> order.references().stream()).toList());
+        List<Attribute> expectedDataOutput = new ArrayList<>();
+        for (Attribute attribute : physicalPlanOutput) {
+            if (topLevelProject.outputSet().contains(attribute)
+                || orderRefsSet.contains(attribute)
+                || EsQueryExec.isDocAttribute(attribute)) {
+                expectedDataOutput.add(attribute);
+            }
+        }
+        FragmentExec updatedFragmentExec = fragmentExec.withFragment(new Project(Source.EMPTY, withAddedDocToRelation, expectedDataOutput));
+        ExchangeSinkExec updatedDataPlan = originalPlan.replaceChildAndUpdateOutput(updatedFragmentExec);
+
+        PhysicalPlan reductionPlan = toNonOptimizedPhysicalDataPlan(fragmentExec.fragment(), context).transformDown(
+            TopNExec.class,
+            topNExec -> topNExec.replaceChild(new ExchangeSourceExec(topN.source(), expectedDataOutput, false)).withSortedInput()
+        );
+        Alias handleAlias = new Alias(
+            Source.EMPTY,
+            fetchBoundary.handleAttribute().name(),
+            new FetchHandleFunction(Source.EMPTY, doc, localNodeId, retainedSessionId),
+            fetchBoundary.handleAttribute().id(),
+            true
+        );
+        PhysicalPlan withHandle = new EvalExec(Source.EMPTY, reductionPlan, List.of(handleAlias));
+        PhysicalPlan projected = new ProjectExec(Source.EMPTY, withHandle, fetchBoundary.handoffOutput());
+        PhysicalPlan sizedReductionPlan = EstimatesRowSize.estimateRowSize(updatedFragmentExec.estimatedRowSize(), projected);
+        return new ReductionPlan(originalPlan.replaceChild(sizedReductionPlan), updatedDataPlan);
     }
 
     /**

@@ -172,6 +172,7 @@ import org.elasticsearch.xpack.esql.plan.physical.ExchangeSinkExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSourceExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExternalFieldExtractExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExternalSourceExec;
+import org.elasticsearch.xpack.esql.plan.physical.FetchExec;
 import org.elasticsearch.xpack.esql.plan.physical.FieldExtractExec;
 import org.elasticsearch.xpack.esql.plan.physical.FilterExec;
 import org.elasticsearch.xpack.esql.plan.physical.FragmentExec;
@@ -194,7 +195,6 @@ import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
 import org.elasticsearch.xpack.esql.plan.physical.ProjectExec;
 import org.elasticsearch.xpack.esql.plan.physical.ReadDimsExec;
 import org.elasticsearch.xpack.esql.plan.physical.RegisteredDomainExec;
-import org.elasticsearch.xpack.esql.plan.physical.RemoteFetchExec;
 import org.elasticsearch.xpack.esql.plan.physical.SampleExec;
 import org.elasticsearch.xpack.esql.plan.physical.ShowExec;
 import org.elasticsearch.xpack.esql.plan.physical.SparklineGenerateEmptyBucketsExec;
@@ -212,10 +212,10 @@ import org.elasticsearch.xpack.esql.plan.physical.inference.RerankExec;
 import org.elasticsearch.xpack.esql.planner.EsPhysicalOperationProviders.ShardContext;
 import org.elasticsearch.xpack.esql.planner.mapper.Mapper;
 import org.elasticsearch.xpack.esql.plugin.EsqlPlugin;
+import org.elasticsearch.xpack.esql.plugin.FetchHandle;
+import org.elasticsearch.xpack.esql.plugin.FetchOperator;
+import org.elasticsearch.xpack.esql.plugin.FetchService;
 import org.elasticsearch.xpack.esql.plugin.QueryPragmas;
-import org.elasticsearch.xpack.esql.plugin.RemoteFetchHandle;
-import org.elasticsearch.xpack.esql.plugin.RemoteFetchOperator;
-import org.elasticsearch.xpack.esql.plugin.RemoteFetchService;
 import org.elasticsearch.xpack.esql.score.ScoreMapper;
 import org.elasticsearch.xpack.esql.session.Configuration;
 import org.elasticsearch.xpack.esql.session.EsqlCCSUtils;
@@ -274,7 +274,7 @@ public class LocalExecutionPlanner {
     private final AbstractPhysicalOperationProviders physicalOperationProviders;
     private final OperatorFactoryRegistry operatorFactoryRegistry;
     @Nullable
-    private final RemoteFetchService remoteFetchService;
+    private final FetchService fetchService;
     @Nullable
     private final Executor parallelWorkerExecutor;
     private final int esqlWorkerPoolSize;
@@ -298,7 +298,7 @@ public class LocalExecutionPlanner {
         ProjectResolver projectResolver,
         AbstractPhysicalOperationProviders physicalOperationProviders,
         OperatorFactoryRegistry operatorFactoryRegistry,
-        @Nullable RemoteFetchService remoteFetchService,
+        @Nullable FetchService fetchService,
         @Nullable Executor parallelWorkerExecutor,
         int esqlWorkerPoolSize,
         MatcherWatchdog grokMatcherWatchdog
@@ -321,7 +321,7 @@ public class LocalExecutionPlanner {
         this.projectResolver = projectResolver;
         this.physicalOperationProviders = physicalOperationProviders;
         this.operatorFactoryRegistry = operatorFactoryRegistry;
-        this.remoteFetchService = remoteFetchService;
+        this.fetchService = fetchService;
         this.parallelWorkerExecutor = parallelWorkerExecutor;
         this.esqlWorkerPoolSize = esqlWorkerPoolSize;
         // Resolved once by the caller from the live ClusterSettings (the setting is dynamic), then shared
@@ -398,8 +398,8 @@ public class LocalExecutionPlanner {
             return planUnpackDims(unpackDims, context);
         } else if (node instanceof ExternalFieldExtractExec extExtract) {
             return planExternalFieldExtract(extExtract, context);
-        } else if (node instanceof RemoteFetchExec remoteFetch) {
-            return planRemoteFetch(remoteFetch, context);
+        } else if (node instanceof FetchExec fetch) {
+            return planFetch(fetch, context);
         } else if (node instanceof ExchangeExec exchangeExec) {
             return planExchange(exchangeExec, context);
         } else if (node instanceof TopNExec topNExec) {
@@ -775,39 +775,29 @@ public class LocalExecutionPlanner {
         return source.with(factory, newLayout);
     }
 
-    private PhysicalOperation planRemoteFetch(RemoteFetchExec exec, LocalExecutionPlannerContext context) {
-        if (remoteFetchService == null) {
-            throw new IllegalStateException("RemoteFetchExec requires RemoteFetchService");
+    private PhysicalOperation planFetch(FetchExec exec, LocalExecutionPlannerContext context) {
+        if (fetchService == null) {
+            throw new IllegalStateException("FetchExec requires FetchService");
         }
         PhysicalOperation source = plan(exec.child(), context);
         Layout.ChannelAndType handle = source.layout.get(exec.handleAttribute().id());
         if (handle == null) {
-            throw new IllegalStateException(
-                "remote fetch handle attribute [" + exec.handleAttribute() + "] is not present in input layout"
-            );
+            throw new IllegalStateException("fetch handle attribute [" + exec.handleAttribute() + "] is not present in input layout");
         }
-        List<RemoteFetchService.FetchField> requestFields = exec.attributesToFetch()
-            .stream()
-            .map(attr -> new RemoteFetchService.FetchField(fieldName(attr), attr.dataType()))
-            .toList();
         PhysicalPlan pushdownPlan = exec.pushdownPlan();
         Layout layout = source.layout.builder().append(exec.fetchedOutputAttributes()).build();
         return source.with(
-            new RemoteFetchOperator.Factory(
+            new FetchOperator.Factory(
                 handle.channel(),
-                requestFields,
+                exec.extractionSpecs(),
                 exec.fetchedOutputAttributes(),
                 pushdownPlan,
                 configuration,
                 Math.max(1, context.queryPragmas().exchangeBufferSize()),
-                () -> remoteFetchService.newReleasingBatchExchangeClient(parentTask)
+                () -> fetchService.newReleasingBatchExchangeClient(parentTask)
             ),
             layout
         );
-    }
-
-    private static String fieldName(Attribute attr) {
-        return attr instanceof FieldAttribute fieldAttribute ? fieldAttribute.fieldName().string() : attr.name();
     }
 
     private PhysicalOperation planOutput(OutputExec outputExec, LocalExecutionPlannerContext context) {
@@ -1246,8 +1236,8 @@ public class LocalExecutionPlanner {
 
         ElementType[] elementTypes = new ElementType[source.layout.numberOfChannels()];
         TopNEncoder[] encoders = new TopNEncoder[source.layout.numberOfChannels()];
-        Set<NameId> remoteFetchHandleIds = inputAttributes.stream()
-            .filter(RemoteFetchHandle::isRemoteFetchHandleCarrier)
+        Set<NameId> fetchHandleIds = inputAttributes.stream()
+            .filter(FetchHandle::isAttribute)
             .map(Attribute::id)
             .collect(Collectors.toSet());
         List<Layout.ChannelSet> inverse = source.layout.inverse();
@@ -1255,9 +1245,9 @@ public class LocalExecutionPlanner {
             Layout.ChannelSet channelSet = inverse.get(channel);
             var fieldExtractPreference = fieldExtractPreference(docValuesAttributes, channelSet.nameIds());
             elementTypes[channel] = PlannerUtils.toElementType(channelSet.type(), fieldExtractPreference);
-            boolean remoteFetchHandleChannel = channelSet.nameIds().stream().anyMatch(remoteFetchHandleIds::contains);
+            boolean fetchHandleChannel = channelSet.nameIds().stream().anyMatch(fetchHandleIds::contains);
             // Handles use a keyword-shaped block to cross generic exchanges, but their contents are binary StreamOutput payloads.
-            encoders[channel] = remoteFetchHandleChannel
+            encoders[channel] = fetchHandleChannel
                 ? TopNEncoder.DEFAULT_UNSORTABLE
                 : TopNExec.encoder(channelSet.type(), context.shardContexts);
         }

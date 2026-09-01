@@ -106,13 +106,16 @@ final class RetainedSearchContextsRegistry {
         }
     }
 
+    void touch(String sessionId) {
+        Entry entry = entriesBySessionId.get(sessionId);
+        if (entry != null) {
+            entry.touch(relativeTimeInMillis.getAsLong());
+        }
+    }
+
     void expire() {
         long nowInMillis = relativeTimeInMillis.getAsLong();
-        entriesBySessionId.forEach((sessionId, entry) -> {
-            if (entry.isExpired(nowInMillis, keepAliveInMillis)) {
-                entry.closeRegistration();
-            }
-        });
+        entriesBySessionId.forEach((sessionId, entry) -> entry.expireIfIdle(nowInMillis, keepAliveInMillis));
     }
 
     private static final class Entry {
@@ -151,14 +154,22 @@ final class RetainedSearchContextsRegistry {
             refs.decRef();
         }
 
-        boolean isExpired(long nowInMillis, long keepAliveInMillis) {
+        synchronized void touch(long nowInMillis) {
+            if (registrationClosed.get() == false) {
+                lastAccessTimeInMillis.accumulateAndGet(nowInMillis, Math::max);
+            }
+        }
+
+        synchronized void expireIfIdle(long nowInMillis, long keepAliveInMillis) {
             // Expiry is only a backstop for abandoned registrations:
             // never expire while producer is still active, while registration is already closed,
             // or while any lease remains outstanding.
             if (registrationClosed.get() || producerActive.get() || refs.refCount() > 1) {
-                return false;
+                return;
             }
-            return nowInMillis - lastAccessTimeInMillis.get() > keepAliveInMillis;
+            if (nowInMillis - lastAccessTimeInMillis.get() > keepAliveInMillis) {
+                closeRegistration();
+            }
         }
 
         void finishRegistration(long nowInMillis) {
