@@ -873,7 +873,7 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                     );
                 }
             } catch (Exception e) {
-                listener.onFailure(e);
+                failWithoutStarting(request, listener, e);
                 return;
             }
         } else {

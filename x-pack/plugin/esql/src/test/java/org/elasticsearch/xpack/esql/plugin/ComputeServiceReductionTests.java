@@ -9,6 +9,7 @@ package org.elasticsearch.xpack.esql.plugin;
 
 import org.elasticsearch.TransportVersion;
 import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.compute.operator.PlanTimeProfile;
 import org.elasticsearch.compute.operator.topn.TopNOperator;
 import org.elasticsearch.index.IndexMode;
 import org.elasticsearch.test.ESTestCase;
@@ -49,6 +50,7 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.instanceOf;
+import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.startsWith;
 
 public class ComputeServiceReductionTests extends ESTestCase {
@@ -233,6 +235,33 @@ public class ComputeServiceReductionTests extends ESTestCase {
         assertThat(e.getMessage(), containsString("nested pipeline breaker"));
     }
 
+    public void testRemoteFetchBoundaryTakesPrecedenceWhenNodeLevelReductionIsDisabled() {
+        Configuration configuration = remoteFetchConfiguration();
+        ReductionPlan reduction = reduceRemoteFetch(configuration, remoteFetchDataPlan(configuration), false, true, null);
+
+        assertThat(reduction.nodeReducePlan().collect(TopNExec.class), hasSize(1));
+        assertThat(reduction.nodeReducePlan().collect(RemoteFetchBoundaryExec.class), hasSize(0));
+        assertThat(reduction.dataNodePlan().collect(RemoteFetchBoundaryExec.class), hasSize(0));
+    }
+
+    public void testRemoteFetchBoundaryTakesPrecedenceWhenBothOrdinaryReductionFlagsAreDisabled() {
+        Configuration configuration = remoteFetchConfiguration();
+        ReductionPlan reduction = reduceRemoteFetch(configuration, remoteFetchDataPlan(configuration), false, false, null);
+
+        assertThat(reduction.nodeReducePlan().collect(TopNExec.class), hasSize(1));
+        assertThat(reduction.nodeReducePlan().collect(RemoteFetchBoundaryExec.class), hasSize(0));
+        assertThat(reduction.dataNodePlan().collect(RemoteFetchBoundaryExec.class), hasSize(0));
+    }
+
+    public void testRemoteFetchBoundaryReductionRecordsProfilingTime() {
+        Configuration configuration = remoteFetchConfiguration();
+        PlanTimeProfile profile = new PlanTimeProfile();
+
+        reduceRemoteFetch(configuration, remoteFetchDataPlan(configuration), false, false, profile);
+
+        assertThat(profile, not(equalTo(new PlanTimeProfile())));
+    }
+
     private static PhysicalPlan distributedQueryPlan(Configuration configuration) {
         Map<String, EsField> mapping = Map.of(
             "hire_date",
@@ -255,18 +284,35 @@ public class ComputeServiceReductionTests extends ESTestCase {
         return EsqlTestUtils.configuration(new QueryPragmas(Settings.builder().put(QueryPragmas.REMOTE_FETCH_TOPN.getKey(), true).build()));
     }
 
+    private static ExchangeSinkExec remoteFetchDataPlan(Configuration configuration) {
+        return as(
+            PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(distributedQueryPlan(configuration), configuration).v2(),
+            ExchangeSinkExec.class
+        );
+    }
+
     private static ReductionPlan reduceRemoteFetch(Configuration configuration, ExchangeSinkExec dataPlan) {
+        return reduceRemoteFetch(configuration, dataPlan, true, true, null);
+    }
+
+    private static ReductionPlan reduceRemoteFetch(
+        Configuration configuration,
+        ExchangeSinkExec dataPlan,
+        boolean runNodeLevelReduction,
+        boolean reduceNodeLateMaterialization,
+        PlanTimeProfile profile
+    ) {
         return ComputeService.reductionPlan(
             PlannerSettings.DEFAULTS,
             new EsqlFlags(false),
             configuration,
             FoldContext.small(),
             dataPlan,
-            true,
-            true,
+            runNodeLevelReduction,
+            reduceNodeLateMaterialization,
             "node-a",
             "session-a[n]",
-            null
+            profile
         );
     }
 
