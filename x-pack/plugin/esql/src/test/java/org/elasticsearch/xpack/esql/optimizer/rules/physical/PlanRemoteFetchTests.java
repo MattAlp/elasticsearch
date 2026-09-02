@@ -190,6 +190,16 @@ public class PlanRemoteFetchTests extends ESTestCase {
         assertThat(optimized.toString(), optimized.collect(RemoteFetchBoundaryExec.class), hasSize(0));
     }
 
+    public void testDoesNotPlanUserEvalUsedAsTopNSortKey() {
+        PhysicalPlan optimized = distributedPlan(
+            configuration(true, true, MappedFieldType.FieldExtractPreference.NONE),
+            TransportVersion.current(),
+            "FROM employees | EVAL adjusted_salary = salary + 1 | SORT adjusted_salary | LIMIT 20 | KEEP adjusted_salary, emp_no"
+        );
+
+        assertThat(optimized.toString(), optimized.collect(RemoteFetchBoundaryExec.class), hasSize(0));
+    }
+
     public void testPlansSortExpressionUsedByTopN() {
         PhysicalPlan optimized = distributedPlan(
             configuration(true, true, MappedFieldType.FieldExtractPreference.NONE),

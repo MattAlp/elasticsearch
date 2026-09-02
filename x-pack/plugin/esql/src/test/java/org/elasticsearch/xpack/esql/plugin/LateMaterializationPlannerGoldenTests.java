@@ -98,6 +98,16 @@ public class LateMaterializationPlannerGoldenTests extends GoldenTestCase {
             """);
     }
 
+    public void testRemoteFetchTopNDoesNotPlanUserEvalSortKey() {
+        runRemoteFetchGoldenTest("""
+            FROM employees
+            | EVAL adjusted_salary = salary + 1
+            | SORT adjusted_salary
+            | LIMIT 20
+            | KEEP adjusted_salary, emp_no
+            """);
+    }
+
     public void testRemoteFetchTopNDoesNotPlanNestedPipelineBreaker() {
         runRemoteFetchGoldenTest("""
             FROM employees

@@ -191,17 +191,12 @@ public final class PlanRemoteFetch extends ParameterizedRule<PhysicalPlan, Physi
     }
 
     private static boolean hasProjectedEvalBeforeTopN(TopN topN, Project topLevelProject) {
-        // Synthetic evals used only by the sort are part of an eligible TopN. User-visible values computed before it must stay eager.
-        AttributeSet orderReferences = AttributeSet.of(topN.order().stream().flatMap(order -> order.references().stream()).toList());
+        // Optimizer-synthetic sort expressions are part of an eligible TopN. User-authored values computed before it must stay eager.
         return topN.child()
             .collect(Eval.class)
             .stream()
             .flatMap(eval -> eval.generatedAttributes().stream())
-            .anyMatch(
-                attribute -> attribute.synthetic() == false
-                    && topLevelProject.outputSet().contains(attribute)
-                    && orderReferences.contains(attribute) == false
-            );
+            .anyMatch(attribute -> attribute.synthetic() == false && topLevelProject.outputSet().contains(attribute));
     }
 
     private static boolean isSingleLocalRelation(TopN topN) {
