@@ -57,6 +57,7 @@ import org.elasticsearch.xpack.esql.datasources.Federation;
 import org.elasticsearch.xpack.esql.datasources.spi.ExternalSplit;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSinkExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
+import org.elasticsearch.xpack.esql.plan.physical.RemoteFetchBoundaryExec;
 import org.elasticsearch.xpack.esql.planner.PlanConcurrencyCalculator;
 import org.elasticsearch.xpack.esql.planner.PlannerSettings;
 import org.elasticsearch.xpack.esql.planner.PlannerUtils;
@@ -208,7 +209,8 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                             boolean enableReduceNodeLateMaterialization = EsqlCapabilities.Cap.ENABLE_REDUCE_NODE_LATE_MATERIALIZATION
                                 .isEnabled();
                             if (retainSearchContexts
-                                && connection.getTransportVersion().supports(DataNodeRequest.ESQL_REMOTE_FETCH_TOPN_REDUCTION) == false) {
+                                && connection.getTransportVersion()
+                                    .supports(RemoteFetchBoundaryExec.ESQL_REMOTE_FETCH_TOPN_REDUCTION) == false) {
                                 /*
                                  * The coordinator only plans remote-fetch TopN when the cluster-wide minimum transport version supports
                                  * it. Reaching this branch means the connection view changed after planning, or otherwise disagrees with
@@ -218,7 +220,7 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                                 l.onFailure(
                                     new IllegalStateException(
                                         "remote fetch TopN requires transport version ["
-                                            + DataNodeRequest.ESQL_REMOTE_FETCH_TOPN_REDUCTION
+                                            + RemoteFetchBoundaryExec.ESQL_REMOTE_FETCH_TOPN_REDUCTION
                                             + "] but node ["
                                             + connection.getNode().getName()
                                             + "] has ["

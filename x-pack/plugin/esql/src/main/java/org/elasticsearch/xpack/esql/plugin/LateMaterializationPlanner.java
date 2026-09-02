@@ -14,12 +14,8 @@ import org.elasticsearch.xpack.esql.core.expression.AttributeSet;
 import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.util.CollectionUtils;
-import org.elasticsearch.xpack.esql.optimizer.LocalLogicalOptimizerContext;
 import org.elasticsearch.xpack.esql.optimizer.LocalPhysicalOptimizerContext;
-import org.elasticsearch.xpack.esql.optimizer.rules.logical.local.ReplaceFieldWithConstantOrNull;
-import org.elasticsearch.xpack.esql.optimizer.rules.physical.local.InsertFieldExtraction;
 import org.elasticsearch.xpack.esql.optimizer.rules.physical.local.PushTopNToSource;
-import org.elasticsearch.xpack.esql.optimizer.rules.physical.local.ReplaceSourceAttributes;
 import org.elasticsearch.xpack.esql.plan.logical.EsRelation;
 import org.elasticsearch.xpack.esql.plan.logical.LimitBy;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
@@ -35,7 +31,7 @@ import org.elasticsearch.xpack.esql.plan.physical.LimitByExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
 import org.elasticsearch.xpack.esql.plan.physical.TopNByExec;
 import org.elasticsearch.xpack.esql.plan.physical.TopNExec;
-import org.elasticsearch.xpack.esql.planner.mapper.LocalMapper;
+import org.elasticsearch.xpack.esql.planner.PlannerUtils;
 import org.elasticsearch.xpack.esql.stats.SearchStats;
 
 import java.util.ArrayList;
@@ -220,7 +216,7 @@ class LateMaterializationPlanner {
         LogicalPlan pipelineBreaker = topLevelProject.child();
         LocalPhysicalOptimizerContext context = contextFactory.apply(SEARCH_STATS_LATE_MATERIALIZATION_REPLACEMENT);
 
-        List<Attribute> physicalPlanOutput = toNonOptimizedPhysicalDataPlan(pipelineBreaker, context).output();
+        List<Attribute> physicalPlanOutput = PlannerUtils.toPhysicalPlanForReductionSchema(pipelineBreaker, context).output();
         Attribute doc = physicalPlanOutput.stream().filter(EsQueryExec::isDocAttribute).findFirst().orElse(null);
         if (doc == null) {
             return null;
@@ -255,7 +251,7 @@ class LateMaterializationPlanner {
         ExchangeSinkExec updatedDataPlan = originalPlan.replaceChildAndUpdateOutput(updatedFragmentExec);
 
         PhysicalPlan reductionPlan = reductionPlanTransformer.apply(
-            toNonOptimizedPhysicalDataPlan(ctx.fragmentExec.fragment(), ctx.context)
+            PlannerUtils.toPhysicalPlanForReductionSchema(ctx.fragmentExec.fragment(), ctx.context)
         );
         PhysicalPlan sizedReductionPlan = EstimatesRowSize.estimateRowSize(updatedFragmentExec.estimatedRowSize(), reductionPlan);
         return new ReductionPlan(originalPlan.replaceChild(sizedReductionPlan), updatedDataPlan);
@@ -269,20 +265,6 @@ class LateMaterializationPlanner {
         List<Attribute> physicalPlanOutput,
         LogicalPlan withAddedDocToRelation
     ) {}
-
-    /**
-     * A stripped-down version of {@link org.elasticsearch.xpack.esql.planner.PlannerUtils#localPlan}, doing just the bare minimum to
-     * translate the logical plan to a physical one. This is needed here since we need to solidify the expected output between the data
-     * drivers and node-reduce one.
-     */
-    private static PhysicalPlan toNonOptimizedPhysicalDataPlan(LogicalPlan plan, LocalPhysicalOptimizerContext context) {
-        var logicalContext = new LocalLogicalOptimizerContext(context.configuration(), context.foldCtx(), context.searchStats());
-        // Replace NULL-typed fields (from UNMAPPED_FIELDS="NULLIFY") with constant nulls in the *data* node using
-        // ReplaceFieldWithConstantOrNull, so that InsertFieldExtraction in the *node-reduce* driver won't try to load them from the index.
-        // TODO: Do this in InsertFieldExtraction (See #146068) in the node-reduce driver instead.
-        LogicalPlan optimized = new ReplaceFieldWithConstantOrNull().apply(plan, logicalContext);
-        return new InsertFieldExtraction().apply(new ReplaceSourceAttributes().apply(LocalMapper.INSTANCE.map(optimized)), context);
-    }
 
     private LateMaterializationPlanner() { /* static class */ }
 

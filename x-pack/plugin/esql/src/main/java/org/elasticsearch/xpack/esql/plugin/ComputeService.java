@@ -86,6 +86,7 @@ import org.elasticsearch.xpack.esql.plan.physical.ExternalSourceExec;
 import org.elasticsearch.xpack.esql.plan.physical.FragmentExec;
 import org.elasticsearch.xpack.esql.plan.physical.OutputExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
+import org.elasticsearch.xpack.esql.plan.physical.RemoteFetchBoundaryExec;
 import org.elasticsearch.xpack.esql.plan.physical.TopNExec;
 import org.elasticsearch.xpack.esql.planner.EsPhysicalOperationProviders;
 import org.elasticsearch.xpack.esql.planner.ExplainPlanTransformer;
@@ -943,22 +944,14 @@ public class ComputeService {
         });
         Map<String, OriginalIndices> clusterToConcreteIndices = getIndices(resolvedPlan, EsRelation::concreteIndices);
         boolean hasConcreteIndices = clusterToConcreteIndices.values().stream().anyMatch(indices -> indices.indices().length > 0);
-        var distributedPlan = DistributedPlanner.plan(
-            plannerSettings.get(),
-            flags,
-            configuration,
-            foldContext,
-            resolvedPlan,
-            clusterToConcreteIndices,
-            clusterService.state().getMinTransportVersion()
-        );
-        PhysicalPlan coordinatorPlan = distributedPlan.coordinatorPlan();
+        var coordinatorAndDataNode = PlannerUtils.breakPlanBetweenCoordinatorAndDataNode(resolvedPlan, configuration);
+        PhysicalPlan coordinatorPlan = coordinatorAndDataNode.v1();
 
         if (exchangeSinkSupplier == null) {
             coordinatorPlan = new OutputExec(coordinatorPlan, collectedPages::add);
         }
 
-        PhysicalPlan dataNodePlan = distributedPlan.dataNodePlan();
+        PhysicalPlan dataNodePlan = coordinatorAndDataNode.v2();
         if (dataNodePlan != null && dataNodePlan instanceof ExchangeSinkExec == false) {
             assert false : "expected data node plan starts with an ExchangeSink; got " + dataNodePlan;
             listener.onFailure(new IllegalStateException("expected data node plan starts with an ExchangeSink; got " + dataNodePlan));
@@ -1033,7 +1026,9 @@ public class ComputeService {
         Map<String, OriginalIndices> clusterToOriginalIndices = getIndices(resolvedPlan, EsRelation::originalIndices);
         var localOriginalIndices = clusterToOriginalIndices.remove(LOCAL_CLUSTER);
         var localConcreteIndices = clusterToConcreteIndices.remove(LOCAL_CLUSTER);
-        final boolean retainSearchContexts = distributedPlan.retainSearchContexts();
+        final boolean retainSearchContexts = dataNodePlan.anyMatch(
+            plan -> plan instanceof RemoteFetchBoundaryExec boundary && boundary.requiresRetainedSearchContexts()
+        );
         /*
          * Grab the output attributes here, so we can pass them to
          * the listener without holding on to a reference to the
