@@ -9,6 +9,7 @@ package org.elasticsearch.xpack.esql.plan.physical;
 
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
+import org.elasticsearch.xpack.esql.core.expression.NameId;
 import org.elasticsearch.xpack.esql.core.expression.Nullability;
 import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
@@ -92,6 +93,75 @@ public class RemoteFetchBoundaryExecSerializationTests extends AbstractPhysicalP
         assertThat(e.getMessage(), containsString("invalid remote-fetch handle attribute"));
     }
 
+    public void testRejectsDocumentHandleNameIdCollision() {
+        NameId id = new NameId();
+        Attribute doc = doc(id);
+        Attribute handle = handle(id);
+        List<Attribute> eager = randomFieldAttributes(1, 4, false);
+        PhysicalPlan child = new ExchangeSourceExec(randomSource(), dataOutput(doc, eager), false);
+
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> new RemoteFetchBoundaryExec(randomSource(), child, doc, handle, eager)
+        );
+        assertThat(e.getMessage(), containsString("NameId collision"));
+    }
+
+    public void testRejectsDuplicateEagerNameIds() {
+        Attribute doc = doc();
+        Attribute handle = handle();
+        NameId id = new NameId();
+        List<Attribute> eager = List.of(attribute("first", id), attribute("second", id));
+        PhysicalPlan child = new ExchangeSourceExec(randomSource(), dataOutput(doc, eager), false);
+
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> new RemoteFetchBoundaryExec(randomSource(), child, doc, handle, eager)
+        );
+        assertThat(e.getMessage(), containsString("NameId collision"));
+    }
+
+    public void testRejectsEagerNameIdCollisionWithDocument() {
+        Attribute doc = doc();
+        Attribute handle = handle();
+        List<Attribute> eager = List.of(attribute("eager", doc.id()));
+        PhysicalPlan child = new ExchangeSourceExec(randomSource(), dataOutput(doc, eager), false);
+
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> new RemoteFetchBoundaryExec(randomSource(), child, doc, handle, eager)
+        );
+        assertThat(e.getMessage(), containsString("NameId collision"));
+    }
+
+    public void testRejectsEagerNameIdCollisionWithHandle() {
+        Attribute doc = doc();
+        Attribute handle = handle();
+        List<Attribute> eager = List.of(attribute("eager", handle.id()));
+        PhysicalPlan child = new ExchangeSourceExec(randomSource(), dataOutput(doc, eager), false);
+
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> new RemoteFetchBoundaryExec(randomSource(), child, doc, handle, eager)
+        );
+        assertThat(e.getMessage(), containsString("NameId collision"));
+    }
+
+    public void testRejectsChildDataAttributesThatCollideByNameId() {
+        Attribute doc = doc();
+        Attribute handle = handle();
+        NameId eagerId = new NameId();
+        List<Attribute> eager = List.of(attribute("expected", eagerId));
+        List<Attribute> childOutput = dataOutput(doc, List.of(attribute("different", eagerId)));
+        PhysicalPlan child = new ExchangeSourceExec(randomSource(), childOutput, false);
+
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> new RemoteFetchBoundaryExec(randomSource(), child, doc, handle, eager)
+        );
+        assertThat(e.getMessage(), containsString("child/data NameId collision"));
+    }
+
     @Override
     protected RemoteFetchBoundaryExec mutateInstance(RemoteFetchBoundaryExec instance) throws IOException {
         Attribute doc = instance.documentAttribute();
@@ -111,16 +181,20 @@ public class RemoteFetchBoundaryExecSerializationTests extends AbstractPhysicalP
         return new MetadataAttribute(Source.EMPTY, MetadataAttribute.DOC, DataType.DOC_DATA_TYPE, false);
     }
 
+    private static Attribute doc(NameId id) {
+        return new MetadataAttribute(Source.EMPTY, MetadataAttribute.DOC, DataType.DOC_DATA_TYPE, Nullability.TRUE, id, false, false);
+    }
+
     private static Attribute handle() {
-        return new ReferenceAttribute(
-            Source.EMPTY,
-            null,
-            RemoteFetchHandle.ATTRIBUTE_NAME,
-            DataType.KEYWORD,
-            Nullability.FALSE,
-            null,
-            true
-        );
+        return handle(null);
+    }
+
+    private static Attribute handle(NameId id) {
+        return new ReferenceAttribute(Source.EMPTY, null, RemoteFetchHandle.ATTRIBUTE_NAME, DataType.KEYWORD, Nullability.FALSE, id, true);
+    }
+
+    private static Attribute attribute(String name, NameId id) {
+        return new ReferenceAttribute(Source.EMPTY, null, name, DataType.LONG, Nullability.FALSE, id, false);
     }
 
     private static List<Attribute> dataOutput(Attribute doc, List<Attribute> eager) {

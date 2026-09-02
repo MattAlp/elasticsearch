@@ -33,6 +33,7 @@ import org.elasticsearch.xpack.esql.plan.physical.EsQueryExec;
 import org.elasticsearch.xpack.esql.plan.physical.EstimatesRowSize;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeExec;
 import org.elasticsearch.xpack.esql.plan.physical.FragmentExec;
+import org.elasticsearch.xpack.esql.plan.physical.FuseScoreEvalExec;
 import org.elasticsearch.xpack.esql.plan.physical.LimitByExec;
 import org.elasticsearch.xpack.esql.plan.physical.LimitExec;
 import org.elasticsearch.xpack.esql.plan.physical.MetricsInfoExec;
@@ -199,9 +200,11 @@ public final class PlanRemoteFetch extends ParameterizedRule<PhysicalPlan, Physi
     }
 
     private static boolean hasOtherPipelineBreaker(PhysicalPlan plan, TopNExec coordinatorTopN) {
+        // Physical plans have no PipelineBreaker marker. Keep this list aligned with Mapper's logical PipelineBreaker cases.
         return plan.anyMatch(
             candidate -> candidate != coordinatorTopN
                 && (candidate instanceof AggregateExec
+                    || candidate instanceof FuseScoreEvalExec
                     || candidate instanceof LimitExec
                     || candidate instanceof LimitByExec
                     || candidate instanceof MetricsInfoExec

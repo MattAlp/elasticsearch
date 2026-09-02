@@ -13,6 +13,7 @@ import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.AttributeSet;
+import org.elasticsearch.xpack.esql.core.expression.NameId;
 import org.elasticsearch.xpack.esql.core.tree.NodeInfo;
 import org.elasticsearch.xpack.esql.core.tree.NodeStringMapper;
 import org.elasticsearch.xpack.esql.core.tree.Source;
@@ -21,8 +22,9 @@ import org.elasticsearch.xpack.esql.plugin.RemoteFetchHandle;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -86,19 +88,62 @@ public final class RemoteFetchBoundaryExec extends UnaryExec {
         if (RemoteFetchHandle.isRemoteFetchHandleCarrier(handleAttribute) == false) {
             throw new IllegalArgumentException("invalid remote-fetch handle attribute [" + handleAttribute + "]");
         }
-        if (documentAttribute.equals(handleAttribute)) {
-            throw new IllegalArgumentException("remote-fetch document and handle attributes must be distinct");
-        }
-        if (new HashSet<>(eagerAttributes).size() != eagerAttributes.size()) {
-            throw new IllegalArgumentException("remote-fetch eager attributes must be unique");
-        }
-        if (eagerAttributes.contains(documentAttribute) || eagerAttributes.contains(handleAttribute)) {
-            throw new IllegalArgumentException("remote-fetch eager attributes must not contain the document or handle attribute");
-        }
-        if (child().output().equals(dataOutput) == false) {
+        List<Attribute> boundaryAttributes = new ArrayList<>(eagerAttributes.size() + 2);
+        boundaryAttributes.add(documentAttribute);
+        boundaryAttributes.add(handleAttribute);
+        boundaryAttributes.addAll(eagerAttributes);
+        validateUniqueNameIds("boundary attributes", boundaryAttributes);
+        validateUniqueNameIds("data output", dataOutput);
+        validateUniqueNameIds("handoff output", handoffOutput);
+        validateUniqueNameIds("child output", child().output());
+        validateChildDataContract();
+    }
+
+    private void validateChildDataContract() {
+        if (child().output().size() != dataOutput.size()) {
             throw new IllegalArgumentException(
                 "child output must match remote-fetch data output; child [" + child().output() + "], data output [" + dataOutput + "]"
             );
+        }
+        for (int i = 0; i < dataOutput.size(); i++) {
+            Attribute childAttribute = child().output().get(i);
+            Attribute dataAttribute = dataOutput.get(i);
+            if (childAttribute.id().equals(dataAttribute.id()) == false) {
+                throw new IllegalArgumentException(
+                    "child output must match remote-fetch data output; child [" + child().output() + "], data output [" + dataOutput + "]"
+                );
+            }
+            if (childAttribute.equals(dataAttribute) == false) {
+                throw new IllegalArgumentException(
+                    "remote-fetch child/data NameId collision ["
+                        + childAttribute.id()
+                        + "] identifies both ["
+                        + childAttribute
+                        + "] and ["
+                        + dataAttribute
+                        + "]"
+                );
+            }
+        }
+    }
+
+    private static void validateUniqueNameIds(String contract, List<Attribute> attributes) {
+        Map<NameId, Attribute> attributesById = new HashMap<>();
+        for (Attribute attribute : attributes) {
+            Attribute previous = attributesById.putIfAbsent(attribute.id(), attribute);
+            if (previous != null) {
+                throw new IllegalArgumentException(
+                    "remote-fetch "
+                        + contract
+                        + " NameId collision ["
+                        + attribute.id()
+                        + "] between ["
+                        + previous
+                        + "] and ["
+                        + attribute
+                        + "]"
+                );
+            }
         }
     }
 

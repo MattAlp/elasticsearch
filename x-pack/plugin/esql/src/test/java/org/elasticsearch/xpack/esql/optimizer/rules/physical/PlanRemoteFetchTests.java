@@ -9,6 +9,7 @@ package org.elasticsearch.xpack.esql.optimizer.rules.physical;
 
 import org.elasticsearch.TransportVersion;
 import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.compute.operator.fuse.RrfConfig;
 import org.elasticsearch.index.IndexMode;
 import org.elasticsearch.index.mapper.MappedFieldType;
 import org.elasticsearch.test.ESTestCase;
@@ -35,6 +36,7 @@ import org.elasticsearch.xpack.esql.plan.logical.TopN;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeSinkExec;
 import org.elasticsearch.xpack.esql.plan.physical.FragmentExec;
+import org.elasticsearch.xpack.esql.plan.physical.FuseScoreEvalExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
 import org.elasticsearch.xpack.esql.plan.physical.ProjectExec;
 import org.elasticsearch.xpack.esql.plan.physical.RemoteFetchBoundaryExec;
@@ -155,6 +157,55 @@ public class PlanRemoteFetchTests extends ESTestCase {
         assertThat(optimized.toString(), optimized.collect(RemoteFetchBoundaryExec.class), hasSize(0));
     }
 
+    public void testDoesNotPlanWithFuseScoreEvalPipelineBreaker() {
+        PhysicalPlan distributedTopN = distributedPlan(
+            configuration(false, true, MappedFieldType.FieldExtractPreference.NONE),
+            TransportVersion.current()
+        );
+        PhysicalPlan withFuse = new FuseScoreEvalExec(
+            Source.EMPTY,
+            distributedTopN,
+            distributedTopN.output().getFirst(),
+            distributedTopN.output().get(1),
+            RrfConfig.DEFAULT_CONFIG
+        );
+
+        PhysicalPlan optimized = applyRemoteFetch(withFuse);
+
+        assertThat(optimized.toString(), optimized.collect(RemoteFetchBoundaryExec.class), hasSize(0));
+    }
+
+    public void testDoesNotPlanNonEmptyRemoteConcreteIndexTopology() {
+        Attribute deferred = new FieldAttribute(
+            Source.EMPTY,
+            "deferred",
+            new EsField("deferred", DataType.LONG, Map.of(), true, EsField.TimeSeriesFieldType.NONE)
+        );
+        PhysicalPlan remotePlan = distributedTopNPlan(
+            deferred,
+            Map.of("remote", List.of("remote:test")),
+            Map.of("remote", List.of("test"))
+        );
+
+        PhysicalPlan optimized = applyRemoteFetch(remotePlan);
+
+        assertThat(optimized.collect(RemoteFetchBoundaryExec.class), hasSize(0));
+    }
+
+    public void testRestoresOutputWithoutTopLevelProject() {
+        PhysicalPlan original = distributedPlan(
+            configuration(false, true, MappedFieldType.FieldExtractPreference.NONE),
+            TransportVersion.current(),
+            "FROM employees | SORT hire_date | LIMIT 20"
+        );
+
+        PhysicalPlan optimized = applyRemoteFetch(original);
+
+        assertThat(optimized, instanceOf(ProjectExec.class));
+        assertThat(optimized.output(), equalTo(original.output()));
+        assertThat(optimized.collect(RemoteFetchBoundaryExec.class), hasSize(1));
+    }
+
     public void testDoesNotRemoteFetchScore() {
         PhysicalPlan optimized = distributedPlan(
             configuration(true, true, MappedFieldType.FieldExtractPreference.NONE),
@@ -227,6 +278,17 @@ public class PlanRemoteFetchTests extends ESTestCase {
     }
 
     private static void assertDeferredAttributeIsRejected(Attribute deferredAttribute) {
+        PhysicalPlan plan = distributedTopNPlan(deferredAttribute, Map.of("", List.of("test")), Map.of("", List.of("test")));
+
+        PhysicalPlan optimized = applyRemoteFetch(plan);
+        assertThat(optimized.collect(RemoteFetchBoundaryExec.class), hasSize(0));
+    }
+
+    private static PhysicalPlan distributedTopNPlan(
+        Attribute deferredAttribute,
+        Map<String, List<String>> originalIndices,
+        Map<String, List<String>> concreteIndices
+    ) {
         Attribute doc = new MetadataAttribute(Source.EMPTY, MetadataAttribute.DOC, DataType.DOC_DATA_TYPE, false);
         Attribute sort = new FieldAttribute(
             Source.EMPTY,
@@ -238,25 +300,22 @@ public class PlanRemoteFetchTests extends ESTestCase {
             Source.EMPTY,
             "test",
             IndexMode.STANDARD,
-            Map.of("", List.of("test")),
-            Map.of("", List.of("test")),
+            originalIndices,
+            concreteIndices,
             Map.of("test", new IndexProperties(IndexMode.STANDARD, 0)),
             List.of(doc, sort, deferredAttribute)
         );
         TopN topN = new TopN(Source.EMPTY, new Project(Source.EMPTY, relation, List.of(doc, sort)), order, EsqlTestUtils.of(10), false);
         Project dataProject = new Project(Source.EMPTY, topN, List.of(sort, deferredAttribute));
         ExchangeExec exchange = new ExchangeExec(Source.EMPTY, dataProject.output(), false, new FragmentExec(dataProject));
-        PhysicalPlan plan = new ProjectExec(
-            Source.EMPTY,
-            new TopNExec(Source.EMPTY, exchange, order, EsqlTestUtils.of(10), 0),
-            dataProject.output()
-        );
+        return new ProjectExec(Source.EMPTY, new TopNExec(Source.EMPTY, exchange, order, EsqlTestUtils.of(10), 0), dataProject.output());
+    }
 
-        PhysicalPlan optimized = new PlanRemoteFetch().apply(
+    private static PhysicalPlan applyRemoteFetch(PhysicalPlan plan) {
+        return new PlanRemoteFetch().apply(
             plan,
             new PhysicalOptimizerContext(configuration(true, true, MappedFieldType.FieldExtractPreference.NONE), TransportVersion.current())
         );
-        assertThat(optimized.collect(RemoteFetchBoundaryExec.class), hasSize(0));
     }
 
     private static <T> T as(Object value, Class<T> expectedType) {
