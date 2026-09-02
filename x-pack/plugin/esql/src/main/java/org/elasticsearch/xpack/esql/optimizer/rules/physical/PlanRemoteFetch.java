@@ -18,11 +18,15 @@ import org.elasticsearch.xpack.esql.core.expression.Nullability;
 import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
+import org.elasticsearch.xpack.esql.core.type.DateEsField;
 import org.elasticsearch.xpack.esql.core.type.EsField;
+import org.elasticsearch.xpack.esql.core.type.KeywordEsField;
+import org.elasticsearch.xpack.esql.core.type.TextEsField;
 import org.elasticsearch.xpack.esql.core.util.CollectionUtils;
 import org.elasticsearch.xpack.esql.optimizer.LocalPhysicalOptimizerContext;
 import org.elasticsearch.xpack.esql.optimizer.PhysicalOptimizerContext;
 import org.elasticsearch.xpack.esql.plan.logical.EsRelation;
+import org.elasticsearch.xpack.esql.plan.logical.Eval;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.PipelineBreaker;
 import org.elasticsearch.xpack.esql.plan.logical.Project;
@@ -63,7 +67,6 @@ import static org.elasticsearch.transport.RemoteClusterAware.isRemoteIndexName;
  * Plans coordinator-driven remote fetch while the coordinator and data-node sides still share one physical plan.
  */
 public final class PlanRemoteFetch extends ParameterizedRule<PhysicalPlan, PhysicalPlan, PhysicalOptimizerContext> {
-
     @Override
     public PhysicalPlan apply(PhysicalPlan plan, PhysicalOptimizerContext context) {
         if (context.configuration().pragmas().remoteFetchTopN() == false
@@ -142,7 +145,9 @@ public final class PlanRemoteFetch extends ParameterizedRule<PhysicalPlan, Physi
         if ((exchangeChild instanceof FragmentExec fragmentExec)
             && fragmentExec.fragment() instanceof Project topLevelProject
             && topLevelProject.child() instanceof TopN topN) {
-            if (topN.child().anyMatch(PipelineBreaker.class::isInstance) || isSingleLocalRelation(topN) == false) {
+            if (topN.child().anyMatch(PipelineBreaker.class::isInstance)
+                || hasProjectedEvalBeforeTopN(topN, topLevelProject)
+                || isSingleLocalRelation(topN) == false) {
                 return Optional.empty();
             }
             LocalPhysicalOptimizerContext localContext = new LocalPhysicalOptimizerContext(
@@ -185,6 +190,20 @@ public final class PlanRemoteFetch extends ParameterizedRule<PhysicalPlan, Physi
         return Optional.empty();
     }
 
+    private static boolean hasProjectedEvalBeforeTopN(TopN topN, Project topLevelProject) {
+        // Synthetic evals used only by the sort are part of an eligible TopN. User-visible values computed before it must stay eager.
+        AttributeSet orderReferences = AttributeSet.of(topN.order().stream().flatMap(order -> order.references().stream()).toList());
+        return topN.child()
+            .collect(Eval.class)
+            .stream()
+            .flatMap(eval -> eval.generatedAttributes().stream())
+            .anyMatch(
+                attribute -> attribute.synthetic() == false
+                    && topLevelProject.outputSet().contains(attribute)
+                    && orderReferences.contains(attribute) == false
+            );
+    }
+
     private static boolean isSingleLocalRelation(TopN topN) {
         List<EsRelation> relations = topN.collect(EsRelation.class);
         if (relations.size() != 1) {
@@ -223,7 +242,13 @@ public final class PlanRemoteFetch extends ParameterizedRule<PhysicalPlan, Physi
             return false;
         }
         if (attribute instanceof FieldAttribute fieldAttribute) {
-            return fieldAttribute.field().getClass() == EsField.class;
+            // The fetch request preserves only name and type. These are the normal mapped-field implementations with direct loaders;
+            // every other subclass carries specialized extraction or conversion semantics that cannot be reconstructed remotely.
+            Class<? extends EsField> fieldClass = fieldAttribute.field().getClass();
+            return fieldClass == EsField.class
+                || fieldClass == KeywordEsField.class
+                || fieldClass == TextEsField.class
+                || fieldClass == DateEsField.class;
         }
         return attribute.getClass() == MetadataAttribute.class && MetadataAttribute.SCORE.equals(attribute.name()) == false;
     }

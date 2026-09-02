@@ -22,9 +22,12 @@ import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
 import org.elasticsearch.xpack.esql.core.expression.TemporalityAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
+import org.elasticsearch.xpack.esql.core.type.DateEsField;
 import org.elasticsearch.xpack.esql.core.type.EsField;
+import org.elasticsearch.xpack.esql.core.type.KeywordEsField;
 import org.elasticsearch.xpack.esql.core.type.MultiTypeEsField;
 import org.elasticsearch.xpack.esql.core.type.PotentiallyUnmappedKeywordEsField;
+import org.elasticsearch.xpack.esql.core.type.TextEsField;
 import org.elasticsearch.xpack.esql.expression.Order;
 import org.elasticsearch.xpack.esql.index.EsIndexGenerator;
 import org.elasticsearch.xpack.esql.index.IndexProperties;
@@ -157,6 +160,46 @@ public class PlanRemoteFetchTests extends ESTestCase {
         assertThat(optimized.toString(), optimized.collect(RemoteFetchBoundaryExec.class), hasSize(0));
     }
 
+    public void testDoesNotPlanAggregationAfterTopN() {
+        PhysicalPlan optimized = distributedPlan(
+            configuration(true, true, MappedFieldType.FieldExtractPreference.NONE),
+            TransportVersion.current(),
+            "FROM employees | SORT hire_date | LIMIT 20 | STATS max_salary = MAX(salary)"
+        );
+
+        assertThat(optimized.toString(), optimized.collect(RemoteFetchBoundaryExec.class), hasSize(0));
+    }
+
+    public void testDoesNotPlanAggregationBelowTopN() {
+        PhysicalPlan optimized = distributedPlan(
+            configuration(true, true, MappedFieldType.FieldExtractPreference.NONE),
+            TransportVersion.current(),
+            "FROM employees | STATS max_salary = MAX(salary) BY hire_date | SORT max_salary DESC | LIMIT 20"
+        );
+
+        assertThat(optimized.toString(), optimized.collect(RemoteFetchBoundaryExec.class), hasSize(0));
+    }
+
+    public void testDoesNotPlanExpressionBeforeTopN() {
+        PhysicalPlan optimized = distributedPlan(
+            configuration(true, true, MappedFieldType.FieldExtractPreference.NONE),
+            TransportVersion.current(),
+            "FROM employees | EVAL adjusted_salary = salary + 1 | SORT hire_date | LIMIT 20 | KEEP hire_date, adjusted_salary, emp_no"
+        );
+
+        assertThat(optimized.toString(), optimized.collect(RemoteFetchBoundaryExec.class), hasSize(0));
+    }
+
+    public void testPlansSortExpressionUsedByTopN() {
+        PhysicalPlan optimized = distributedPlan(
+            configuration(true, true, MappedFieldType.FieldExtractPreference.NONE),
+            TransportVersion.current(),
+            "FROM employees | SORT salary + 1 | LIMIT 20 | KEEP hire_date, salary, emp_no"
+        );
+
+        assertThat(optimized.toString(), optimized.collect(RemoteFetchBoundaryExec.class), hasSize(1));
+    }
+
     public void testDoesNotPlanWithFuseScoreEvalPipelineBreaker() {
         PhysicalPlan distributedTopN = distributedPlan(
             configuration(false, true, MappedFieldType.FieldExtractPreference.NONE),
@@ -214,6 +257,22 @@ public class PlanRemoteFetchTests extends ESTestCase {
         );
 
         assertThat(optimized.collect(RemoteFetchBoundaryExec.class), hasSize(0));
+    }
+
+    public void testPlansNormalMappedFieldImplementations() {
+        List<EsField> fields = List.of(
+            new KeywordEsField("deferred", Map.of(), true, 32766, false, false, EsField.TimeSeriesFieldType.NONE),
+            new TextEsField("deferred", Map.of(), false, false, EsField.TimeSeriesFieldType.NONE),
+            DateEsField.dateEsField("deferred", Map.of(), true, EsField.TimeSeriesFieldType.NONE)
+        );
+        for (EsField field : fields) {
+            Attribute deferred = new FieldAttribute(Source.EMPTY, "deferred", field);
+            PhysicalPlan plan = distributedTopNPlan(deferred, Map.of("", List.of("test")), Map.of("", List.of("test")));
+
+            PhysicalPlan optimized = applyRemoteFetch(plan);
+
+            assertThat(field.getClass().getSimpleName(), optimized.collect(RemoteFetchBoundaryExec.class), hasSize(1));
+        }
     }
 
     public void testDoesNotPlanSpecializedOrTemporalExtractionSemantics() {

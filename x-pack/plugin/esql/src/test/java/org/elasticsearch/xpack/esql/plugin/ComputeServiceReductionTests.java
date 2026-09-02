@@ -213,6 +213,7 @@ public class ComputeServiceReductionTests extends ESTestCase {
             () -> reduceRemoteFetch(configuration, dataPlan.replaceChild(malformedBoundary))
         );
         assertThat(e.getMessage(), containsString("expected direct Fragment child"));
+        assertThat(e.getMessage(), not(containsString(malformedBoundary.toString())));
     }
 
     public void testReductionRejectsNestedPipelineBreakerBelowRemoteFetchTopN() {
@@ -233,6 +234,7 @@ public class ComputeServiceReductionTests extends ESTestCase {
             () -> reduceRemoteFetch(configuration, dataPlan.replaceChild(malformedBoundary))
         );
         assertThat(e.getMessage(), containsString("nested pipeline breaker"));
+        assertThat(e.getMessage(), not(containsString(malformedBoundary.toString())));
     }
 
     public void testRemoteFetchBoundaryTakesPrecedenceWhenNodeLevelReductionIsDisabled() {
