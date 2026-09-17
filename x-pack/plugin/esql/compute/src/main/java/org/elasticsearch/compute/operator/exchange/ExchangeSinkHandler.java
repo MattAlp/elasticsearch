@@ -166,13 +166,7 @@ public final class ExchangeSinkHandler {
                 }
                 response = tracker == null || page == null
                     ? new ExchangeResponse(blockFactory, page, buffer.isFinished())
-                    : new ExchangeResponse(
-                        blockFactory,
-                        page,
-                        buffer.isFinished(),
-                        tracker.serializedBytes::addAndGet,
-                        tracker::responseFinished
-                    );
+                    : new ExchangeResponse(blockFactory, page, buffer.isFinished(), tracker);
             } finally {
                 promised.release();
             }
@@ -248,7 +242,7 @@ public final class ExchangeSinkHandler {
         }
     }
 
-    private static class ProfileTracker {
+    private static class ProfileTracker implements ExchangeResponse.ProfileListener {
         private final AtomicLong pages = new AtomicLong();
         private final AtomicLong rows = new AtomicLong();
         private final AtomicLong serializedBytes = new AtomicLong();
@@ -260,7 +254,13 @@ public final class ExchangeSinkHandler {
             inFlightResponses.incrementAndGet();
         }
 
-        private void responseFinished() {
+        @Override
+        public void onSerialized(long bytes) {
+            serializedBytes.addAndGet(bytes);
+        }
+
+        @Override
+        public void onReleased() {
             if (inFlightResponses.decrementAndGet() == 0) {
                 completeIfFinished();
             }

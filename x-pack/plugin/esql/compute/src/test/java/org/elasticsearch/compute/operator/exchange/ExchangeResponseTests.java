@@ -45,7 +45,18 @@ public class ExchangeResponseTests extends ComputeTestCase {
         }
         Page page = new Page(blocks);
         AtomicLong serializedBytes = new AtomicLong();
-        ExchangeResponse response = new ExchangeResponse(factory, page, randomBoolean(), serializedBytes::addAndGet);
+        AtomicLong releases = new AtomicLong();
+        ExchangeResponse response = new ExchangeResponse(factory, page, randomBoolean(), new ExchangeResponse.ProfileListener() {
+            @Override
+            public void onSerialized(long bytes) {
+                serializedBytes.addAndGet(bytes);
+            }
+
+            @Override
+            public void onReleased() {
+                releases.incrementAndGet();
+            }
+        });
         long beforeUsage = factory.breaker().getUsed();
         assertThat(page.ramBytesUsedByBlocks(), equalTo(beforeUsage));
         try (BytesStreamOutput output = new BytesStreamOutput()) {
@@ -56,6 +67,7 @@ public class ExchangeResponseTests extends ComputeTestCase {
         assertThat(afterUsage, equalTo(beforeUsage * 2L));
         response.close();
         assertThat(factory.breaker().getUsed(), equalTo(0L));
+        assertThat(releases.get(), equalTo(1L));
     }
 
     public void testProfileCompletionWaitsForLastSerializedResponse() throws Exception {
@@ -90,5 +102,73 @@ public class ExchangeResponseTests extends ComputeTestCase {
         retainedResponse.get().close();
         completion.actionGet();
         assertThat(handler.profile(), equalTo(new ExchangeSinkHandler.Profile(1L, 10L, serializedBytes.get())));
+    }
+
+    public void testProfileCompletionWaitsForReleasedUnserializedResponse() {
+        BlockFactory factory = blockFactory();
+        ExchangeSinkHandler handler = new ExchangeSinkHandler(factory, 1, System::currentTimeMillis);
+        handler.enableProfiling();
+        ExchangeSink sink = handler.createExchangeSink(() -> {});
+        sink.addPage(new Page(factory.newConstantIntBlockWith(1, 10)));
+        sink.finish();
+
+        PlainActionFuture<Void> completion = new PlainActionFuture<>();
+        handler.addProfileCompletionListener(completion);
+        AtomicReference<ExchangeResponse> retainedResponse = new AtomicReference<>();
+        handler.fetchPageAsync(false, ActionListener.wrap(response -> {
+            response.incRef();
+            retainedResponse.set(response);
+        }, completion::onFailure));
+        handler.fetchPageAsync(false, ActionListener.noop());
+
+        assertFalse(completion.isDone());
+        retainedResponse.get().close();
+        completion.actionGet();
+        assertThat(handler.profile(), equalTo(new ExchangeSinkHandler.Profile(1L, 10L, 0L)));
+    }
+
+    public void testProfileDisabledUsesNormalCompletion() {
+        BlockFactory factory = blockFactory();
+        ExchangeSinkHandler handler = new ExchangeSinkHandler(factory, 1, System::currentTimeMillis);
+        ExchangeSink sink = handler.createExchangeSink(() -> {});
+        sink.addPage(new Page(factory.newConstantIntBlockWith(1, 10)));
+        sink.finish();
+
+        PlainActionFuture<Void> completion = new PlainActionFuture<>();
+        handler.addProfileCompletionListener(completion);
+        handler.fetchPageAsync(false, ActionListener.noop());
+        handler.fetchPageAsync(false, ActionListener.noop());
+
+        completion.actionGet();
+        assertThat(handler.profile(), equalTo(ExchangeSinkHandler.Profile.EMPTY));
+        assertThat(factory.breaker().getUsed(), equalTo(0L));
+    }
+
+    public void testProfileCompletionAfterConsumerFinishesEarly() {
+        BlockFactory factory = blockFactory();
+        ExchangeSinkHandler handler = new ExchangeSinkHandler(factory, 1, System::currentTimeMillis);
+        handler.enableProfiling();
+        ExchangeSink sink = handler.createExchangeSink(() -> {});
+        sink.addPage(new Page(factory.newConstantIntBlockWith(1, 10)));
+
+        PlainActionFuture<Void> completion = new PlainActionFuture<>();
+        handler.addProfileCompletionListener(completion);
+        handler.fetchPageAsync(true, ActionListener.noop());
+
+        completion.actionGet();
+        assertThat(handler.profile(), equalTo(ExchangeSinkHandler.Profile.EMPTY));
+        assertThat(factory.breaker().getUsed(), equalTo(0L));
+    }
+
+    public void testProfileCompletionPropagatesFailure() {
+        ExchangeSinkHandler handler = new ExchangeSinkHandler(blockFactory(), 1, System::currentTimeMillis);
+        handler.enableProfiling();
+        AtomicReference<Exception> actualFailure = new AtomicReference<>();
+        handler.addProfileCompletionListener(ActionListener.wrap(ignored -> fail("expected failure"), actualFailure::set));
+
+        Exception expectedFailure = new IllegalStateException("failure");
+        handler.onFailure(expectedFailure);
+
+        assertSame(expectedFailure, actualFailure.get());
     }
 }
