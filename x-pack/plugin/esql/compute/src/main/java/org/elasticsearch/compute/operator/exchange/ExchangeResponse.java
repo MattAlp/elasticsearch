@@ -19,29 +19,48 @@ import org.elasticsearch.transport.TransportResponse;
 
 import java.io.IOException;
 import java.util.Objects;
+import java.util.function.LongConsumer;
 
 public final class ExchangeResponse extends TransportResponse implements Releasable {
+    private static final Runnable NOOP_ON_CLOSE = () -> {};
+
     private final RefCounted counted = AbstractRefCounted.of(this::closeInternal);
     private final Page page;
     private final boolean finished;
     private boolean pageTaken;
     private final BlockFactory blockFactory;
+    @Nullable
+    private final LongConsumer serializedBytesConsumer;
+    private final Runnable onClose;
     private long reservedBytes = 0;
 
     public ExchangeResponse(BlockFactory blockFactory, Page page, boolean finished) {
+        this(blockFactory, page, finished, null, NOOP_ON_CLOSE);
+    }
+
+    ExchangeResponse(BlockFactory blockFactory, Page page, boolean finished, LongConsumer serializedBytesConsumer) {
+        this(blockFactory, page, finished, serializedBytesConsumer, NOOP_ON_CLOSE);
+    }
+
+    ExchangeResponse(BlockFactory blockFactory, Page page, boolean finished, LongConsumer serializedBytesConsumer, Runnable onClose) {
         this.blockFactory = blockFactory;
         this.page = page;
         this.finished = finished;
+        this.serializedBytesConsumer = serializedBytesConsumer;
+        this.onClose = onClose;
     }
 
     public ExchangeResponse(BlockStreamInput in) throws IOException {
         this.blockFactory = in.blockFactory();
         this.page = in.readOptionalWriteable(Page::new);
         this.finished = in.readBoolean();
+        this.serializedBytesConsumer = null;
+        this.onClose = NOOP_ON_CLOSE;
     }
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
+        long startPosition = serializedBytesConsumer == null ? 0L : out.position();
         if (page != null) {
             long bytes = page.ramBytesUsedByBlocks();
             blockFactory.breaker().addEstimateBytesAndMaybeBreak(bytes, "serialize exchange response");
@@ -49,6 +68,9 @@ public final class ExchangeResponse extends TransportResponse implements Releasa
         }
         out.writeOptionalWriteable(page);
         out.writeBoolean(finished);
+        if (serializedBytesConsumer != null) {
+            serializedBytesConsumer.accept(out.position() - startPosition);
+        }
     }
 
     /**
@@ -119,9 +141,13 @@ public final class ExchangeResponse extends TransportResponse implements Releasa
     }
 
     private void closeInternal() {
-        blockFactory.breaker().addWithoutBreaking(-reservedBytes);
-        if (pageTaken == false && page != null) {
-            page.releaseBlocks();
+        try {
+            blockFactory.breaker().addWithoutBreaking(-reservedBytes);
+            if (pageTaken == false && page != null) {
+                page.releaseBlocks();
+            }
+        } finally {
+            onClose.run();
         }
     }
 }

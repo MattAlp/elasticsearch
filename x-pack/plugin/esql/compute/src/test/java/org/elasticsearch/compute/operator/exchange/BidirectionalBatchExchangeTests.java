@@ -264,8 +264,16 @@ public class BidirectionalBatchExchangeTests extends ESTestCase {
             BidirectionalBatchExchangeClient.Profile profile = client.profile();
             assertThat(profile.totalSetupNanos(), greaterThan(0L));
             assertThat(profile.maxSetupNanos(), greaterThan(0L));
-            assertThat(profile.serverProfiles().size(), equalTo(createdWorkerNodeIds.size()));
-            assertTrue(profile.serverProfiles().stream().allMatch(serverProfile -> serverProfile.driverTookNanos() > 0L));
+            assertThat(profile.workers().size(), equalTo(createdWorkerNodeIds.size()));
+            assertTrue(profile.workers().stream().allMatch(worker -> worker.setupNanos() > 0L));
+            assertTrue(profile.workers().stream().allMatch(worker -> worker.request().pages() > 0L));
+            assertTrue(profile.workers().stream().allMatch(worker -> worker.request().rows() > 0L));
+            assertTrue(profile.workers().stream().allMatch(worker -> worker.request().serializedBytes() > 0L));
+            assertTrue(profile.workers().stream().allMatch(worker -> worker.server() != null));
+            assertTrue(profile.workers().stream().allMatch(worker -> worker.server().driverTookNanos() > 0L));
+            assertTrue(profile.workers().stream().allMatch(worker -> worker.server().responsePages() > 0L));
+            assertTrue(profile.workers().stream().allMatch(worker -> worker.server().responseRows() > 0L));
+            assertTrue(profile.workers().stream().allMatch(worker -> worker.server().responseSerializedBytes() > 0L));
 
             // Verify results and release pages
             verifyResultsAndReleasePages(
@@ -723,6 +731,7 @@ public class BidirectionalBatchExchangeTests extends ESTestCase {
             infra.numServers(), // maxWorkers
             () -> serverNodes.get(serverNodeIndex.getAndIncrement() % serverNodes.size()) // serverNodeSupplier
         );
+        client.enableProfiling();
         logger.debug("[TEST-CLIENT] Client initialized successfully");
 
         return client;

@@ -127,7 +127,7 @@ public final class BatchExchangeStatusResponse extends TransportResponse {
     }
 
     /**
-     * Compact profile of a batch exchange server driver and its source loading work.
+     * Compact profile of a batch exchange server driver and its exchange traffic.
      */
     public record Profile(
         long driverTookNanos,
@@ -136,11 +136,48 @@ public final class BatchExchangeStatusResponse extends TransportResponse {
         long fieldLoadNanos,
         long sourceDocsLoaded,
         long sourceFieldReads,
-        long sourceBytesLoaded
+        long sourceBytesLoaded,
+        long responsePages,
+        long responseRows,
+        long responseSerializedBytes
     ) implements org.elasticsearch.common.io.stream.Writeable {
 
         public Profile(StreamInput in) throws IOException {
-            this(in.readVLong(), in.readVLong(), in.readVLong(), in.readVLong(), in.readVLong(), in.readVLong(), in.readVLong());
+            this(
+                in.readVLong(),
+                in.readVLong(),
+                in.readVLong(),
+                in.readVLong(),
+                in.readVLong(),
+                in.readVLong(),
+                in.readVLong(),
+                in.readVLong(),
+                in.readVLong(),
+                in.readVLong()
+            );
+        }
+
+        public Profile(
+            long driverTookNanos,
+            long driverCpuNanos,
+            long valuesLoaded,
+            long fieldLoadNanos,
+            long sourceDocsLoaded,
+            long sourceFieldReads,
+            long sourceBytesLoaded
+        ) {
+            this(
+                driverTookNanos,
+                driverCpuNanos,
+                valuesLoaded,
+                fieldLoadNanos,
+                sourceDocsLoaded,
+                sourceFieldReads,
+                sourceBytesLoaded,
+                0L,
+                0L,
+                0L
+            );
         }
 
         /**
@@ -148,8 +185,9 @@ public final class BatchExchangeStatusResponse extends TransportResponse {
          *
          * @param driverProfile completed driver profile
          * @param driverTookNanos elapsed time measured from client-ready driver dispatch rather than driver construction
+         * @param responseProfile output exchange traffic sent back to the client
          */
-        public static Profile from(DriverProfile driverProfile, long driverTookNanos) {
+        public static Profile from(DriverProfile driverProfile, long driverTookNanos, ExchangeSinkHandler.Profile responseProfile) {
             long valuesLoaded = 0L;
             long fieldLoadNanos = 0L;
             long sourceDocsLoaded = 0L;
@@ -171,7 +209,10 @@ public final class BatchExchangeStatusResponse extends TransportResponse {
                 fieldLoadNanos,
                 sourceDocsLoaded,
                 sourceFieldReads,
-                sourceBytesLoaded
+                sourceBytesLoaded,
+                responseProfile.pages(),
+                responseProfile.rows(),
+                responseProfile.serializedBytes()
             );
         }
 
@@ -184,6 +225,9 @@ public final class BatchExchangeStatusResponse extends TransportResponse {
             out.writeVLong(sourceDocsLoaded);
             out.writeVLong(sourceFieldReads);
             out.writeVLong(sourceBytesLoaded);
+            out.writeVLong(responsePages);
+            out.writeVLong(responseRows);
+            out.writeVLong(responseSerializedBytes);
         }
     }
 
