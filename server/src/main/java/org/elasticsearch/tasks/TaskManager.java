@@ -9,6 +9,10 @@
 
 package org.elasticsearch.tasks;
 
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.context.Context;
+
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.util.SetOnce;
@@ -32,6 +36,7 @@ import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.telemetry.tracing.Tracer;
+import org.elasticsearch.telemetry.tracing.TracingContext;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.transport.TaskTransportChannel;
 import org.elasticsearch.transport.TcpChannel;
@@ -86,6 +91,29 @@ public class TaskManager implements ClusterStateApplier {
     private DiscoveryNodes lastDiscoveryNodes = DiscoveryNodes.EMPTY_NODES;
 
     private final Tracer tracer;
+    private final String traceNodeName;
+    private final String traceClusterName;
+    private io.opentelemetry.api.trace.Tracer nativeTracer;
+
+    /** Installs the node-owned provider at bootstrap; task code never owns SDK lifecycle. */
+    public void setOpenTelemetry(OpenTelemetry openTelemetry) {
+        if (openTelemetry == OpenTelemetry.noop()) {
+            return;
+        }
+        if (nativeTracer != null) {
+            throw new IllegalStateException("native tracing already configured");
+        }
+        nativeTracer = openTelemetry.getTracer("elasticsearch.tasks");
+    }
+
+    /** Activates a borrowed task context for one execution slice without ending the task's span. */
+    public Releasable withTaskContext(Task task) {
+        var context = threadPool.getThreadContext();
+        if (nativeTracer != null) {
+            return TracingContext.activate(context, task.getTraceContext());
+        }
+        return context.hasApmTraceContext() || context.hasParentApmTraceContext() ? tracer.withScope(task) : () -> {};
+    }
 
     private final ByteSizeValue maxHeaderSize;
     private final Map<TcpChannel, ChannelPendingTaskTracker> channelPendingTaskTrackers = ConcurrentCollections.newConcurrentMap();
@@ -111,6 +139,8 @@ public class TaskManager implements ClusterStateApplier {
         this.maxHeaderSize = SETTING_HTTP_MAX_HEADER_SIZE.get(settings);
         this.tracer = tracer;
         this.nodeId = nodeId;
+        this.traceNodeName = settings.get("node.name", nodeId);
+        this.traceClusterName = settings.get("cluster.name", "elasticsearch");
     }
 
     public void setTaskResultsService(TaskResultsService taskResultsService) {
@@ -182,6 +212,30 @@ public class TaskManager implements ClusterStateApplier {
      * For REST actions this will be the case, otherwise {@link Tracer#startTrace} can be used.
      */
     void maybeStartTrace(ThreadContext threadContext, Task task) {
+        if (nativeTracer != null) {
+            Context parent = TracingContext.current(threadContext);
+            if (Span.fromContext(parent).getSpanContext().isValid()) {
+                var builder = nativeTracer.spanBuilder(task.getAction())
+                    .setParent(parent)
+                    .setAttribute(Tracer.AttributeKeys.TASK_ID, task.getId())
+                    .setAttribute(Tracer.AttributeKeys.NODE_NAME, traceNodeName)
+                    .setAttribute(Tracer.AttributeKeys.CLUSTER_NAME, traceClusterName)
+                    .setAttribute("es.node.id", nodeId);
+                if (task.getParentTaskId().isSet()) {
+                    builder.setAttribute(Tracer.AttributeKeys.PARENT_TASK_ID, task.getParentTaskId().toString());
+                }
+                String opaqueId = threadContext.getHeader(Task.X_OPAQUE_ID_HTTP_HEADER);
+                if (opaqueId != null) {
+                    builder.setAttribute("es.x-opaque-id", opaqueId);
+                }
+                String project = threadContext.getHeader(Task.X_ELASTIC_PROJECT_ID_HTTP_HEADER);
+                if (project != null) {
+                    builder.setAttribute("elasticsearch.project.id", project);
+                }
+                task.setTraceContext(TracingContext.withSpan(parent, builder.startSpan()));
+            }
+            return;
+        }
         if (threadContext.hasParentApmTraceContext() == false && threadContext.getTransient(Task.PARENT_TRACE_PARENT_HEADER) == null) {
             return;
         }
@@ -199,6 +253,10 @@ public class TaskManager implements ClusterStateApplier {
         Transport.Connection localConnection,
         ActionListener<Response> taskListener
     ) {
+        final var parentListener = org.elasticsearch.action.support.ContextPreservingActionListener.wrapPreservingContext(
+            taskListener,
+            threadPool.getThreadContext()
+        );
         final Releasable unregisterChildNode;
         if (request.getParentTask().isSet()) {
             unregisterChildNode = registerChildConnection(request.getParentTask().getId(), localConnection);
@@ -214,37 +272,40 @@ public class TaskManager implements ClusterStateApplier {
                 Releasables.close(unregisterChildNode);
                 throw e;
             }
-            action.execute(task, request, new ActionListener<>() {
-                @Override
-                public void onResponse(Response response) {
-                    try {
-                        release();
-                    } finally {
-                        taskListener.onResponse(response);
-                    }
-                }
-
-                @Override
-                public void onFailure(Exception e) {
-                    try {
-                        if (request.getParentTask().isSet()) {
-                            cancelChildLocal(request.getParentTask(), request.getRequestId(), e.toString());
+            try (var scope = withTaskContext(task)) {
+                action.execute(task, request, new ActionListener<>() {
+                    @Override
+                    public void onResponse(Response response) {
+                        try {
+                            release();
+                        } finally {
+                            parentListener.onResponse(response);
                         }
-                        release();
-                    } finally {
-                        taskListener.onFailure(e);
                     }
-                }
 
-                @Override
-                public String toString() {
-                    return this.getClass().getName() + "{" + taskListener + "}{" + task + "}";
-                }
+                    @Override
+                    public void onFailure(Exception e) {
+                        task.recordTraceFailure(e);
+                        try {
+                            if (request.getParentTask().isSet()) {
+                                cancelChildLocal(request.getParentTask(), request.getRequestId(), e.toString());
+                            }
+                            release();
+                        } finally {
+                            parentListener.onFailure(e);
+                        }
+                    }
 
-                private void release() {
-                    Releasables.close(unregisterChildNode, () -> unregister(task));
-                }
-            });
+                    @Override
+                    public String toString() {
+                        return this.getClass().getName() + "{" + taskListener + "}{" + task + "}";
+                    }
+
+                    private void release() {
+                        Releasables.close(unregisterChildNode, () -> unregister(task));
+                    }
+                });
+            }
             return task;
         }
     }
@@ -353,7 +414,11 @@ public class TaskManager implements ClusterStateApplier {
                 return removedTask;
             }
         } finally {
-            tracer.stopTrace(task); // stop trace if started / known by tracer
+            if (nativeTracer != null) {
+                task.finishTrace();
+            } else {
+                tracer.stopTrace(task);
+            }
             for (RemovedTaskListener listener : removedTaskListeners) {
                 listener.onRemoved(task);
             }

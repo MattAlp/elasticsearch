@@ -185,7 +185,7 @@ public class AsyncTaskManagementService<
             @SuppressWarnings("unchecked")
             T searchTask = (T) taskManager.register("transport", action + "[a]", new AsyncRequestWrapper(request, nodeId));
             boolean operationStarted = false;
-            try {
+            try (var scope = taskManager.withTaskContext(searchTask)) {
                 operation.execute(
                     request,
                     searchTask,

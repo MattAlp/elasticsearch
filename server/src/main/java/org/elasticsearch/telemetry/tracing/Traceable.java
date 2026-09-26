@@ -9,10 +9,17 @@
 
 package org.elasticsearch.telemetry.tracing;
 
+import io.opentelemetry.context.Context;
+
 /**
  * A class that can be traced using the telemetry tracing API
  */
 public interface Traceable {
+    /** Borrows a native context without transferring ownership of the operation's completion. */
+    default Context getTraceContext() {
+        return Context.root();
+    }
+
     /**
      * A consistent id for the span.  Should be structured "[short-name]-[unique-id]" ie "request-abc1234"
      */

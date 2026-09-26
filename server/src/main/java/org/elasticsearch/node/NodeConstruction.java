@@ -772,6 +772,7 @@ class NodeConstruction {
             telemetryProvider.getTracer(),
             nodeEnvironment.nodeId()
         );
+        taskManager.setOpenTelemetry(telemetryProvider.getOpenTelemetry());
 
         ClusterService clusterService = createClusterService(settingsModule, threadPool, taskManager, telemetryProvider.getMeterRegistry());
         clusterService.addStateApplier(scriptService);

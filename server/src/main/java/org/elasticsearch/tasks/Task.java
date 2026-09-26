@@ -9,6 +9,10 @@
 
 package org.elasticsearch.tasks;
 
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.StatusCode;
+import io.opentelemetry.context.Context;
+
 import org.elasticsearch.action.ActionResponse;
 import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.common.io.stream.NamedWriteable;
@@ -19,6 +23,7 @@ import org.elasticsearch.xcontent.ToXContentObject;
 
 import java.io.IOException;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 
@@ -89,6 +94,46 @@ public class Task implements Traceable {
     );
 
     private final long id;
+
+    private volatile Context traceContext = Context.root();
+    private boolean traceFinished;
+    private boolean traceFailed;
+
+    @Override
+    public Context getTraceContext() {
+        return traceContext;
+    }
+
+    /** Attaches the task-owned span before execution starts; callers may only borrow its context. */
+    public void setTraceContext(Context context) {
+        traceContext = Objects.requireNonNull(context);
+    }
+
+    /** Completes the task-owned span once, including duplicate unregister attempts. */
+    public synchronized void finishTrace() {
+        if (traceFinished == false) {
+            traceFinished = true;
+            if (traceFailed == false) {
+                Span.fromContext(traceContext)
+                    .setAttribute("es.outcome", this instanceof CancellableTask task && task.isCancelled() ? "cancelled" : "success");
+            }
+            Span.fromContext(traceContext).end();
+        }
+    }
+
+    /** Records terminal failure without attaching unbounded exception stacks or changing span ownership. */
+    public synchronized void recordTraceFailure(Exception failure) {
+        if (traceFinished == false) {
+            traceFailed = true;
+            Span span = Span.fromContext(traceContext);
+            boolean cancelled = failure instanceof TaskCancelledException;
+            span.setAttribute("es.outcome", cancelled ? "cancelled" : "failure");
+            span.setAttribute("error.type", failure.getClass().getName());
+            if (cancelled == false) {
+                span.setStatus(StatusCode.ERROR);
+            }
+        }
+    }
 
     private final String type;
 

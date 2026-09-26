@@ -143,6 +143,28 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
         return traceSupplier.get();
     }
 
+    /** Allows boundary instrumentation to avoid allocating local roots while recording is disabled. */
+    public boolean isEnabled() {
+        return enabled;
+    }
+
+    /** Reuses the legacy metadata and redaction policy while native instrumentation owns its span. */
+    public void decorateSpan(TraceContext context, Map<String, Object> attributes, SpanBuilder builder) {
+        setSpanAttributes(context, attributes, builder);
+    }
+
+    private Context contextFor(Traceable traceable) {
+        Context nativeContext = traceable.getTraceContext();
+        return nativeContext != null && Span.fromContext(nativeContext).getSpanContext().isValid()
+            ? nativeContext
+            : spans.get(traceable.getSpanId());
+    }
+
+    private Span spanFor(Traceable traceable) {
+        Context context = contextFor(traceable);
+        return context == null ? null : Span.fromContext(context);
+    }
+
     public CompletableResultCode attemptFlushTraces() {
         if (enabled == false) {
             return CompletableResultCode.ofSuccess();
@@ -411,8 +433,8 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
      */
     @Override
     public Releasable withScope(Traceable traceable) {
-        final Context context = spans.get(traceable.getSpanId());
-        if (context != null && Span.fromContextOrNull(context).isRecording()) {
+        final Context context = contextFor(traceable);
+        if (context != null) {
             return context.makeCurrent()::close;
         }
         return () -> {};
@@ -474,7 +496,7 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
 
     @Override
     public void addError(Traceable traceable, Throwable throwable) {
-        final var span = Span.fromContextOrNull(spans.get(traceable.getSpanId()));
+        final var span = spanFor(traceable);
         if (span == null) {
             return;
         }
@@ -489,7 +511,7 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
 
     @Override
     public void setAttribute(Traceable traceable, String key, boolean value) {
-        final var span = Span.fromContextOrNull(spans.get(traceable.getSpanId()));
+        final var span = spanFor(traceable);
         if (span != null) {
             span.setAttribute(key, value);
         }
@@ -497,7 +519,7 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
 
     @Override
     public void setAttribute(Traceable traceable, String key, double value) {
-        final var span = Span.fromContextOrNull(spans.get(traceable.getSpanId()));
+        final var span = spanFor(traceable);
         if (span != null) {
             span.setAttribute(key, value);
         }
@@ -505,7 +527,7 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
 
     @Override
     public void setAttribute(Traceable traceable, String key, long value) {
-        final var span = Span.fromContextOrNull(spans.get(traceable.getSpanId()));
+        final var span = spanFor(traceable);
         if (span != null) {
             span.setAttribute(key, value);
         }
@@ -513,14 +535,14 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
 
     @Override
     public void setAttribute(Traceable traceable, String key, String value) {
-        final var span = Span.fromContextOrNull(spans.get(traceable.getSpanId()));
+        final var span = spanFor(traceable);
         if (span != null) {
             span.setAttribute(key, value);
         }
     }
 
     public void setAttributes(Traceable traceable, Attributes attributes) {
-        final var span = Span.fromContextOrNull(spans.get(traceable.getSpanId()));
+        final var span = spanFor(traceable);
         if (span != null) {
             span.setAllAttributes(attributes);
         }
@@ -528,14 +550,14 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
 
     @Override
     public void setStatusToError(Traceable traceable, String description) {
-        final var span = Span.fromContextOrNull(spans.get(traceable.getSpanId()));
+        final var span = spanFor(traceable);
         if (span != null) {
             span.setStatus(StatusCode.ERROR, description);
         }
     }
 
     public SpanStatusBuilder spanStatusBuilder(Traceable traceable) {
-        final var span = Span.fromContextOrNull(spans.get(traceable.getSpanId()));
+        final var span = spanFor(traceable);
         return span == null ? NoopSpanStatusBuilder.INSTANCE : new APMSpanStatusBuilder(span);
     }
 
@@ -560,7 +582,8 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
     @Override
     public void stopTrace(Traceable traceable) {
         final String spanId = traceable.getSpanId();
-        final var span = Span.fromContextOrNull(spans.remove(spanId));
+        Context context = spans.remove(spanId);
+        final var span = context == null ? null : Span.fromContext(context);
         if (span != null) {
             logger.trace("Finishing trace [{}]", spanId);
             span.end();
@@ -583,7 +606,7 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
 
     @Override
     public void addEvent(Traceable traceable, String eventName) {
-        final var span = Span.fromContextOrNull(spans.get(traceable.getSpanId()));
+        final var span = spanFor(traceable);
         if (span != null) {
             span.addEvent(eventName);
         }

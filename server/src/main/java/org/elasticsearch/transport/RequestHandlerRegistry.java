@@ -82,9 +82,14 @@ public class RequestHandlerRegistry<Request extends TransportRequest> implements
                 final Releasable stopTracking = taskManager.startTrackingCancellableChannelTask(tcpChannel, cancellableTask);
                 unregisterTask = Releasables.wrap(unregisterTask, stopTracking);
             }
-            final TaskTransportChannel taskTransportChannel = new TaskTransportChannel(task.getId(), channel, assertOnce(unregisterTask));
-            handler.messageReceived(request, taskTransportChannel, task);
+            final TaskTransportChannel taskTransportChannel = new TaskTransportChannel(task, channel, assertOnce(unregisterTask));
+            try (var scope = taskManager.withTaskContext(task)) {
+                handler.messageReceived(request, taskTransportChannel, task);
+            }
             unregisterTask = null;
+        } catch (Exception failure) {
+            task.recordTraceFailure(failure);
+            throw failure;
         } finally {
             Releasables.close(unregisterTask);
         }

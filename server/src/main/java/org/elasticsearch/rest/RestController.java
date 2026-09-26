@@ -734,7 +734,14 @@ public class RestController implements HttpServerTransport.Dispatcher {
                 } else {
                     startTrace(threadContext, channel, handlers.getPath());
                     var decoratedChannel = new MeteringRestChannelDecorator(channel, requestsCounter, handler.getConcreteRestHandler());
-                    maybeAggregateAndDispatchRequest(request, decoratedChannel, handler, handlers, threadContext);
+                    try (
+                        var scope = org.elasticsearch.telemetry.tracing.TracingContext.activate(
+                            threadContext,
+                            channel.request().getTraceContext()
+                        )
+                    ) {
+                        maybeAggregateAndDispatchRequest(request, decoratedChannel, handler, handlers, threadContext);
+                    }
                     return;
                 }
             }

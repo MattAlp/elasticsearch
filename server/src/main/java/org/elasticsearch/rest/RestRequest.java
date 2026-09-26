@@ -9,6 +9,9 @@
 
 package org.elasticsearch.rest;
 
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.context.Context;
+
 import org.apache.lucene.util.SetOnce;
 import org.elasticsearch.ElasticsearchParseException;
 import org.elasticsearch.ElasticsearchStatusException;
@@ -43,6 +46,7 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
@@ -100,6 +104,33 @@ public class RestRequest implements ToXContent.Params, Traceable {
     private boolean contentConsumed = false;
 
     private final long requestId;
+
+    private volatile Context traceContext = Context.root();
+    private boolean traceStarted;
+    private boolean traceFinished;
+
+    @Override
+    public Context getTraceContext() {
+        return traceContext;
+    }
+
+    /** Attaches the request-owned span once, even when error handling re-enters instrumentation. */
+    public synchronized boolean setTraceContext(Context context) {
+        if (traceStarted) {
+            return false;
+        }
+        traceStarted = true;
+        traceContext = Objects.requireNonNull(context);
+        return true;
+    }
+
+    /** Ends the HTTP span once, independently of any background query task. */
+    public synchronized void finishTrace() {
+        if (traceFinished == false) {
+            traceFinished = true;
+            Span.fromContext(traceContext).end();
+        }
+    }
 
     public boolean isContentConsumed() {
         return contentConsumed;

@@ -9,6 +9,7 @@
 
 package org.elasticsearch.telemetry.apm.internal.tracing;
 
+import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator;
 import io.opentelemetry.context.propagation.ContextPropagators;
@@ -19,27 +20,217 @@ import io.opentelemetry.sdk.trace.data.SpanData;
 import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
 import io.opentelemetry.sdk.trace.samplers.Sampler;
 
+import org.elasticsearch.TransportVersion;
+import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.ActionResponse;
+import org.elasticsearch.action.support.PlainActionFuture;
+import org.elasticsearch.cluster.node.VersionInformation;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.concurrent.AbstractRunnable;
 import org.elasticsearch.common.util.concurrent.ThreadContext;
 import org.elasticsearch.tasks.Task;
 import org.elasticsearch.tasks.TaskManager;
 import org.elasticsearch.telemetry.tracing.Traceable;
+import org.elasticsearch.telemetry.tracing.TracingContext;
 import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.test.transport.MockTransportService;
 import org.elasticsearch.threadpool.TestThreadPool;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.transport.EmptyRequest;
+import org.elasticsearch.transport.TransportResponseHandler;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 /** Native and legacy instrumentation share one SDK and preserve context across asynchronous boundaries. */
 public class NativeTracingTests extends ESTestCase {
+    public void testConcurrentQueriesAcrossTcpAndDeferredCallbacks() throws Exception {
+        try (Fixture fixture = new Fixture(Settings.EMPTY, Sampler.alwaysOn(), 10)) {
+            ThreadPool threadPool = new TestThreadPool("native-tcp-probe");
+            try (
+                MockTransportService sender = MockTransportService.createNewService(
+                    Settings.builder().put("node.name", "sender").build(),
+                    VersionInformation.CURRENT,
+                    TransportVersion.current(),
+                    threadPool
+                );
+                MockTransportService receiver = MockTransportService.createNewService(
+                    Settings.builder().put("node.name", "receiver").build(),
+                    VersionInformation.CURRENT,
+                    TransportVersion.current(),
+                    threadPool
+                );
+                var worker = Executors.newSingleThreadExecutor()
+            ) {
+                sender.getTaskManager().setOpenTelemetry(fixture.sdk);
+                receiver.getTaskManager().setOpenTelemetry(fixture.sdk);
+                sender.start();
+                receiver.start();
+                sender.acceptIncomingRequests();
+                receiver.acceptIncomingRequests();
+                var callbacks = new ConcurrentLinkedQueue<Runnable>();
+                var arrived = new CountDownLatch(2);
+                sender.registerRequestHandler("internal:trace/ack", threadPool.generic(), EmptyRequest::new, (request, channel, task) -> {
+                    assertEquals(
+                        task.getTraceContext(),
+                        org.elasticsearch.telemetry.tracing.TracingContext.current(threadPool.getThreadContext())
+                    );
+                    channel.sendResponse(ActionResponse.Empty.INSTANCE);
+                });
+                receiver.registerRequestHandler(
+                    "internal:trace/work",
+                    threadPool.generic(),
+                    EmptyRequest::new,
+                    (request, channel, task) -> {
+                        String traceId = Span.current().getSpanContext().getTraceId();
+                        callbacks.add(threadPool.getThreadContext().preserveContext(() -> {
+                            assertEquals(traceId, Span.current().getSpanContext().getTraceId());
+                            Span callback = fixture.sdk.getTracer("probe").spanBuilder("deferred-callback").startSpan();
+                            try (var scope = callback.makeCurrent()) {
+                                receiver.sendRequest(
+                                    sender.getLocalNode(),
+                                    "internal:trace/ack",
+                                    new EmptyRequest(),
+                                    TransportResponseHandler.empty(threadPool.generic(), ActionListener.wrap(ignored -> {
+                                        assertEquals(traceId, Span.current().getSpanContext().getTraceId());
+                                        callback.end();
+                                        channel.sendResponse(ActionResponse.Empty.INSTANCE);
+                                    }, failure -> {
+                                        callback.end();
+                                        channel.sendResponse(failure);
+                                    }))
+                                );
+                            }
+                        }));
+                        arrived.countDown();
+                    }
+                );
+                try (
+                    org.elasticsearch.core.Releasable outbound = safeAwait(
+                        listener -> sender.connectToNode(receiver.getLocalNode(), listener)
+                    );
+                    org.elasticsearch.core.Releasable inbound = safeAwait(
+                        listener -> receiver.connectToNode(sender.getLocalNode(), listener)
+                    )
+                ) {
+                    List<Span> queries = new ArrayList<>();
+                    List<PlainActionFuture<Void>> results = new ArrayList<>();
+                    for (String name : List.of("query-a", "query-b")) {
+                        Span query = fixture.sdk.getTracer("probe").spanBuilder(name).setNoParent().startSpan();
+                        queries.add(query);
+                        var result = new PlainActionFuture<Void>();
+                        results.add(result);
+                        try (var stored = threadPool.getThreadContext().newStoredContext(); var scope = query.makeCurrent()) {
+                            threadPool.getThreadContext().putHeader(Task.X_OPAQUE_ID_HTTP_HEADER, name);
+                            sender.sendRequest(
+                                receiver.getLocalNode(),
+                                "internal:trace/work",
+                                new EmptyRequest(),
+                                TransportResponseHandler.empty(threadPool.generic(), result)
+                            );
+                        }
+                    }
+                    assertTrue(arrived.await(10, TimeUnit.SECONDS));
+                    for (Runnable callback : callbacks) {
+                        worker.submit(callback).get(10, TimeUnit.SECONDS);
+                    }
+                    for (PlainActionFuture<Void> result : results) {
+                        result.get(10, TimeUnit.SECONDS);
+                    }
+                    queries.forEach(Span::end);
+                    assertBusy(() -> assertEquals(8, fixture.exporter.getFinishedSpanItems().size()));
+                    for (Span query : queries) {
+                        var trace = fixture.exporter.getFinishedSpanItems()
+                            .stream()
+                            .filter(span -> span.getTraceId().equals(query.getSpanContext().getTraceId()))
+                            .toList();
+                        assertEquals(4, trace.size());
+                        SpanData work = trace.stream()
+                            .filter(span -> span.getName().equals("internal:trace/work"))
+                            .findFirst()
+                            .orElseThrow();
+                        SpanData callback = trace.stream()
+                            .filter(span -> span.getName().equals("deferred-callback"))
+                            .findFirst()
+                            .orElseThrow();
+                        SpanData ack = trace.stream().filter(span -> span.getName().equals("internal:trace/ack")).findFirst().orElseThrow();
+                        assertEquals(query.getSpanContext().getSpanId(), work.getParentSpanId());
+                        assertEquals(work.getSpanId(), callback.getParentSpanId());
+                        assertEquals(callback.getSpanId(), ack.getParentSpanId());
+                        String opaqueId = trace.stream()
+                            .filter(span -> span.getName().startsWith("query-"))
+                            .findFirst()
+                            .orElseThrow()
+                            .getName();
+                        assertEquals(opaqueId, work.getAttributes().get(AttributeKey.stringKey("es.x-opaque-id")));
+                        assertEquals(opaqueId, ack.getAttributes().get(AttributeKey.stringKey("es.x-opaque-id")));
+                    }
+                    assertBusy(() -> assertTrue(sender.getTaskManager().getTasks().isEmpty()));
+                    assertBusy(() -> assertTrue(receiver.getTaskManager().getTasks().isEmpty()));
+                    worker.submit(() -> assertFalse(Span.current().getSpanContext().isValid())).get(10, TimeUnit.SECONDS);
+                }
+            } finally {
+                terminate(threadPool);
+            }
+        }
+    }
+
+    public void testNativeTaskOwnershipAndLocalInstrumentation() {
+        try (Fixture fixture = new Fixture(Settings.EMPTY, Sampler.alwaysOn(), 10)) {
+            ThreadPool threadPool = new TestThreadPool("native-task-probe");
+            try {
+                ThreadContext context = threadPool.getThreadContext();
+                context.putHeader(Task.TRACE_PARENT_HTTP_HEADER, "00-11111111111111111111111111111111-2222222222222222-01");
+                String opaqueId = randomBoolean() ? randomAlphaOfLength(12) : null;
+                if (opaqueId != null) {
+                    context.putHeader(Task.X_OPAQUE_ID_HTTP_HEADER, opaqueId);
+                }
+                TaskManager manager = new TaskManager(Settings.EMPTY, threadPool, Set.of(), fixture.tracer);
+                manager.setOpenTelemetry(fixture.sdk);
+                Task task;
+                try (var incoming = context.newTraceContext()) {
+                    task = manager.register("transport", "native-task", new EmptyRequest());
+                    try (var activation = manager.withTaskContext(task)) {
+                        Span local = fixture.sdk.getTracer("probe").spanBuilder("native-child").startSpan();
+                        try (
+                            var scope = TracingContext.activate(
+                                context,
+                                TracingContext.withSpan(io.opentelemetry.context.Context.current(), local)
+                            )
+                        ) {
+                            try (var nested = context.newTraceContext()) {
+                                Task child = manager.register("transport", "native-action", new EmptyRequest());
+                                manager.unregister(child);
+                            }
+                        } finally {
+                            local.end();
+                        }
+                        assertTrue(Span.current().isRecording());
+                    }
+                    assertFalse(Span.current().getSpanContext().isValid());
+                    manager.unregister(task);
+                    manager.unregister(task);
+                }
+                assertEquals(3, fixture.exporter.getFinishedSpanItems().size());
+                assertEquals("2222222222222222", fixture.span("native-task").getParentSpanId());
+                assertEquals(fixture.span("native-task").getSpanId(), fixture.span("native-child").getParentSpanId());
+                assertEquals(fixture.span("native-child").getSpanId(), fixture.span("native-action").getParentSpanId());
+                assertEquals(opaqueId, fixture.span("native-task").getAttributes().get(AttributeKey.stringKey("es.x-opaque-id")));
+                assertEquals(opaqueId, fixture.span("native-action").getAttributes().get(AttributeKey.stringKey("es.x-opaque-id")));
+                assertTrue(fixture.tracer.getSpans().isEmpty());
+            } finally {
+                terminate(threadPool);
+            }
+        }
+    }
+
     public void testLegacyContextOnlyPairOwnsItsChild() {
         try (Fixture fixture = new Fixture(Settings.EMPTY, Sampler.alwaysOn(), 10)) {
             Traceable parent = () -> "parent";
@@ -210,6 +401,78 @@ public class NativeTracingTests extends ESTestCase {
                 }
             }
             assertTrue(fixture.tracer.getSpans().isEmpty());
+        }
+    }
+
+    public void testSynchronousTransportHandlerFailureIsRecordedBeforeCompletion() throws Exception {
+        try (Fixture fixture = new Fixture(Settings.EMPTY, Sampler.alwaysOn(), 10)) {
+            ThreadPool threadPool = new TestThreadPool("throwing-handler");
+            try (
+                var sender = MockTransportService.createNewService(
+                    Settings.builder().put("node.name", "sender").build(),
+                    VersionInformation.CURRENT,
+                    TransportVersion.current(),
+                    threadPool
+                );
+                var receiver = MockTransportService.createNewService(
+                    Settings.builder().put("node.name", "receiver").build(),
+                    VersionInformation.CURRENT,
+                    TransportVersion.current(),
+                    threadPool
+                )
+            ) {
+                sender.getTaskManager().setOpenTelemetry(fixture.sdk);
+                receiver.getTaskManager().setOpenTelemetry(fixture.sdk);
+                sender.start();
+                receiver.start();
+                sender.acceptIncomingRequests();
+                receiver.acceptIncomingRequests();
+                String action = "internal:trace/throw";
+                receiver.registerRequestHandler(action, threadPool.generic(), EmptyRequest::new, (request, channel, task) -> {
+                    throw new IllegalStateException("handler failed before sending a response");
+                });
+                try (
+                    org.elasticsearch.core.Releasable connection = safeAwait(
+                        listener -> sender.connectToNode(receiver.getLocalNode(), listener)
+                    )
+                ) {
+                    Span root = fixture.sdk.getTracer("test").spanBuilder("request").startSpan();
+                    try {
+                        var result = new PlainActionFuture<Void>();
+                        try (var scope = root.makeCurrent()) {
+                            sender.sendRequest(
+                                receiver.getLocalNode(),
+                                action,
+                                new EmptyRequest(),
+                                TransportResponseHandler.empty(threadPool.generic(), result)
+                            );
+                        }
+                        var failure = expectThrows(java.util.concurrent.ExecutionException.class, () -> result.get(10, TimeUnit.SECONDS));
+                        assertEquals(
+                            "handler failed before sending a response",
+                            org.elasticsearch.ExceptionsHelper.unwrapCause(failure.getCause()).getMessage()
+                        );
+                        assertBusy(() -> {
+                            SpanData recorded = fixture.span(action);
+                            assertEquals(io.opentelemetry.api.trace.StatusCode.ERROR, recorded.getStatus().getStatusCode());
+                            assertEquals(
+                                "failure",
+                                recorded.getAttributes().get(io.opentelemetry.api.common.AttributeKey.stringKey("es.outcome"))
+                            );
+                            assertEquals(
+                                IllegalStateException.class.getName(),
+                                recorded.getAttributes().get(io.opentelemetry.api.common.AttributeKey.stringKey("error.type"))
+                            );
+                            assertEquals(root.getSpanContext().getSpanId(), recorded.getParentSpanId());
+                            assertTrue(receiver.getTaskManager().getTasks().isEmpty());
+                        });
+                    } finally {
+                        root.end();
+                    }
+                }
+            } finally {
+                terminate(threadPool);
+            }
         }
     }
 

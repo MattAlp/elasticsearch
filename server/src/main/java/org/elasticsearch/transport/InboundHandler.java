@@ -123,18 +123,25 @@ public class InboundHandler {
         try (var ignored = threadContext.newStoredContext()) {
             // Place the context with the headers from the message
             threadContext.setHeaders(header.getHeaders());
-            threadContext.putTransient("_remote_address", remoteAddress);
-            if (header.isRequest()) {
-                handleRequest(channel, /* autocloses absent exception */ message);
-            } else {
-                // Responses do not support short circuiting currently
-                assert message.isShortCircuit() == false;
-                responseHandler = findResponseHandler(header);
-                // ignore if its null, the service logs it
-                if (responseHandler != null) {
-                    executeResponseHandler( /* autocloses absent exception */ message, responseHandler, remoteAddress);
+            try (
+                var tracing = org.elasticsearch.telemetry.tracing.TracingContext.activate(
+                    threadContext,
+                    org.elasticsearch.telemetry.tracing.TracingContext.extract(threadContext)
+                )
+            ) {
+                threadContext.putTransient("_remote_address", remoteAddress);
+                if (header.isRequest()) {
+                    handleRequest(channel, /* autocloses absent exception */ message);
                 } else {
-                    message.close();
+                    // Responses do not support short circuiting currently
+                    assert message.isShortCircuit() == false;
+                    responseHandler = findResponseHandler(header);
+                    // ignore if its null, the service logs it
+                    if (responseHandler != null) {
+                        executeResponseHandler( /* autocloses absent exception */ message, responseHandler, remoteAddress);
+                    } else {
+                        message.close();
+                    }
                 }
             }
         } finally {

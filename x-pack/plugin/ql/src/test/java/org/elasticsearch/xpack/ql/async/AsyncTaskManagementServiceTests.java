@@ -6,6 +6,12 @@
  */
 package org.elasticsearch.xpack.ql.async;
 
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.sdk.OpenTelemetrySdk;
+import io.opentelemetry.sdk.testing.exporter.InMemorySpanExporter;
+import io.opentelemetry.sdk.trace.SdkTracerProvider;
+import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
+
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.ActionRequestValidationException;
 import org.elasticsearch.action.ActionResponse;
@@ -14,10 +20,13 @@ import org.elasticsearch.action.support.ActionTestUtils;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.BigArrays;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.tasks.Task;
 import org.elasticsearch.tasks.TaskId;
+import org.elasticsearch.tasks.TaskManager;
+import org.elasticsearch.telemetry.tracing.Tracer;
 import org.elasticsearch.test.ESSingleNodeTestCase;
 import org.elasticsearch.transport.TransportService;
 import org.elasticsearch.xpack.core.async.AsyncExecutionId;
@@ -30,8 +39,11 @@ import org.junit.After;
 import org.junit.Before;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -197,13 +209,20 @@ public class AsyncTaskManagementServiceTests extends ESSingleNodeTestCase {
     private AsyncTaskManagementService<TestRequest, TestResponse, TestTask> createManagementService(
         AsyncTaskManagementService.AsyncOperation<TestRequest, TestResponse, TestTask> operation
     ) {
+        return createManagementService(operation, transportService.getTaskManager());
+    }
+
+    private AsyncTaskManagementService<TestRequest, TestResponse, TestTask> createManagementService(
+        AsyncTaskManagementService.AsyncOperation<TestRequest, TestResponse, TestTask> operation,
+        TaskManager taskManager
+    ) {
         BigArrays bigArrays = getInstanceFromNode(BigArrays.class);
         return new AsyncTaskManagementService<>(
             index,
             client(),
             "test_origin",
             writableRegistry(),
-            transportService.getTaskManager(),
+            taskManager,
             "test_action",
             operation,
             TestTask.class,
@@ -211,6 +230,87 @@ public class AsyncTaskManagementServiceTests extends ESSingleNodeTestCase {
             transportService.getThreadPool(),
             bigArrays
         );
+    }
+
+    public void testConcurrentBackgroundTasksActivateAndRestoreContext() throws Exception {
+        var threadPool = transportService.getThreadPool();
+        var threadContext = threadPool.getThreadContext();
+        var exporter = InMemorySpanExporter.create();
+        try (
+            var sdk = OpenTelemetrySdk.builder()
+                .setTracerProvider(SdkTracerProvider.builder().addSpanProcessor(SimpleSpanProcessor.create(exporter)).build())
+                .build()
+        ) {
+            var taskManager = new TaskManager(Settings.EMPTY, threadPool, Set.of(), Tracer.NOOP);
+            taskManager.setOpenTelemetry(sdk);
+            List<Runnable> completions = new ArrayList<>();
+            List<TestTask> tasks = new ArrayList<>();
+            List<Span> parents = new ArrayList<>();
+            var service = createManagementService(new TestOperation() {
+                @Override
+                public void execute(TestRequest request, TestTask task, ActionListener<TestResponse> listener) {
+                    var taskSpan = Span.fromContext(task.getTraceContext());
+                    assertEquals(taskSpan.getSpanContext(), Span.current().getSpanContext());
+                    tasks.add(task);
+                    completions.add(threadContext.preserveContext(() -> {
+                        assertEquals(taskSpan.getSpanContext(), Span.current().getSpanContext());
+                        var dependency = sdk.getTracer("test").spanBuilder("dependency").startSpan();
+                        dependency.end();
+                        super.execute(request, task, listener);
+                    }));
+                }
+            }, taskManager);
+            try {
+                for (String name : List.of("first", "second")) {
+                    var parent = sdk.getTracer("test").spanBuilder(name).setNoParent().startSpan();
+                    parents.add(parent);
+                    try (var scope = parent.makeCurrent()) {
+                        service.asyncExecute(
+                            new TestRequest(name),
+                            TimeValue.timeValueMinutes(1),
+                            TimeValue.timeValueMinutes(10),
+                            false,
+                            ActionTestUtils.assertNoFailureListener(
+                                response -> assertEquals("response for [" + name + "]", response.string)
+                            )
+                        );
+                        assertEquals(parent.getSpanContext(), Span.current().getSpanContext());
+                        assertNull(threadContext.getHeader(Task.TRACE_PARENT_HTTP_HEADER));
+                    }
+                }
+                assertTrue(exporter.getFinishedSpanItems().isEmpty());
+                for (int index = completions.size() - 1; index >= 0; index--) {
+                    var completion = completions.get(index);
+                    executorService.submit(() -> {
+                        completion.run();
+                        assertFalse(Span.current().getSpanContext().isValid());
+                        assertTrue(threadContext.isDefaultContext());
+                    }).get(10, TimeUnit.SECONDS);
+                }
+                assertTrue(taskManager.getTasks().isEmpty());
+                assertEquals(4, exporter.getFinishedSpanItems().size());
+                for (int index = 0; index < tasks.size(); index++) {
+                    var taskContext = Span.fromContext(tasks.get(index).getTraceContext()).getSpanContext();
+                    var parentContext = parents.get(index).getSpanContext();
+                    var taskSpan = exporter.getFinishedSpanItems()
+                        .stream()
+                        .filter(span -> span.getSpanId().equals(taskContext.getSpanId()))
+                        .findFirst()
+                        .orElseThrow();
+                    assertEquals(parentContext.getSpanId(), taskSpan.getParentSpanId());
+                    assertEquals(parentContext.getTraceId(), taskSpan.getTraceId());
+                    var dependency = exporter.getFinishedSpanItems()
+                        .stream()
+                        .filter(span -> span.getName().equals("dependency") && span.getTraceId().equals(parentContext.getTraceId()))
+                        .findFirst()
+                        .orElseThrow();
+                    assertEquals(taskSpan.getSpanId(), dependency.getParentSpanId());
+                }
+            } finally {
+                tasks.forEach(taskManager::unregister);
+                parents.forEach(Span::end);
+            }
+        }
     }
 
     public void testReturnBeforeTimeout() throws Exception {

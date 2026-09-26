@@ -25,6 +25,7 @@ import org.elasticsearch.rest.RestRequest;
 import org.elasticsearch.rest.RestResponse;
 import org.elasticsearch.telemetry.apm.internal.tracing.APMTracer;
 import org.elasticsearch.telemetry.instrumentation.HttpServerInstrumentation;
+import org.elasticsearch.telemetry.tracing.TracingContext;
 
 import java.util.List;
 import java.util.Locale;
@@ -55,7 +56,21 @@ public class APMHttpServerInstrumentation implements HttpServerInstrumentation {
     @Override
     public void start(ThreadContext threadContext, RestRequest request, String matchedRoute) {
         var req = new RequestAndRoute(request, matchedRoute);
-        tracer.startTrace(threadContext, request, spanNameExtractor.extract(req), legacyRequestAttributes(req));
+        Context parent = TracingContext.extract(threadContext);
+        if (tracer.isEnabled() == false) {
+            request.setTraceContext(parent);
+            return;
+        }
+        var builder = tracer.getOpenTelemetry()
+            .getTracer("elasticsearch.http")
+            .spanBuilder(spanNameExtractor.extract(req))
+            .setParent(parent);
+        tracer.decorateSpan(threadContext, legacyRequestAttributes(req), builder);
+        var span = builder.startSpan();
+        if (request.setTraceContext(TracingContext.withSpan(parent, span)) == false) {
+            span.end();
+            return;
+        }
 
         var attributes = Attributes.builder();
         httpServerAttributesExtractor.onStart(attributes, /* we don't care about the context in this case */ Context.root(), req);
@@ -95,7 +110,7 @@ public class APMHttpServerInstrumentation implements HttpServerInstrumentation {
         tracer.setAttributes(request, attributes.build());
 
         httpSpanStatusExtractor.extract(tracer.spanStatusBuilder(request), requestAndRoute, response, null);
-        tracer.stopTrace(request);
+        request.finishTrace();
     }
 
     private void setLegacyResponseAttributes(RestRequest request, RestResponse response) {
