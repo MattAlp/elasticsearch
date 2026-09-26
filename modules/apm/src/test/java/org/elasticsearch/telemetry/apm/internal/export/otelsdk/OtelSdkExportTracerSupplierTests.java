@@ -17,8 +17,10 @@ import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
 
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 
+import org.apache.logging.log4j.Level;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.test.MockLog;
 
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
@@ -26,6 +28,30 @@ import static org.hamcrest.Matchers.is;
 
 @ThreadLeakFilters(filters = { OkHttpThreadsFilter.class })
 public class OtelSdkExportTracerSupplierTests extends ESTestCase {
+    public void testCachedTracerUsesLiveLocalRecordingPolicy() {
+        Settings settings = Settings.builder()
+            .put(OtelSdkSettings.TELEMETRY_EXPORT_ENDPOINT.getKey(), "http://127.0.0.1:9")
+            .put(OtelSdkSettings.TELEMETRY_EXPORT_SEND_TIMEOUT.getKey(), "200ms")
+            .put(OtelSdkSettings.TELEMETRY_EXPORT_INTERVAL.getKey(), "300ms")
+            .put(OtelSdkSettings.TELEMETRY_TRACING_SAMPLE_RATE.getKey(), 1.0)
+            .build();
+        try (var supplier = new OtelSdkExportTracerSupplier(settings, MeterProvider::noop)) {
+            var tracer = supplier.get().getTracer("test");
+            var root = tracer.spanBuilder("root").startSpan();
+            var parent = io.opentelemetry.context.Context.root().with(root);
+            supplier.setRecordingFilter((context, name) -> false);
+            var suppressed = tracer.spanBuilder("suppressed").setParent(parent).startSpan();
+            assertFalse(suppressed.isRecording());
+            assertEquals(root.getSpanContext(), suppressed.getSpanContext());
+            suppressed.end();
+            assertTrue(root.isRecording());
+            supplier.setRecordingFilter((context, name) -> true);
+            var allowed = tracer.spanBuilder("allowed").setParent(parent).startSpan();
+            assertTrue(allowed.isRecording());
+            allowed.end();
+            root.end();
+        }
+    }
 
     public void testMissingEndpointReturnsNoopInsteadOfThrowing() {
         assertDegradesToNoop(Settings.EMPTY);
@@ -38,6 +64,20 @@ public class OtelSdkExportTracerSupplierTests extends ESTestCase {
     private void assertDegradesToNoop(Settings settings) {
         try (var supplier = new OtelSdkExportTracerSupplier(settings, MeterProvider::noop)) {
             assertThat(supplier.get(), is(OpenTelemetry.noop()));
+            try (var log = MockLog.capture(OtelSdkExportTracerSupplier.class)) {
+                log.addExpectation(
+                    new MockLog.UnseenEventExpectation(
+                        "cached no-op provider does not warn again",
+                        OtelSdkExportTracerSupplier.class.getName(),
+                        Level.WARN,
+                        "*trace export is disabled*"
+                    )
+                );
+                for (int attempt = 0; attempt < 10; attempt++) {
+                    assertSame(OpenTelemetry.noop(), supplier.get());
+                }
+                log.assertAllExpectationsMatched();
+            }
             assertThat(supplier.attemptFlushTraces().isSuccess(), is(true));
         }
     }

@@ -9,6 +9,11 @@
 
 package org.elasticsearch.cluster.service;
 
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.SpanContext;
+import io.opentelemetry.api.trace.TraceFlags;
+import io.opentelemetry.api.trace.TraceState;
+
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.core.LogEvent;
 import org.apache.lucene.util.SetOnce;
@@ -113,6 +118,34 @@ import static org.hamcrest.Matchers.lessThanOrEqualTo;
 import static org.hamcrest.Matchers.startsWith;
 
 public class MasterServiceTests extends ESTestCase {
+
+    public void testQueueProcessorDoesNotInheritSubmittingSpan() {
+        Span request = Span.wrap(
+            SpanContext.create("11111111111111111111111111111111", "2222222222222222", TraceFlags.getSampled(), TraceState.getDefault())
+        );
+        try (var active = request.makeCurrent(); var masterService = createMasterService(true)) {
+            PlainActionFuture<Void> completed = new PlainActionFuture<>();
+            var queue = masterService.<ClusterStateTaskListener>createTaskQueue("native-context", Priority.NORMAL, batch -> {
+                assertFalse(Span.current().getSpanContext().isValid());
+                assertTrue(threadPool.getThreadContext().isSystemContext());
+                for (var taskContext : batch.taskContexts()) {
+                    try (var ignored = taskContext.captureResponseHeaders()) {
+                        assertEquals(request.getSpanContext(), Span.current().getSpanContext());
+                    }
+                    assertFalse(Span.current().getSpanContext().isValid());
+                    taskContext.success(() -> {
+                        assertEquals(request.getSpanContext(), Span.current().getSpanContext());
+                        completed.onResponse(null);
+                    });
+                }
+                return batch.initialState();
+            });
+            queue.submitTask("native-context", completed::onFailure, null);
+            completed.actionGet(TimeValue.timeValueSeconds(10));
+            assertEquals(request.getSpanContext(), Span.current().getSpanContext());
+        }
+        assertFalse(Span.current().getSpanContext().isValid());
+    }
 
     private static ThreadPool threadPool;
     private static long relativeTimeInMillis;

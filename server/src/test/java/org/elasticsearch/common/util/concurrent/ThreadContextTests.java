@@ -8,6 +8,12 @@
  */
 package org.elasticsearch.common.util.concurrent;
 
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.SpanContext;
+import io.opentelemetry.api.trace.TraceFlags;
+import io.opentelemetry.api.trace.TraceState;
+import io.opentelemetry.context.Context;
+
 import org.apache.logging.log4j.Level;
 import org.elasticsearch.common.ReferenceDocs;
 import org.elasticsearch.common.io.stream.BytesStreamOutput;
@@ -16,6 +22,7 @@ import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.http.HttpTransportSettings;
 import org.elasticsearch.tasks.Task;
+import org.elasticsearch.telemetry.tracing.TracingContext;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.test.MockLog;
 import org.hamcrest.Matcher;
@@ -49,6 +56,66 @@ import static org.hamcrest.Matchers.nullValue;
 import static org.hamcrest.Matchers.sameInstance;
 
 public class ThreadContextTests extends ESTestCase {
+
+    public void testDelayedSnapshotRestoresNativeContext() {
+        ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
+        Span parent = Span.wrap(
+            SpanContext.create("11111111111111111111111111111111", "2222222222222222", TraceFlags.getSampled(), TraceState.getDefault())
+        );
+        Span child = Span.wrap(
+            SpanContext.create("11111111111111111111111111111111", "3333333333333333", TraceFlags.getSampled(), TraceState.getDefault())
+        );
+        Span unrelated = Span.wrap(
+            SpanContext.create("44444444444444444444444444444444", "5555555555555555", TraceFlags.getSampled(), TraceState.getDefault())
+        );
+        for (boolean preserveResponseHeaders : List.of(false, true)) {
+            ThreadContext.StoredContext snapshot;
+            try (var activation = TracingContext.activate(threadContext, Context.root().with(parent)); var nested = child.makeCurrent()) {
+                snapshot = preserveResponseHeaders
+                    ? threadContext.newStoredContextPreservingResponseHeaders()
+                    : threadContext.newStoredContext();
+            }
+            try (var activation = TracingContext.activate(threadContext, Context.root().with(unrelated))) {
+                var restorable = threadContext.wrapRestorable(snapshot);
+                for (int iteration = 0; iteration < 3; iteration++) {
+                    try (var restored = iteration == 0 ? threadContext.restoreExistingContext(snapshot) : restorable.get()) {
+                        assertEquals(child.getSpanContext(), Span.current().getSpanContext());
+                        assertEquals(child.getSpanContext(), Span.fromContext(TracingContext.current(threadContext)).getSpanContext());
+                        assertEquals("00-11111111111111111111111111111111-3333333333333333-01", threadContext.getHeader("traceparent"));
+                        threadContext.addResponseHeader("response", "value");
+                        threadContext.preserveContext(() -> assertEquals(child.getSpanContext(), Span.current().getSpanContext())).run();
+                    }
+                    assertEquals(unrelated.getSpanContext(), Span.current().getSpanContext());
+                    assertEquals(unrelated.getSpanContext().getTraceId(), threadContext.getHeader(Task.TRACE_ID));
+                }
+                expectThrows(IllegalArgumentException.class, () -> {
+                    try (var restored = restorable.get()) {
+                        assertEquals(child.getSpanContext(), Span.current().getSpanContext());
+                        throw new IllegalArgumentException("callback failed");
+                    }
+                });
+                assertEquals(unrelated.getSpanContext(), Span.current().getSpanContext());
+            }
+            assertFalse(Span.current().getSpanContext().isValid());
+        }
+    }
+
+    public void testCleanSnapshotClearsNativeContext() {
+        ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
+        var clean = threadContext.newStoredContext();
+        Span unrelated = Span.wrap(
+            SpanContext.create("11111111111111111111111111111111", "2222222222222222", TraceFlags.getSampled(), TraceState.getDefault())
+        );
+        try (var activation = TracingContext.activate(threadContext, Context.root().with(unrelated))) {
+            try (var restored = threadContext.restoreExistingContext(clean)) {
+                assertFalse(Span.current().getSpanContext().isValid());
+                assertNull(threadContext.getHeader(Task.TRACE_PARENT_HTTP_HEADER));
+                threadContext.preserveContext(() -> assertFalse(Span.current().getSpanContext().isValid())).run();
+            }
+            assertEquals(unrelated.getSpanContext(), Span.current().getSpanContext());
+        }
+        assertFalse(Span.current().getSpanContext().isValid());
+    }
 
     public void testStashContext() {
         Settings build = Settings.builder().put("request.headers.default", "1").build();

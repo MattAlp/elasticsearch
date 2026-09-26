@@ -9,6 +9,7 @@
 
 package org.elasticsearch.telemetry.apm.internal;
 
+import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.sdk.common.CompletableResultCode;
 
 import org.elasticsearch.common.settings.Settings;
@@ -60,6 +61,11 @@ public class APMTelemetryProvider implements TelemetryProvider {
     @Override
     public APMTracer getTracer() {
         return apmTracer;
+    }
+
+    @Override
+    public OpenTelemetry getOpenTelemetry() {
+        return apmTracer.getOpenTelemetry();
     }
 
     public APMMeterService getMeterService() {

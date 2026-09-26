@@ -12,6 +12,7 @@ package org.elasticsearch.telemetry.apm.internal.export.otelsdk;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.metrics.MeterProvider;
 import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator;
+import io.opentelemetry.context.Context;
 import io.opentelemetry.context.propagation.ContextPropagators;
 import io.opentelemetry.exporter.otlp.trace.OtlpGrpcSpanExporter;
 import io.opentelemetry.exporter.otlp.trace.OtlpGrpcSpanExporterBuilder;
@@ -29,6 +30,7 @@ import org.elasticsearch.logging.Logger;
 import org.elasticsearch.telemetry.apm.internal.export.TraceSupplier;
 
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiPredicate;
 import java.util.function.Supplier;
 
 /**
@@ -42,6 +44,13 @@ public class OtelSdkExportTracerSupplier implements TraceSupplier {
     private final Supplier<MeterProvider> meterProvider;
     private final Object mutex = new Object();
     private volatile OpenTelemetrySdk openTelemetrySdk;
+    private OpenTelemetry openTelemetry;
+    private volatile BiPredicate<Context, String> recordingFilter = (parent, name) -> true;
+
+    /** Applies live ES recording policy without replacing the SDK or invalidating cached native tracers. */
+    public void setRecordingFilter(BiPredicate<Context, String> recordingFilter) {
+        this.recordingFilter = recordingFilter;
+    }
 
     public OtelSdkExportTracerSupplier(Settings settings, Supplier<MeterProvider> meterProvider) {
         this.settings = settings;
@@ -51,10 +60,13 @@ public class OtelSdkExportTracerSupplier implements TraceSupplier {
     @Override
     public OpenTelemetry get() {
         synchronized (mutex) {
-            if (openTelemetrySdk == null) {
+            if (openTelemetry == null) {
                 openTelemetrySdk = createOpenTelemetrySdk();
+                openTelemetry = openTelemetrySdk == null
+                    ? OpenTelemetry.noop()
+                    : new RecordingPolicyOpenTelemetry(openTelemetrySdk, (parent, name) -> recordingFilter.test(parent, name));
             }
-            return openTelemetrySdk == null ? OpenTelemetry.noop() : openTelemetrySdk;
+            return openTelemetry;
         }
     }
 
@@ -74,6 +86,7 @@ public class OtelSdkExportTracerSupplier implements TraceSupplier {
                 openTelemetrySdk.getSdkTracerProvider().close();
                 openTelemetrySdk = null;
             }
+            openTelemetry = null;
         }
     }
 

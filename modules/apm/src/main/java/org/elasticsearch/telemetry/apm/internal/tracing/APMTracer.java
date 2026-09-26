@@ -47,8 +47,11 @@ import org.elasticsearch.telemetry.apm.internal.export.otelsdk.OtelSdkExportTrac
 import org.elasticsearch.telemetry.apm.internal.export.otelsdk.OtelSdkSettings;
 import org.elasticsearch.telemetry.tracing.TraceContext;
 import org.elasticsearch.telemetry.tracing.Traceable;
+import org.elasticsearch.telemetry.tracing.TracingContext;
 
 import java.time.Instant;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -66,7 +69,9 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
     private static final Logger logger = LogManager.getLogger(APMTracer.class);
 
     /** Tracks per-span local depth in Context to enforce {@link OtelSdkSettings#TELEMETRY_TRACING_MAX_DEPTH}. */
-    private static final ContextKey<Integer> SPAN_LOCAL_DEPTH_KEY = ContextKey.named("es.apm.span.local_depth");
+    private static final ContextKey<Integer> SPAN_LOCAL_DEPTH_KEY = TracingContext.LOCAL_DEPTH;
+
+    private final ThreadLocal<Deque<Releasable>> legacyScopes = new ThreadLocal<>();
 
     /** Holds in-flight span information. */
     private final Map<String, Context> spans = ConcurrentCollections.newConcurrentMap();
@@ -126,6 +131,16 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
         this.enabled = APMAgentSettings.TELEMETRY_TRACING_ENABLED_SETTING.get(settings);
         this.maxTraceDepth = maxTraceDepth;
         this.recordExceptionStacks = recordExceptionStacks;
+        if (traceSupplier instanceof OtelSdkExportTracerSupplier sdkSupplier) {
+            sdkSupplier.setRecordingFilter(
+                (parent, name) -> enabled && filterAutomaton.run(name) && TracingContext.childDepth(parent) <= this.maxTraceDepth
+            );
+        }
+    }
+
+    /** Returns the node-owned native API; sampling policy controls recording even for cached native tracers. */
+    public OpenTelemetry getOpenTelemetry() {
+        return traceSupplier.get();
     }
 
     public CompletableResultCode attemptFlushTraces() {
@@ -215,7 +230,6 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
 
     private void destroyApmServices() {
         this.services = null;
-        this.spans.clear();// discard in-flight spans
     }
 
     @Override
@@ -233,6 +247,7 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
 
         if (filterAutomaton.run(spanName) == false) {
             logger.trace("Skipping tracing [{}] [{}] as it has been filtered out", spanId, spanName);
+            propagateParent(traceContext, services);
             return;
         }
 
@@ -240,11 +255,14 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
             // A span can have a parent span, which here is modelled though a parent span context.
             // Setting this is important for seeing a complete trace in the APM UI.
             // Attempt to fetch a local parent context first, otherwise look for a remote parent
-            final Context localParentContext = traceContext.getTransient(Task.PARENT_APM_TRACE_CONTEXT);
+            final Context activeContext = Context.current();
+            final Context localParentContext = Span.fromContext(activeContext).getSpanContext().isValid()
+                ? activeContext
+                : traceContext.getTransient(Task.PARENT_APM_TRACE_CONTEXT);
 
             // Depth is parent's depth + 1, or 0 for a root span; remote traceparent doesn't count.
             final int localDepth;
-            if (localParentContext != null) {
+            if (localParentContext != null && Span.fromContext(localParentContext).getSpanContext().isRemote() == false) {
                 Integer parentDepth = localParentContext.get(SPAN_LOCAL_DEPTH_KEY);
                 localDepth = (parentDepth != null ? parentDepth : 0) + 1;
             } else {
@@ -253,6 +271,7 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
 
             if (localDepth > maxTraceDepth) {
                 logger.trace("Skipping span [{}] [{}] at local depth {} (maxTraceDepth={})", spanId, spanName, localDepth, maxTraceDepth);
+                propagateParent(traceContext, services);
                 return null;
             }
 
@@ -274,11 +293,17 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
             final Span span = spanBuilder.startSpan();
             if (span.isRecording() == false) {
                 logger.trace("Span [{}] [{}] will not be recorded due to sampling", spanId, spanName);
+                updateThreadContext(
+                    traceContext,
+                    services,
+                    TracingContext.withSpan(parentContext == null ? Context.root() : parentContext, span)
+                );
                 span.end(); // end span immediately to release any resources.
                 return null; // return null to discard and not record in map of spans
             }
 
-            final Context contextForNewSpan = Context.current().with(span).with(SPAN_LOCAL_DEPTH_KEY, localDepth);
+            final Context contextForNewSpan = (parentContext == null ? Context.root() : parentContext).with(span)
+                .with(SPAN_LOCAL_DEPTH_KEY, localDepth);
             if (span.isRecording()) {
                 logger.trace("Recording trace [{}] [{}]", spanId, spanName);
                 updateThreadContext(traceContext, services, contextForNewSpan);
@@ -304,7 +329,30 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
 
         SpanBuilder spanBuilder = services.tracer.spanBuilder(name);
         setSpanAttributes(attributes, spanBuilder);
-        spanBuilder.startSpan();
+        Span span = spanBuilder.startSpan();
+        Scope scope = TracingContext.withSpan(Context.current(), span).makeCurrent();
+        Deque<Releasable> scopes = legacyScopes.get();
+        if (scopes == null) {
+            scopes = new ArrayDeque<>();
+            legacyScopes.set(scopes);
+        }
+        scopes.push(() -> {
+            try {
+                scope.close();
+            } finally {
+                span.end();
+            }
+        });
+    }
+
+    private void propagateParent(TraceContext traceContext, APMServices services) {
+        Context parent = traceContext.getTransient(Task.PARENT_APM_TRACE_CONTEXT);
+        if (parent == null) {
+            parent = getRemoteParentContext(traceContext);
+        }
+        if (parent != null && Span.fromContext(parent).getSpanContext().isValid()) {
+            updateThreadContext(traceContext, services, parent);
+        }
     }
 
     private static void updateThreadContext(TraceContext traceContext, APMServices services, Context context) {
@@ -524,7 +572,13 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
      */
     @Override
     public void stopTrace() {
-        Span.current().end();
+        Deque<Releasable> scopes = legacyScopes.get();
+        if (scopes != null) {
+            scopes.pop().close();
+            if (scopes.isEmpty()) {
+                legacyScopes.remove();
+            }
+        }
     }
 
     @Override

@@ -124,7 +124,7 @@ public class MasterService extends AbstractLifecycleComponent {
 
     protected final ThreadPool threadPool;
     private final TaskManager taskManager;
-    private final ThreadContext.StoredContext clusterStateUpdateContext;
+    private final Supplier<ThreadContext.StoredContext> clusterStateUpdateContext;
 
     private volatile ExecutorService threadPoolExecutor;
     private final AtomicInteger totalQueueSize = new AtomicInteger();
@@ -172,12 +172,11 @@ public class MasterService extends AbstractLifecycleComponent {
         this.meterRegistry = meterRegistry;
     }
 
-    private static ThreadContext.StoredContext getClusterStateUpdateContext(ThreadContext threadContext) {
-        try (var ignored = threadContext.newStoredContext()) {
+    private static Supplier<ThreadContext.StoredContext> getClusterStateUpdateContext(ThreadContext threadContext) {
+        assert threadContext.isDefaultContext() : "must only create MasterService in a clean ThreadContext";
+        try (var ignored = threadContext.newEmptySystemContext()) {
             // capture the context in which to run all cluster state updates here where we know it to be very clean
-            assert threadContext.isDefaultContext() : "must only create MasterService in a clean ThreadContext";
-            threadContext.markAsSystemContext();
-            return threadContext.newStoredContext();
+            return threadContext.newRestorableContext(false);
         }
     }
 
@@ -1574,9 +1573,7 @@ public class MasterService extends AbstractLifecycleComponent {
         }
 
         assert totalQueueSize.get() > 0;
-        final var threadContext = threadPool.getThreadContext();
-        try (var ignored = threadContext.newStoredContext()) {
-            clusterStateUpdateContext.restore();
+        try (var ignored = clusterStateUpdateContext.get()) {
             threadPoolExecutor.execute(queuesProcessor);
         }
     }

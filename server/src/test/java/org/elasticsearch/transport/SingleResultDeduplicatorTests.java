@@ -9,6 +9,12 @@
 
 package org.elasticsearch.transport;
 
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.SpanContext;
+import io.opentelemetry.api.trace.TraceFlags;
+import io.opentelemetry.api.trace.TraceState;
+import io.opentelemetry.context.Context;
+
 import org.apache.lucene.util.SetOnce;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.ActionRunnable;
@@ -21,6 +27,8 @@ import org.elasticsearch.common.util.concurrent.EsExecutors;
 import org.elasticsearch.common.util.concurrent.ThreadContext;
 import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.Releasables;
+import org.elasticsearch.tasks.Task;
+import org.elasticsearch.telemetry.tracing.TracingContext;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.test.TestEsExecutors;
 import org.elasticsearch.threadpool.ThreadPool;
@@ -41,6 +49,45 @@ import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.not;
 
 public class SingleResultDeduplicatorTests extends ESTestCase {
+
+    public void testQueuedBatchDoesNotInheritCompletingBatchTrace() {
+        ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
+        List<ActionListener<Void>> completions = new ArrayList<>();
+        List<Runnable> dispatched = new ArrayList<>();
+        List<SpanContext> observed = new ArrayList<>();
+        var deduplicator = new SingleResultDeduplicator<Void>(threadContext, listener -> {
+            observed.add(Span.current().getSpanContext());
+            dispatched.add(threadContext.preserveContext(() -> {
+                observed.add(Span.current().getSpanContext());
+                assertEquals(Span.current().getSpanContext().getTraceId(), threadContext.getHeader(Task.TRACE_ID));
+            }));
+            completions.add(listener);
+        });
+        Span first = Span.wrap(
+            SpanContext.create("11111111111111111111111111111111", "2222222222222222", TraceFlags.getSampled(), TraceState.getDefault())
+        );
+        Span second = Span.wrap(
+            SpanContext.create("33333333333333333333333333333333", "4444444444444444", TraceFlags.getSampled(), TraceState.getDefault())
+        );
+        for (Span span : List.of(first, second)) {
+            try (var activation = TracingContext.activate(threadContext, Context.root().with(span))) {
+                deduplicator.execute(
+                    ActionListener.wrap(ignored -> { assertEquals(span.getSpanContext(), Span.current().getSpanContext()); }, failure -> {
+                        throw new AssertionError(failure);
+                    })
+                );
+            }
+        }
+        try (var activation = TracingContext.activate(threadContext, Context.root().with(first))) {
+            completions.getFirst().onResponse(null);
+            assertEquals(first.getSpanContext(), Span.current().getSpanContext());
+            dispatched.get(1).run();
+            completions.get(1).onResponse(null);
+            assertEquals(first.getSpanContext(), Span.current().getSpanContext());
+        }
+        assertEquals(List.of(first.getSpanContext(), second.getSpanContext(), second.getSpanContext()), observed);
+        assertFalse(Span.current().getSpanContext().isValid());
+    }
 
     public void testDeduplicatesWithoutShowingStaleData() {
         final SetOnce<ActionListener<Object>> firstListenerRef = new SetOnce<>();

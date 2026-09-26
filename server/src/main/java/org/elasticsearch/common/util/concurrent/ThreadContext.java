@@ -8,6 +8,8 @@
  */
 package org.elasticsearch.common.util.concurrent;
 
+import io.opentelemetry.context.Context;
+
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.elasticsearch.action.support.ContextPreservingActionListener;
@@ -28,6 +30,7 @@ import org.elasticsearch.rest.RestController;
 import org.elasticsearch.rest.RestRequest;
 import org.elasticsearch.tasks.Task;
 import org.elasticsearch.telemetry.tracing.TraceContext;
+import org.elasticsearch.telemetry.tracing.TracingContext;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -122,6 +125,7 @@ public final class ThreadContext implements Writeable, TraceContext {
      */
     public StoredContext stashContextPreservingRequestHeaders(HeadersFor headersFor, Set<String> requestHeaders) {
         final ThreadContextStruct context = threadLocal.get();
+        final Context tracing = TracingContext.current(this);
 
         /*
          * When the context is stashed, it should be empty, except for headers that were specified to be preserved via `requestHeaders`
@@ -159,7 +163,7 @@ public final class ThreadContext implements Writeable, TraceContext {
 
         // If the node and thus the threadLocal get closed while this task is still executing, we don't want this runnable to fail with an
         // uncaught exception
-        return storedOriginalContext(context);
+        return storedOriginalContext(context, tracing);
     }
 
     public StoredContext stashContextPreservingRequestHeaders(HeadersFor headersFor, final String... requestHeaders) {
@@ -174,7 +178,7 @@ public final class ThreadContext implements Writeable, TraceContext {
     public StoredContext newEmptyContext() {
         final var callingContext = threadLocal.get();
         threadLocal.set(DEFAULT_CONTEXT);
-        return storedOriginalContext(callingContext);
+        return detachedTracingContext(callingContext);
     }
 
     /**
@@ -185,7 +189,7 @@ public final class ThreadContext implements Writeable, TraceContext {
     public StoredContext newEmptySystemContext() {
         final var callingContext = threadLocal.get();
         threadLocal.set(DEFAULT_CONTEXT.setSystemContext());
-        return storedOriginalContext(callingContext);
+        return detachedTracingContext(callingContext);
     }
 
     /**
@@ -201,6 +205,7 @@ public final class ThreadContext implements Writeable, TraceContext {
      */
     public StoredContext newTraceContext() {
         final ThreadContextStruct originalContext = threadLocal.get();
+        final Context tracing = TracingContext.current(this);
 
         // this is the context when this method returns
         final ThreadContextStruct newContext;
@@ -213,30 +218,7 @@ public final class ThreadContext implements Writeable, TraceContext {
             || transientHeaders.containsKey(Task.APM_TRACE_CONTEXT);
 
         if (hasTraceHeaders == false) {
-            final boolean hasParentTraceHeaders = (transientHeaders.containsKey(Task.PARENT_TRACE_PARENT_HEADER)
-                || transientHeaders.containsKey(Task.PARENT_TRACE_STATE)
-                || transientHeaders.containsKey(Task.PARENT_APM_TRACE_CONTEXT));
-
-            if (hasParentTraceHeaders == false) {
-                // no need to copy if no trace headers are present
-                newContext = originalContext;
-            } else {
-                // tracing was stopped (e.g. after reaching max spans);
-                // remove parent trace headers to not attempt creating any further, immediately discarded spans
-                final Map<String, Object> newTransientHeaders = new HashMap<>(transientHeaders);
-                newTransientHeaders.remove(Task.PARENT_TRACE_PARENT_HEADER);
-                newTransientHeaders.remove(Task.PARENT_TRACE_STATE);
-                newTransientHeaders.remove(Task.PARENT_APM_TRACE_CONTEXT);
-
-                newContext = new ThreadContextStruct(
-                    requestHeaders,
-                    originalContext.responseHeaders,
-                    newTransientHeaders,
-                    originalContext.isSystemContext,
-                    originalContext.warningHeadersSize
-                );
-                threadLocal.set(newContext);
-            }
+            newContext = originalContext;
         } else {
             final Map<String, String> newRequestHeaders = new HashMap<>(requestHeaders);
             final Map<String, Object> newTransientHeaders = new HashMap<>(transientHeaders);
@@ -270,14 +252,14 @@ public final class ThreadContext implements Writeable, TraceContext {
         }
         // Tracing shouldn't interrupt the propagation of response headers, so in the same as
         // #newStoredContextPreservingResponseHeaders(), pass on any potential changes to the response headers.
-        return () -> {
+        return new ContextSnapshot(() -> {
             var found = threadLocal.get();
             if (found != newContext) {
                 threadLocal.set(originalContext.putResponseHeaders(found.responseHeaders));
             } else {
                 threadLocal.set(originalContext);
             }
-        };
+        }, tracing);
     }
 
     public boolean hasApmTraceContext() {
@@ -302,11 +284,13 @@ public final class ThreadContext implements Writeable, TraceContext {
 
         newRequestHeaders.remove(Task.TRACE_PARENT_HTTP_HEADER);
         newRequestHeaders.remove(Task.TRACE_STATE);
+        newRequestHeaders.remove(Task.TRACE_ID);
 
         newTransientHeaders.remove(Task.PARENT_TRACE_PARENT_HEADER);
         newTransientHeaders.remove(Task.PARENT_TRACE_STATE);
         newTransientHeaders.remove(Task.APM_TRACE_CONTEXT);
         newTransientHeaders.remove(Task.PARENT_APM_TRACE_CONTEXT);
+        newTransientHeaders.remove(Task.TRACE_START_TIME);
 
         threadLocal.set(
             new ThreadContextStruct(
@@ -317,11 +301,30 @@ public final class ThreadContext implements Writeable, TraceContext {
                 context.warningHeadersSize
             )
         );
-        return storedOriginalContext(context);
+        return detachedTracingContext(context);
     }
 
-    private StoredContext storedOriginalContext(ThreadContextStruct originalContext) {
-        return () -> threadLocal.set(originalContext);
+    private StoredContext detachedTracingContext(ThreadContextStruct original) {
+        var scope = Context.root().makeCurrent();
+        return () -> {
+            try {
+                scope.close();
+            } finally {
+                threadLocal.set(original);
+            }
+        };
+    }
+
+    private StoredContext storedOriginalContext(ThreadContextStruct originalContext, Context tracing) {
+        return new ContextSnapshot(() -> threadLocal.set(originalContext), tracing);
+    }
+
+    /** Keeps delayed scoped restoration tied to the request that captured the snapshot, not the wrapping thread. */
+    private record ContextSnapshot(StoredContext delegate, Context tracing) implements StoredContext {
+        @Override
+        public void close() {
+            delegate.close();
+        }
     }
 
     private static Set<String> getRequestHeadersToCopy(HeadersFor headersFor, Set<String> requestHeaders) {
@@ -353,7 +356,8 @@ public final class ThreadContext implements Writeable, TraceContext {
      */
     public Writeable captureAsWriteable() {
         final ThreadContextStruct context = threadLocal.get();
-        return out -> context.writeTo(out, defaultHeader);
+        final Context tracing = TracingContext.current(this);
+        return out -> context.writeTo(out, defaultHeader, tracing);
     }
 
     /**
@@ -388,10 +392,11 @@ public final class ThreadContext implements Writeable, TraceContext {
      */
     public StoredContext stashAndMergeHeaders(Map<String, String> headers) {
         final ThreadContextStruct context = threadLocal.get();
+        final Context tracing = TracingContext.current(this);
         Map<String, String> newHeader = new HashMap<>(headers);
         newHeader.putAll(context.requestHeaders);
         threadLocal.set(DEFAULT_CONTEXT.putHeaders(newHeader));
-        return storedOriginalContext(context);
+        return storedOriginalContext(context, tracing);
     }
 
     /**
@@ -399,22 +404,21 @@ public final class ThreadContext implements Writeable, TraceContext {
      */
     public StoredContext newStoredContextPreservingResponseHeaders() {
         final ThreadContextStruct originalContext = threadLocal.get();
-        return () -> {
+        final Context tracing = TracingContext.current(this);
+        return new ContextSnapshot(() -> {
             var found = threadLocal.get();
             if (found != originalContext) {
                 threadLocal.set(originalContext.putResponseHeaders(found.responseHeaders));
             }
-        };
+        }, tracing);
     }
 
     /**
      * Capture the current context and then restore the given context, returning a {@link StoredContext} that reverts back to the current
-     * context again. Equivalent to using {@link #newStoredContext()} and then calling {@code existingContext.restore()}.
+     * context again. Also activates the snapshot's tracing context until the returned scope is closed.
      */
     public StoredContext restoreExistingContext(StoredContext existingContext) {
-        final var originalContext = threadLocal.get();
-        existingContext.restore();
-        return storedOriginalContext(originalContext);
+        return wrapRestorable(existingContext).get();
     }
 
     /**
@@ -422,7 +426,7 @@ public final class ThreadContext implements Writeable, TraceContext {
      */
     public StoredContext newStoredContext() {
         final ThreadContextStruct originalContext = threadLocal.get();
-        return storedOriginalContext(originalContext);
+        return storedOriginalContext(originalContext, TracingContext.current(this));
     }
 
     /**
@@ -451,6 +455,7 @@ public final class ThreadContext implements Writeable, TraceContext {
         Collection<String> requestHeadersToClear
     ) {
         final ThreadContextStruct originalContext = threadLocal.get();
+        final Context tracing = TracingContext.current(this);
         // clear specific transient headers from the current context
         Map<String, Object> newTransientHeaders = null;
         for (String transientHeaderToClear : transientHeadersToClear) {
@@ -482,13 +487,13 @@ public final class ThreadContext implements Writeable, TraceContext {
         }
         // this is the context when this method returns
         final ThreadContextStruct newContext = threadLocal.get();
-        return () -> {
+        return new ContextSnapshot(() -> {
             if (preserveResponseHeaders && threadLocal.get() != newContext) {
                 threadLocal.set(originalContext.putResponseHeaders(threadLocal.get().responseHeaders));
             } else {
                 threadLocal.set(originalContext);
             }
-        };
+        }, tracing);
     }
 
     /**
@@ -518,19 +523,34 @@ public final class ThreadContext implements Writeable, TraceContext {
 
     /**
      * Same as {@link #newRestorableContext(boolean)} but wraps an existing context to restore.
+     * Snapshots retain their tracing context from capture time, even if wrapped under another request's active span.
      * @param storedContext the context to restore
      */
     public Supplier<StoredContext> wrapRestorable(StoredContext storedContext) {
+        final Context tracing = storedContext instanceof ContextSnapshot snapshot ? snapshot.tracing() : TracingContext.current(this);
         return () -> {
             StoredContext context = newStoredContext();
             storedContext.restore();
-            return context;
+            final Releasable activation;
+            try {
+                activation = TracingContext.activate(this, tracing);
+            } catch (RuntimeException | Error failure) {
+                context.restore();
+                throw failure;
+            }
+            return () -> {
+                try {
+                    activation.close();
+                } finally {
+                    context.restore();
+                }
+            };
         };
     }
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
-        threadLocal.get().writeTo(out, defaultHeader);
+        threadLocal.get().writeTo(out, defaultHeader, TracingContext.current(this));
     }
 
     /**
@@ -877,6 +897,11 @@ public final class ThreadContext implements Writeable, TraceContext {
         // intentionally not storing prior context to avoid restoring unwanted headers
     }
 
+    /**
+     * Restores Elasticsearch state without opening a native tracing scope. For asynchronous dispatch, use
+     * {@link ThreadContext#wrapRestorable(StoredContext)} or {@link ThreadContext#restoreExistingContext(StoredContext)}
+     * so that tracing is activated and subsequently restored on the execution thread as well.
+     */
     @FunctionalInterface
     public interface StoredContext extends AutoCloseable, Releasable {
         default void restore() {
@@ -1093,7 +1118,7 @@ public final class ThreadContext implements Writeable, TraceContext {
             return putHeaders(newHeaders);
         }
 
-        private void writeTo(StreamOutput out, Map<String, String> defaultHeaders) throws IOException {
+        private void writeTo(StreamOutput out, Map<String, String> defaultHeaders, Context tracing) throws IOException {
             final Map<String, String> requestHeaders;
             if (defaultHeaders.isEmpty()) {
                 requestHeaders = this.requestHeaders;
@@ -1102,7 +1127,7 @@ public final class ThreadContext implements Writeable, TraceContext {
                 requestHeaders.putAll(this.requestHeaders);
             }
 
-            out.writeMap(requestHeaders, StreamOutput::writeString);
+            out.writeMap(TracingContext.headers(tracing, requestHeaders), StreamOutput::writeString);
             out.writeMap(responseHeaders, StreamOutput::writeStringCollection);
         }
     }
@@ -1112,16 +1137,16 @@ public final class ThreadContext implements Writeable, TraceContext {
      */
     private class ContextPreservingRunnable implements WrappedRunnable {
         private final Runnable in;
-        private final ThreadContext.StoredContext ctx;
+        private final Supplier<StoredContext> ctx;
 
         private ContextPreservingRunnable(Runnable in) {
-            this.ctx = newStoredContext();
+            this.ctx = newRestorableContext(false);
             this.in = in;
         }
 
         @Override
         public void run() {
-            try (var ignore = restoreExistingContext(ctx)) {
+            try (var ignore = ctx.get()) {
                 in.run();
             }
         }
@@ -1143,13 +1168,13 @@ public final class ThreadContext implements Writeable, TraceContext {
      */
     private class ContextPreservingAbstractRunnable extends AbstractRunnable implements WrappedRunnable {
         private final AbstractRunnable in;
-        private final ThreadContext.StoredContext creatorsContext;
+        private final Supplier<StoredContext> creatorsContext;
         private final boolean useNewTraceContext;
 
         private ThreadContext.StoredContext threadsOriginalContext = null;
 
         private ContextPreservingAbstractRunnable(AbstractRunnable in, boolean useNewTraceContext) {
-            creatorsContext = newStoredContext();
+            creatorsContext = newRestorableContext(false);
             this.in = in;
             this.useNewTraceContext = useNewTraceContext;
         }
@@ -1162,28 +1187,38 @@ public final class ThreadContext implements Writeable, TraceContext {
         @Override
         public void onAfter() {
             try {
-                in.onAfter();
+                runInContext(in::onAfter);
             } finally {
                 if (threadsOriginalContext != null) {
                     threadsOriginalContext.restore();
+                    threadsOriginalContext = null;
                 }
             }
         }
 
         @Override
         public void onFailure(Exception e) {
-            in.onFailure(e);
+            runInContext(() -> in.onFailure(e));
         }
 
         @Override
         public void onRejection(Exception e) {
-            in.onRejection(e);
+            runInContext(() -> in.onRejection(e));
+        }
+
+        private void runInContext(Runnable action) {
+            if (threadsOriginalContext == null) {
+                try (var ignored = creatorsContext.get()) {
+                    action.run();
+                }
+            } else {
+                action.run();
+            }
         }
 
         @Override
         protected void doRun() throws Exception {
-            threadsOriginalContext = stashContext();
-            creatorsContext.restore();
+            threadsOriginalContext = creatorsContext.get();
             if (useNewTraceContext) {
                 // Discard the return value - we'll restore threadsOriginalContext in `onAfter()`.
                 // noinspection resource

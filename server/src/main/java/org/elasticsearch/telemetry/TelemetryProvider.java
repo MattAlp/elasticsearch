@@ -9,6 +9,8 @@
 
 package org.elasticsearch.telemetry;
 
+import io.opentelemetry.api.OpenTelemetry;
+
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.telemetry.instrumentation.HttpServerInstrumentation;
@@ -33,6 +35,11 @@ public interface TelemetryProvider {
     }
 
     Tracer getTracer();
+
+    /** Supplies the node-owned API without exposing SDK or exporter lifecycle to instrumentation. */
+    default OpenTelemetry getOpenTelemetry() {
+        return OpenTelemetry.noop();
+    }
 
     MeterRegistry getMeterRegistry();
 

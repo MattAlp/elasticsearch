@@ -16,6 +16,7 @@ import org.elasticsearch.core.Nullable;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 /**
  *
@@ -41,7 +42,7 @@ public final class SingleResultDeduplicator<T> {
      * The threadContext associated with the first listener in the waitingListeners. This context will be restored right before
      * we perform the {@code executeAction}.
      */
-    private ThreadContext.StoredContext waitingStoredContext;
+    private Supplier<ThreadContext.StoredContext> waitingStoredContext;
 
     private final Consumer<ActionListener<T>> executeAction;
 
@@ -68,7 +69,7 @@ public final class SingleResultDeduplicator<T> {
                 if (waitingListeners.isEmpty()) {
                     // Only the first listener in queue needs the stored context which is used for running executeAction
                     assert waitingStoredContext == null;
-                    waitingStoredContext = threadContext.newStoredContext();
+                    waitingStoredContext = threadContext.newRestorableContext(false);
                 }
                 waitingListeners.add(ContextPreservingActionListener.wrapPreservingContext(listener, threadContext));
                 return;
@@ -77,10 +78,10 @@ public final class SingleResultDeduplicator<T> {
         doExecute(ContextPreservingActionListener.wrapPreservingContext(listener, threadContext), null);
     }
 
-    private void doExecute(ActionListener<T> listener, @Nullable ThreadContext.StoredContext storedContext) {
+    private void doExecute(ActionListener<T> listener, @Nullable Supplier<ThreadContext.StoredContext> storedContext) {
         final ActionListener<T> wrappedListener = ActionListener.runBefore(listener, () -> {
             final List<ActionListener<T>> listeners;
-            final ThreadContext.StoredContext thisStoredContext;
+            final Supplier<ThreadContext.StoredContext> thisStoredContext;
             synchronized (this) {
                 if (waitingListeners.isEmpty()) {
                     // no listeners were queued up while this execution ran, so we just reset the state to not having a running execution
@@ -117,9 +118,8 @@ public final class SingleResultDeduplicator<T> {
         });
         // Restore the given threadContext before proceed with the work execution.
         // This ensures all executions begin execution with their own context.
-        if (storedContext != null) {
-            storedContext.restore();
+        try (var ignored = storedContext == null ? null : storedContext.get()) {
+            ActionListener.run(wrappedListener, executeAction::accept);
         }
-        ActionListener.run(wrappedListener, executeAction::accept);
     }
 }

@@ -18,6 +18,8 @@ import io.opentelemetry.api.trace.SpanBuilder;
 import io.opentelemetry.api.trace.SpanContext;
 import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.api.trace.StatusCode;
+import io.opentelemetry.api.trace.TraceFlags;
+import io.opentelemetry.api.trace.TraceState;
 import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator;
 import io.opentelemetry.context.Context;
@@ -133,7 +135,7 @@ public class APMTracerTests extends ESTestCase {
         ThreadContext traceContext = new ThreadContext(settings);
         apmTracer.startTrace(traceContext, TRACEABLE1, "name1_discard", null);
 
-        assertThat(traceContext.getTransient(Task.APM_TRACE_CONTEXT), nullValue());
+        assertThat(traceContext.getTransient(Task.APM_TRACE_CONTEXT), notNullValue());
         assertThat(apmTracer.getSpans(), anEmptyMap());
     }
 
@@ -148,11 +150,11 @@ public class APMTracerTests extends ESTestCase {
         apmTracer.startTrace(traceContext, TRACEABLE1, "name1", null);
         try (var ignore1 = traceContext.newTraceContext()) {
             apmTracer.startTrace(traceContext, TRACEABLE2, "name2_discard", null);
-            assertThat(traceContext.getTransient(Task.APM_TRACE_CONTEXT), nullValue());
+            assertThat(traceContext.getTransient(Task.APM_TRACE_CONTEXT), notNullValue());
 
             try (var ignore2 = traceContext.newTraceContext()) {
                 apmTracer.startTrace(traceContext, TRACEABLE3, "name3_discard", null);
-                assertThat(traceContext.getTransient(Task.APM_TRACE_CONTEXT), nullValue());
+                assertThat(traceContext.getTransient(Task.APM_TRACE_CONTEXT), notNullValue());
             }
         }
         assertThat(apmTracer.getSpans(), aMapWithSize(1));
@@ -409,7 +411,7 @@ public class APMTracerTests extends ESTestCase {
         // Verify it matches the trace ID and span ID from the traceparent header.
         Span span = Span.fromContext(spanContext);
         assertThat(span.getSpanContext().getTraceId(), is(traceId));
-        assertThat(span.getSpanContext().getSpanId(), is(remoteParentSpanId));
+        assertThat(span.getSpanContext().getSpanId(), not(is(remoteParentSpanId)));
     }
 
     public void testTracingResumesAfterDisableAndReEnable() {
@@ -548,7 +550,7 @@ public class APMTracerTests extends ESTestCase {
         assertThat(tracer.getSpans().keySet(), equalTo(Set.of(TRACEABLE1.getSpanId())));
         Span entrySpan = Span.fromContext(tracer.getSpans().get(TRACEABLE1.getSpanId()));
         assertThat(entrySpan.getSpanContext().getTraceId(), is(traceId));
-        assertThat(entrySpan.getSpanContext().getSpanId(), is(remoteParentSpanId));
+        assertThat(entrySpan.getSpanContext().getSpanId(), not(is(remoteParentSpanId)));
     }
 
     public void test_addError_withStacksDisabled_emitsTypeAndMessageOnly() {
@@ -644,6 +646,15 @@ public class APMTracerTests extends ESTestCase {
             MockSpanBuilder(String spanName) {
                 this.spanName = spanName;
                 this.span = Mockito.mock(Span.class, spanName);
+                Mockito.when(span.getSpanContext())
+                    .thenReturn(
+                        SpanContext.create(
+                            "11111111111111111111111111111111",
+                            "2222222222222222",
+                            TraceFlags.getSampled(),
+                            TraceState.getDefault()
+                        )
+                    );
                 // simulate a span discarded because its trace was not sampled
                 Mockito.when(span.isRecording()).thenReturn(spanName.endsWith("_discard") == false);
                 Mockito.when(span.storeInContext(Mockito.any(Context.class))).thenCallRealMethod();
@@ -652,7 +663,15 @@ public class APMTracerTests extends ESTestCase {
             @Override
             public SpanBuilder setParent(Context context) {
                 SpanContext spanContext = Span.fromContext(context).getSpanContext();
-                Mockito.when(span.getSpanContext()).thenReturn(spanContext);
+                Mockito.when(span.getSpanContext())
+                    .thenReturn(
+                        SpanContext.create(
+                            spanContext.getTraceId(),
+                            "3333333333333333",
+                            spanContext.getTraceFlags(),
+                            spanContext.getTraceState()
+                        )
+                    );
                 return this;
             }
 

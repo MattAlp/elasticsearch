@@ -182,7 +182,7 @@ public class TaskManager implements ClusterStateApplier {
      * For REST actions this will be the case, otherwise {@link Tracer#startTrace} can be used.
      */
     void maybeStartTrace(ThreadContext threadContext, Task task) {
-        if (threadContext.hasParentApmTraceContext() == false) {
+        if (threadContext.hasParentApmTraceContext() == false && threadContext.getTransient(Task.PARENT_TRACE_PARENT_HEADER) == null) {
             return;
         }
         TaskId parentTask = task.getParentTaskId();
