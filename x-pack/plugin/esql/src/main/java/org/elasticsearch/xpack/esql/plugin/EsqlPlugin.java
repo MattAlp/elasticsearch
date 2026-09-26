@@ -608,6 +608,10 @@ public class EsqlPlugin extends Plugin implements ActionPlugin, ExtensiblePlugin
         );
 
         return List.of(
+            new org.elasticsearch.xpack.esql.telemetry.EsqlTracing(
+                services.telemetryProvider().getOpenTelemetry(),
+                services.threadPool().getThreadContext()
+            ),
             new PlanExecutor(
                 new IndexResolver(services.client(), flattenedDataTypeEnabled::get),
                 services.telemetryProvider().getMeterRegistry(),

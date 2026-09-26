@@ -11,17 +11,51 @@ import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.concurrent.AbstractRunnable;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
 import org.elasticsearch.common.util.concurrent.EsRejectedExecutionException;
+import org.elasticsearch.common.util.concurrent.ThreadContext;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.threadpool.FixedExecutorBuilder;
 import org.elasticsearch.threadpool.TestThreadPool;
 
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.hamcrest.Matchers.equalTo;
 
 public class DriverSchedulerTests extends ESTestCase {
+    public void testRejectionAndCancellationRestoreOwnerContext() {
+        for (boolean reject : List.of(false, true)) {
+            var threadContext = new ThreadContext(Settings.EMPTY);
+            var scheduler = new DriverScheduler();
+            var observed = new AtomicReference<String>();
+            AbstractRunnable owned;
+            try (var saved = threadContext.newStoredContext()) {
+                threadContext.putHeader("query", "owner");
+                owned = (AbstractRunnable) threadContext.preserveContext(new AbstractRunnable() {
+                    @Override
+                    protected void doRun() {
+                        observed.set(threadContext.getHeader("query"));
+                    }
+
+                    @Override
+                    public void onFailure(Exception failure) {
+                        observed.set(threadContext.getHeader("query"));
+                    }
+                });
+            }
+            threadContext.putHeader("query", "unrelated");
+            scheduler.scheduleOrRunTask(command -> {
+                if (reject) {
+                    ((AbstractRunnable) command).onRejection(new EsRejectedExecutionException("rejected"));
+                }
+            }, owned);
+            scheduler.runPendingTasks();
+            assertEquals("owner", observed.get());
+            assertEquals("unrelated", threadContext.getHeader("query"));
+        }
+    }
 
     public void testClearPendingTaskOnRejection() {
         DriverScheduler scheduler = new DriverScheduler();

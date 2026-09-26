@@ -101,6 +101,7 @@ public class Driver implements Releasable, Describable {
     private final AtomicBoolean earlyFinished = new AtomicBoolean();
     private final SubscribableListener<Void> completionListener = new SubscribableListener<>();
     private final DriverScheduler scheduler = new DriverScheduler();
+    private volatile Supplier<ThreadContext.StoredContext> completionContext;
     /** Reusable list to collect blocked results, avoiding new allocation on every driver loop. */
     private final List<IsBlockedResult> blockedResults = new ArrayList<>();
 
@@ -299,11 +300,18 @@ public class Driver implements Releasable, Describable {
      * Abort the driver and wait for it to finish
      */
     public void abort(Exception reason, ActionListener<Void> listener) {
+        var restore = completionContext;
+        try (var ignored = restore == null ? null : restore.get()) {
+            abortInContext(reason, listener);
+        }
+    }
+
+    private void abortInContext(Exception reason, ActionListener<Void> listener) {
         finishNanos = System.nanoTime();
         completionListener.addListener(listener);
         if (started.compareAndSet(false, true)) {
             drainAndCloseOperators(reason);
-            completionListener.onFailure(reason);
+            driverContext.waitForAsyncActions(ActionListener.running(() -> completionListener.onFailure(reason)));
         } else {
             cancel(reason.getMessage());
         }
@@ -451,6 +459,7 @@ public class Driver implements Releasable, Describable {
     ) {
         driver.completionListener.addListener(listener);
         if (driver.started.compareAndSet(false, true)) {
+            driver.completionContext = threadContext.newRestorableContext(true);
             LongSupplier currentTimeNanosSupplier = System::nanoTime;
             driver.updateStatus(0, 0, DriverStatus.Status.STARTING, "driver starting", currentTimeNanosSupplier.getAsLong());
             initializeEarlyTerminationChecker(driver);

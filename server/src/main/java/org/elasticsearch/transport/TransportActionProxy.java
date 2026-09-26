@@ -124,6 +124,11 @@ public final class TransportActionProxy {
     }
 
     static class ProxyRequest<T extends TransportRequest> extends AbstractTransportRequest {
+        @Override
+        public boolean shouldTrace() {
+            return wrapped.shouldTrace();
+        }
+
         final T wrapped;
         final DiscoveryNode targetNode;
 

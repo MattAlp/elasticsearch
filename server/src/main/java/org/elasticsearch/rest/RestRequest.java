@@ -116,7 +116,7 @@ public class RestRequest implements ToXContent.Params, Traceable {
 
     /** Attaches the request-owned span once, even when error handling re-enters instrumentation. */
     public synchronized boolean setTraceContext(Context context) {
-        if (traceStarted) {
+        if (traceStarted || traceFinished) {
             return false;
         }
         traceStarted = true;

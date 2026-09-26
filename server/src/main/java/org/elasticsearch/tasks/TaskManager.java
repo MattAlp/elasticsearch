@@ -165,6 +165,7 @@ public class TaskManager implements ClusterStateApplier {
      * tracing a task.
      */
     public Task register(String type, String action, TaskAwareRequest request, boolean traceRequest) {
+        traceRequest &= request.shouldTrace();
         Map<String, String> headers = new HashMap<>();
         long headerSize = 0;
         long maxSize = maxHeaderSize.getBytes();
@@ -190,6 +191,9 @@ public class TaskManager implements ClusterStateApplier {
             headers
         );
         Objects.requireNonNull(task);
+        if (nativeTracer != null && traceRequest == false) {
+            task.borrowTraceContext(TracingContext.current(threadContext));
+        }
         assert task.getParentTaskId().equals(request.getParentTask()) : "Request [ " + request + "] didn't preserve it parentTaskId";
         if (logger.isTraceEnabled()) {
             logger.trace("register {} [{}] [{}] [{}]", task.getId(), type, action, task.getDescription());

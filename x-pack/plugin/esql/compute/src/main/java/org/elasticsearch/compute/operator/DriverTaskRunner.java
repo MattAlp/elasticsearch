@@ -124,6 +124,11 @@ public class DriverTaskRunner {
     private record DriverRequestHandler(TransportService transportService) implements TransportRequestHandler<DriverRequest> {
         @Override
         public void messageReceived(DriverRequest request, TransportChannel channel, Task task) {
+            var status = request.driver.status();
+            io.opentelemetry.api.trace.Span.fromContext(task.getTraceContext())
+                .setAttribute("esql.role", status.description())
+                .setAttribute("esql.driver.id", task.getId())
+                .setAttribute("esql.driver.session_id", request.driver.sessionId());
             var listener = new ChannelActionListener<ActionResponse.Empty>(channel);
             Driver.start(
                 transportService.getThreadPool().getThreadContext(),

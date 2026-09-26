@@ -140,6 +140,9 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
 
     /** Returns the node-owned native API; sampling policy controls recording even for cached native tracers. */
     public OpenTelemetry getOpenTelemetry() {
+        if (enabled == false && traceSupplier instanceof OtelSdkExportTracerSupplier sdkSupplier && sdkSupplier.hasEndpoint() == false) {
+            return OpenTelemetry.noop();
+        }
         return traceSupplier.get();
     }
 
@@ -346,6 +349,10 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
         // If tracing has been disabled, return immediately
         var services = this.services;
         if (services == null) {
+            Deque<Releasable> scopes = legacyScopes.get();
+            if (scopes != null) {
+                scopes.push(() -> {});
+            }
             return;
         }
 

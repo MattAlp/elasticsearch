@@ -51,6 +51,68 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /** Native and legacy instrumentation share one SDK and preserve context across asynchronous boundaries. */
 public class NativeTracingTests extends ESTestCase {
+    public void testDisabledLegacyChildDoesNotEndItsOuterSpan() {
+        try (Fixture fixture = new Fixture(Settings.EMPTY, Sampler.alwaysOn(), 10)) {
+            fixture.tracer.startTrace("outer", Map.of());
+            fixture.tracer.setEnabled(false);
+            fixture.tracer.startTrace("disabled-child", Map.of());
+            fixture.tracer.stopTrace();
+            assertTrue(Span.current().isRecording());
+            fixture.tracer.stopTrace();
+            assertFalse(Span.current().getSpanContext().isValid());
+            assertEquals(List.of("outer"), fixture.exporter.getFinishedSpanItems().stream().map(SpanData::getName).toList());
+        }
+    }
+
+    public void testDetachedWorkDoesNotInheritNativeParent() {
+        try (Fixture fixture = new Fixture(Settings.EMPTY, Sampler.alwaysOn(), 10)) {
+            Span parent = fixture.sdk.getTracer("probe").spanBuilder("parent").startSpan();
+            try (var scope = TracingContext.activate(fixture.context, io.opentelemetry.context.Context.root().with(parent))) {
+                for (int variant = 0; variant < 3; variant++) {
+                    try (var detached = switch (variant) {
+                        case 0 -> fixture.context.newEmptyContext();
+                        case 1 -> fixture.context.newEmptySystemContext();
+                        case 2 -> fixture.context.clearTraceContext();
+                        default -> throw new AssertionError(variant);
+                    }) {
+                        assertFalse(Span.current().getSpanContext().isValid());
+                        assertFalse(Span.fromContext(TracingContext.current(fixture.context)).getSpanContext().isValid());
+                        assertNull(fixture.context.getHeader(Task.TRACE_ID));
+                    }
+                    assertEquals(parent.getSpanContext(), Span.current().getSpanContext());
+                }
+            } finally {
+                parent.end();
+            }
+        }
+    }
+
+    public void testUntracedTaskBorrowsWithoutEndingOrMutatingParent() {
+        try (Fixture fixture = new Fixture(Settings.EMPTY, Sampler.alwaysOn(), 10)) {
+            ThreadPool threadPool = new TestThreadPool("borrowed-task");
+            try {
+                TaskManager manager = new TaskManager(Settings.EMPTY, threadPool, Set.of(), fixture.tracer);
+                manager.setOpenTelemetry(fixture.sdk);
+                Span parent = fixture.sdk.getTracer("probe").spanBuilder("parent").startSpan();
+                try (var scope = parent.makeCurrent()) {
+                    Task message = manager.register("transport", "page-message", new EmptyRequest(), false);
+                    try (var activation = manager.withTaskContext(message)) {
+                        assertEquals(parent.getSpanContext(), Span.current().getSpanContext());
+                    }
+                    message.recordTraceFailure(new IllegalArgumentException("protocol failure"));
+                    manager.unregister(message);
+                    assertTrue(parent.isRecording());
+                } finally {
+                    parent.end();
+                }
+                assertEquals(1, fixture.exporter.getFinishedSpanItems().size());
+                assertEquals(io.opentelemetry.api.trace.StatusCode.UNSET, fixture.span("parent").getStatus().getStatusCode());
+            } finally {
+                terminate(threadPool);
+            }
+        }
+    }
+
     public void testConcurrentQueriesAcrossTcpAndDeferredCallbacks() throws Exception {
         try (Fixture fixture = new Fixture(Settings.EMPTY, Sampler.alwaysOn(), 10)) {
             ThreadPool threadPool = new TestThreadPool("native-tcp-probe");

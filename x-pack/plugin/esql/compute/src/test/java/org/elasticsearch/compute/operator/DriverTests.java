@@ -62,6 +62,17 @@ import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.sameInstance;
 
 public class DriverTests extends ESTestCase {
+    public void testAbortBeforeStartWaitsForAsyncActions() {
+        DriverContext context = driverContext();
+        context.addAsyncAction();
+        Driver driver = createDriver(0, 0, context, List.of(), new ArrayList<>(), TimeValue.timeValueSeconds(1));
+        var completion = new PlainActionFuture<Void>();
+        driver.abort(new TaskCancelledException("cancelled before start"), completion);
+        assertFalse(completion.isDone());
+        context.removeAsyncAction();
+        expectThrows(TaskCancelledException.class, completion::actionGet);
+    }
+
     /**
      * Runs a driver to completion in a single call and asserts that the
      * status and profile returned makes sense.

@@ -38,6 +38,10 @@ base {
 }
 
 dependencies {
+  ['sdk', 'sdk-trace', 'sdk-common', 'sdk-metrics', 'sdk-logs', 'sdk-testing'].each { component ->
+    testImplementation "io.opentelemetry:opentelemetry-${component}:${versions.opentelemetry}"
+    internalClusterTestImplementation "io.opentelemetry:opentelemetry-${component}:${versions.opentelemetry}"
+  }
   compileOnly project(':modules:lang-painless:spi')
   compileOnly project(xpackModule('ml'))
   compileOnly project(':x-pack:plugin:encryption:spi')

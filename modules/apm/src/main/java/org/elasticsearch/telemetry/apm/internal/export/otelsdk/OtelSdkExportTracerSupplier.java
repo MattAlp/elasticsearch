@@ -57,6 +57,11 @@ public class OtelSdkExportTracerSupplier implements TraceSupplier {
         this.meterProvider = meterProvider;
     }
 
+    /** An unconfigured, disabled node can expose the no-op API without initializing an exporter or warning. */
+    public boolean hasEndpoint() {
+        return OtelSdkSettings.TELEMETRY_EXPORT_ENDPOINT.get(settings).isEmpty() == false;
+    }
+
     @Override
     public OpenTelemetry get() {
         synchronized (mutex) {

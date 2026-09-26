@@ -98,6 +98,7 @@ public class Task implements Traceable {
     private volatile Context traceContext = Context.root();
     private boolean traceFinished;
     private boolean traceFailed;
+    private boolean ownsTrace;
 
     @Override
     public Context getTraceContext() {
@@ -105,7 +106,16 @@ public class Task implements Traceable {
     }
 
     /** Attaches the task-owned span before execution starts; callers may only borrow its context. */
-    public void setTraceContext(Context context) {
+    public synchronized void setTraceContext(Context context) {
+        traceContext = Objects.requireNonNull(context);
+        ownsTrace = true;
+        if (traceFinished) {
+            Span.fromContext(context).end();
+        }
+    }
+
+    /** Carries causality through an uninstrumented message without acquiring span ownership. */
+    public synchronized void borrowTraceContext(Context context) {
         traceContext = Objects.requireNonNull(context);
     }
 
@@ -113,6 +123,9 @@ public class Task implements Traceable {
     public synchronized void finishTrace() {
         if (traceFinished == false) {
             traceFinished = true;
+            if (ownsTrace == false) {
+                return;
+            }
             if (traceFailed == false) {
                 Span.fromContext(traceContext)
                     .setAttribute("es.outcome", this instanceof CancellableTask task && task.isCancelled() ? "cancelled" : "success");
@@ -123,7 +136,7 @@ public class Task implements Traceable {
 
     /** Records terminal failure without attaching unbounded exception stacks or changing span ownership. */
     public synchronized void recordTraceFailure(Exception failure) {
-        if (traceFinished == false) {
+        if (traceFinished == false && ownsTrace) {
             traceFailed = true;
             Span span = Span.fromContext(traceContext);
             boolean cancelled = failure instanceof TaskCancelledException;

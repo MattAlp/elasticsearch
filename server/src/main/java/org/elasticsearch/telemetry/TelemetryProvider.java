@@ -36,7 +36,7 @@ public interface TelemetryProvider {
 
     Tracer getTracer();
 
-    /** Supplies the node-owned API without exposing SDK or exporter lifecycle to instrumentation. */
+    /** Supplies native tracing without exposing SDK lifecycle. Metrics continue through {@link #getMeterRegistry()}. */
     default OpenTelemetry getOpenTelemetry() {
         return OpenTelemetry.noop();
     }

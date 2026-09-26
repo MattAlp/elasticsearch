@@ -19,6 +19,11 @@ import java.util.Map;
 import java.util.Objects;
 
 public final class ExchangeRequest extends AbstractTransportRequest {
+    @Override
+    public boolean shouldTrace() {
+        return false;
+    }
+
     private final String exchangeId;
     private final boolean sourcesFinished;
 

@@ -177,6 +177,13 @@ import static org.elasticsearch.xpack.esql.plugin.EsqlPlugin.GROK_WATCHDOG_MAX_E
  * </ul>
  */
 public class ComputeService {
+    private org.elasticsearch.xpack.esql.telemetry.EsqlTracing tracing;
+
+    /** Shares the query's native provider across coordinator and data-node phase instrumentation. */
+    public void setTracing(org.elasticsearch.xpack.esql.telemetry.EsqlTracing tracing) {
+        this.tracing = tracing;
+    }
+
     public static final String DATA_DESCRIPTION = "data";
     public static final String REDUCE_DESCRIPTION = "node_reduce";
     public static final String DATA_ACTION_NAME = EsqlQueryAction.NAME + "/data";
@@ -239,6 +246,10 @@ public class ComputeService {
         this.searchExecutor = threadPool.executor(ThreadPool.Names.SEARCH);
         this.threadPool = threadPool;
         this.driverRunner = new DriverTaskRunner(transportService, searchExecutor);
+        this.tracing = new org.elasticsearch.xpack.esql.telemetry.EsqlTracing(
+            io.opentelemetry.api.OpenTelemetry.noop(),
+            threadPool.getThreadContext()
+        );
         this.enrichLookupService = enrichLookupService;
         this.lookupFromIndexService = lookupFromIndexService;
         this.remoteFetchService = new RemoteFetchService(transportActionServices, this.bigArrays, blockFactory);
@@ -1063,6 +1074,34 @@ public class ComputeService {
         PlanTimeProfile planTimeProfile,
         ActionListener<Result> listener
     ) {
+        tracing.phase(
+            "execution",
+            listener,
+            phaseListener -> executeInternal(
+                sessionId,
+                rootTask,
+                flags,
+                physicalPlan,
+                configuration,
+                foldContext,
+                execInfo,
+                planTimeProfile,
+                phaseListener
+            )
+        );
+    }
+
+    private void executeInternal(
+        String sessionId,
+        CancellableTask rootTask,
+        EsqlFlags flags,
+        PhysicalPlan physicalPlan,
+        Configuration configuration,
+        FoldContext foldContext,
+        EsqlExecutionInfo execInfo,
+        PlanTimeProfile planTimeProfile,
+        ActionListener<Result> listener
+    ) {
         assert ThreadPool.assertCurrentThreadPool(
             ThreadPool.Names.SYSTEM_READ,
             ThreadPool.Names.SEARCH,
@@ -1795,6 +1834,17 @@ public class ComputeService {
             singleValueQueryWarnings
         );
 
+        var planningSpan = tracing.start("planning.local");
+        planningSpan.setAttribute("esql.role", context.description()).setAttribute("esql.fragment.id", context.sessionId());
+        var planningActivation = tracing.activate(planningSpan);
+        var finishPlanning = Releasables.releaseOnce(() -> {
+            try {
+                planningActivation.close();
+            } finally {
+                planningSpan.end();
+            }
+        });
+
         try {
             var workerThreadPool = transportService.getThreadPool();
             var parallelWorkerExecutor = workerThreadPool.executor(EsqlPlugin.computePool());
@@ -1898,6 +1948,8 @@ public class ComputeService {
             }
             String driverSessionId = new TaskId(clusterService.localNode().getId(), task.getId()).toString();
             var drivers = localExecutionPlan.createDrivers(driverSessionId);
+            planningSpan.setAttribute("es.outcome", "success");
+            finishPlanning.close();
             // Note that the drivers themselves do not hold a reference to the search contexts, but rather, these are held (and therefore
             // incremented) by the source operators, and the DocVectors. Since The contexts are pre-created with a count of 1, and then
             // incremented by the relevant source operators, after creating the *data* drivers (and therefore, the source operators), we can
@@ -1971,7 +2023,13 @@ public class ComputeService {
                 Releasables.close(context.searchContexts().iterable());
             }
             LOGGER.debug("Error in ComputeService.runCompute for : " + context.description());
+            if (planningSpan.isRecording()) {
+                org.elasticsearch.xpack.esql.telemetry.EsqlTracing.recordFailure(planningSpan, e);
+            }
+            finishPlanning.close();
             listener.onFailure(e);
+        } finally {
+            finishPlanning.close();
         }
     }
 

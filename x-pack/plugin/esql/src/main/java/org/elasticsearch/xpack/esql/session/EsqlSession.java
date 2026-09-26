@@ -185,6 +185,12 @@ import static org.elasticsearch.xpack.esql.session.SessionUtils.checkPagesBelowS
  * later retrieval if the query was async.
  */
 public class EsqlSession {
+    private org.elasticsearch.xpack.esql.telemetry.EsqlTracing tracing = org.elasticsearch.xpack.esql.telemetry.EsqlTracing.NOOP;
+
+    /** Uses the same native provider and context bridge as query and compute task spans. */
+    public void setTracing(org.elasticsearch.xpack.esql.telemetry.EsqlTracing tracing) {
+        this.tracing = tracing;
+    }
 
     private static final Logger LOGGER = LogManager.getLogger(EsqlSession.class);
 
@@ -418,10 +424,9 @@ public class EsqlSession {
         listener = wrapForAnonymizedFailureLog(listener);
         TimeSpanMarker parsingProfile = executionInfo.queryProfile().parsing();
         parsingProfile.start();
-        EsqlStatement statement = request.parse(
-            parser,
-            SettingsValidationContext.from(crossProjectModeDecider),
-            inferenceService.inferenceSettings()
+        EsqlStatement statement = tracing.phase(
+            "planning.parse",
+            () -> request.parse(parser, SettingsValidationContext.from(crossProjectModeDecider), inferenceService.inferenceSettings())
         );
         // Unwrap EXPLAIN right after parsing: Explain is a leaf plan holding the target query as a
         // field rather than a child, so plan traversals do not descend into it. It must be removed
@@ -1619,6 +1624,21 @@ public class EsqlSession {
         QueryBuilder requestFilter,
         ActionListener<Versioned<LogicalPlan>> logicalPlanListener
     ) {
+        tracing.phase(
+            "planning.analysis",
+            logicalPlanListener,
+            phaseListener -> analyzedPlanInternal(parsed, unmappedResolution, configuration, executionInfo, requestFilter, phaseListener)
+        );
+    }
+
+    private void analyzedPlanInternal(
+        LogicalPlan parsed,
+        UnmappedResolution unmappedResolution,
+        Configuration configuration,
+        EsqlExecutionInfo executionInfo,
+        QueryBuilder requestFilter,
+        ActionListener<Versioned<LogicalPlan>> logicalPlanListener
+    ) {
         assert ThreadPool.assertCurrentThreadPool(ThreadPool.Names.SEARCH);
         executionInfo.queryProfile().setUnmappedResolution(unmappedResolution);
 
@@ -2751,6 +2771,18 @@ public class EsqlSession {
         PhysicalPlanOptimizer physicalPlanOptimizer,
         PlanTimeProfile planTimeProfile
     ) {
+        return tracing.phase(
+            "planning.physical",
+            () -> logicalPlanToPhysicalPlanInternal(optimizedPlan, request, physicalPlanOptimizer, planTimeProfile)
+        );
+    }
+
+    private PhysicalPlan logicalPlanToPhysicalPlanInternal(
+        LogicalPlan optimizedPlan,
+        EsqlQueryRequest request,
+        PhysicalPlanOptimizer physicalPlanOptimizer,
+        PlanTimeProfile planTimeProfile
+    ) {
         // Capture the optimized plan before mapping so a failure in physical planning still
         // surfaces it in the failure log.
         planSnapshot = planSnapshot.withOptimized(optimizedPlan);
@@ -2801,7 +2833,7 @@ public class EsqlSession {
             throw new IllegalStateException("Expected pre-optimized plan");
         }
         long start = planTimeProfile == null ? 0L : System.nanoTime();
-        var plan = logicalPlanOptimizer.optimize(logicalPlan);
+        var plan = tracing.phase("planning.optimize", () -> logicalPlanOptimizer.optimize(logicalPlan));
         if (planTimeProfile != null) {
             planTimeProfile.addLogicalOptimizationPlanTime(System.nanoTime() - start);
         }

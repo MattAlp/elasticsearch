@@ -21,6 +21,11 @@ import java.util.Objects;
  * as streaming and BatchExchangeStatusRequest use different connections.
  */
 public final class BatchExchangeStatusRequest extends AbstractTransportRequest {
+    @Override
+    public boolean shouldTrace() {
+        return false;
+    }
+
     private final String exchangeId;
 
     public BatchExchangeStatusRequest(String exchangeId) {

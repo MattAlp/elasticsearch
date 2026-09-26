@@ -15,6 +15,11 @@ import java.util.Map;
  * An interface for a request that can be used to register a task manager task
  */
 public interface TaskAwareRequest {
+    /** High-volume protocol messages may preserve their parent context without creating their own span. */
+    default boolean shouldTrace() {
+        return true;
+    }
+
     /**
      * Set a reference to task that caused this task to be run.
      */

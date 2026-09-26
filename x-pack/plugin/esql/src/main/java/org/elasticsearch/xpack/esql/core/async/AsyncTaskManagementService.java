@@ -190,7 +190,7 @@ public class AsyncTaskManagementService<
             @SuppressWarnings("unchecked")
             T searchTask = (T) taskManager.register("transport", action + ASYNC_ACTION_SUFFIX, new AsyncRequestWrapper(request, nodeId));
             boolean operationStarted = false;
-            try {
+            try (var tracing = taskManager.withTaskContext(searchTask)) {
                 operation.execute(
                     request,
                     searchTask,
@@ -248,6 +248,7 @@ public class AsyncTaskManagementService<
                 );
             }
         }, e -> {
+            searchTask.recordTraceFailure(e);
             ActionListener<Response> acquiredListener = exclusiveListener.getAndSet(null);
             if (acquiredListener != null) {
                 // We finished before timeout

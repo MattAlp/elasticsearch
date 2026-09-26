@@ -60,6 +60,12 @@ import java.util.function.IntSupplier;
 import static org.elasticsearch.action.ActionListener.wrap;
 
 public class PlanExecutor {
+    private org.elasticsearch.xpack.esql.telemetry.EsqlTracing tracing;
+
+    /** Installs node-owned phase instrumentation before requests are accepted. */
+    public void setTracing(org.elasticsearch.xpack.esql.telemetry.EsqlTracing tracing) {
+        this.tracing = tracing;
+    }
 
     private final IndexResolver indexResolver;
     private final EsqlParser parser;
@@ -290,6 +296,9 @@ public class PlanExecutor {
             services
         );
         QueryMetric clientId = QueryMetric.fromString("rest");
+        if (tracing != null) {
+            session.setTracing(tracing);
+        }
         metrics.total(clientId);
 
         var begin = System.nanoTime();

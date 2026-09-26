@@ -66,6 +66,10 @@ public class APMHttpServerInstrumentation implements HttpServerInstrumentation {
             .spanBuilder(spanNameExtractor.extract(req))
             .setParent(parent);
         tracer.decorateSpan(threadContext, legacyRequestAttributes(req), builder);
+        java.time.Instant received = threadContext.getTransient(org.elasticsearch.tasks.Task.TRACE_START_TIME);
+        if (received != null) {
+            builder.setStartTimestamp(received);
+        }
         var span = builder.startSpan();
         if (request.setTraceContext(TracingContext.withSpan(parent, span)) == false) {
             span.end();

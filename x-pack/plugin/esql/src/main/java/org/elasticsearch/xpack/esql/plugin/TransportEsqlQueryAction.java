@@ -148,12 +148,14 @@ public class TransportEsqlQueryAction extends HandledTransportAction<EsqlQueryRe
         ActionLoggingFieldsProvider fieldProvider,
         ActivityLogWriterProvider logWriterProvider,
         CrossProjectModeDecider crossProjectModeDecider,
-        QueryMetricsListener metricsCollector
+        QueryMetricsListener metricsCollector,
+        org.elasticsearch.xpack.esql.telemetry.EsqlTracing tracing
     ) {
         // TODO replace SAME when removing workaround for https://github.com/elastic/elasticsearch/issues/97916
         super(EsqlQueryAction.NAME, transportService, actionFilters, EsqlQueryRequest::new, EsExecutors.DIRECT_EXECUTOR_SERVICE);
         this.threadPool = threadPool;
         this.planExecutor = planExecutor;
+        this.planExecutor.setTracing(tracing);
         this.clusterService = clusterService;
         this.viewResolver = viewResolver;
         this.requestExecutor = threadPool.executor(ThreadPool.Names.SEARCH);
@@ -252,6 +254,7 @@ public class TransportEsqlQueryAction extends HandledTransportAction<EsqlQueryRe
             operatorFactoryRegistry,
             dataSourceModule.formatReaderRegistry()
         );
+        this.computeService.setTracing(tracing);
 
         this.activityLogger = new QueryLogger<>(
             clusterService.getClusterSettings(),
@@ -376,6 +379,9 @@ public class TransportEsqlQueryAction extends HandledTransportAction<EsqlQueryRe
         TransportVersion localMinimumVersion = clusterService.state().getMinTransportVersion();
         EsqlFlags flags = computeService.createFlags();
         String sessionId = getOrCreateSessionID(task);
+        io.opentelemetry.api.trace.Span.fromContext(task.getTraceContext())
+            .setAttribute("esql.query.id", sessionId)
+            .setAttribute("esql.async", request.async());
         // async-query uses EsqlQueryTask, so pull the EsqlExecutionInfo out of the task
         // sync query uses CancellableTask which does not have EsqlExecutionInfo, so create one
         EsqlExecutionInfo executionInfo = getOrCreateExecutionInfo(task, request);
@@ -416,6 +422,9 @@ public class TransportEsqlQueryAction extends HandledTransportAction<EsqlQueryRe
                 planExecutor.metrics().recordTook(executionInfo.overallTook().millis());
                 collectMetrics(result.inner());
                 var response = toResponse(task, request, request.profile(), result);
+                io.opentelemetry.api.trace.Span.fromContext(task.getTraceContext())
+                    .setAttribute("esql.partial", executionInfo.isPartial())
+                    .setAttribute("esql.stopped", executionInfo.isStopped());
                 assert response.isAsync() == request.async() : "The response must be async if the request was async";
 
                 if (response.isAsync()) {

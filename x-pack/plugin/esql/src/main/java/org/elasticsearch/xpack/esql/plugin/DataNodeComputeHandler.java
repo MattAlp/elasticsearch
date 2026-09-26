@@ -926,6 +926,9 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
 
     @Override
     public void messageReceived(DataNodeRequest request, TransportChannel channel, Task task) {
+        io.opentelemetry.api.trace.Span.fromContext(task.getTraceContext())
+            .setAttribute("esql.fragment.id", request.sessionId())
+            .setAttribute("esql.shard_count", request.shards().size());
         ActionListener<DataNodeComputeResponse> channelListener = new ChannelActionListener<>(channel);
         // Old coordinators receive warnings as transport response headers rather than the ESQL_DRIVER_WARNINGS
         // wire field. Emit them here — before the channel serialises its ThreadContext — so they are included.
