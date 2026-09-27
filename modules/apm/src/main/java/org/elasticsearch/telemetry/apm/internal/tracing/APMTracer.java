@@ -488,11 +488,12 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
         }
     }
 
-    public void setAttributes(Traceable traceable, Attributes attributes) {
-        final var span = Span.fromContextOrNull(spans.get(traceable.getSpanId()));
-        if (span != null) {
-            span.setAllAttributes(attributes);
-        }
+    /**
+     * Returns the OTel span associated with a request so synchronous instrumentation can use the API directly.
+     */
+    public Span getSpan(Traceable traceable) {
+        final Span span = Span.fromContextOrNull(spans.get(traceable.getSpanId()));
+        return span == null ? Span.getInvalid() : span;
     }
 
     @Override

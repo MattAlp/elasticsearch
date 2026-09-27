@@ -10,6 +10,7 @@
 package org.elasticsearch.telemetry.apm.internal.instrumentation;
 
 import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.context.Context;
 import io.opentelemetry.instrumentation.api.instrumenter.AttributesExtractor;
 import io.opentelemetry.instrumentation.api.instrumenter.SpanNameExtractor;
@@ -59,7 +60,7 @@ public class APMHttpServerInstrumentation implements HttpServerInstrumentation {
 
         var attributes = Attributes.builder();
         httpServerAttributesExtractor.onStart(attributes, /* we don't care about the context in this case */ Context.root(), req);
-        tracer.setAttributes(request, attributes.build());
+        tracer.getSpan(request).setAllAttributes(attributes.build());
     }
 
     private Map<String, Object> legacyRequestAttributes(RequestAndRoute req) {
@@ -81,7 +82,8 @@ public class APMHttpServerInstrumentation implements HttpServerInstrumentation {
 
     @Override
     public void end(RestRequest request, RestResponse response) {
-        setLegacyResponseAttributes(request, response);
+        Span span = tracer.getSpan(request);
+        setLegacyResponseAttributes(span, response);
 
         var requestAndRoute = new RequestAndRoute(request, /* only needed at start */ null);
         var attributes = Attributes.builder();
@@ -92,15 +94,14 @@ public class APMHttpServerInstrumentation implements HttpServerInstrumentation {
             response,
             null
         );
-        tracer.setAttributes(request, attributes.build());
+        span.setAllAttributes(attributes.build());
 
         httpSpanStatusExtractor.extract(tracer.spanStatusBuilder(request), requestAndRoute, response, null);
         tracer.stopTrace(request);
     }
 
-    private void setLegacyResponseAttributes(RestRequest request, RestResponse response) {
-        tracer.setAttribute(request, "http.status_code", response.status().getStatus());
-        response.getHeaders()
-            .forEach((key, values) -> tracer.setAttribute(request, "http.response.headers." + key, String.join("; ", values)));
+    private void setLegacyResponseAttributes(Span span, RestResponse response) {
+        span.setAttribute("http.status_code", response.status().getStatus());
+        response.getHeaders().forEach((key, values) -> span.setAttribute("http.response.headers." + key, String.join("; ", values)));
     }
 }

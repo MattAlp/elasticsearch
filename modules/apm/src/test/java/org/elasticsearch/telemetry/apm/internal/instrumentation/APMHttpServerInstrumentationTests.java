@@ -10,6 +10,7 @@
 package org.elasticsearch.telemetry.apm.internal.instrumentation;
 
 import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.StatusCode;
 import io.opentelemetry.instrumentation.api.instrumenter.SpanStatusBuilder;
 
@@ -36,6 +37,7 @@ import static org.mockito.Mockito.when;
 public class APMHttpServerInstrumentationTests extends ESTestCase {
 
     final SpanStatusBuilder spanStatusBuilder = mock(SpanStatusBuilder.class);
+    final Span span = mock(Span.class);
     final APMTracer tracer = mock(APMTracer.class);
     final APMHttpServerInstrumentation instrumentation = new APMHttpServerInstrumentation(tracer);
 
@@ -46,10 +48,11 @@ public class APMHttpServerInstrumentationTests extends ESTestCase {
             .withHeaders(Map.of("Accept-Encoding", List.of("gzip")))
             .build();
         ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
+        when(tracer.getSpan(request)).thenReturn(span);
 
         instrumentation.start(threadContext, request, "/{index}/_search");
 
-        var inOrder = inOrder(tracer);
+        var inOrder = inOrder(tracer, span);
         inOrder.verify(tracer)
             .startTrace(
                 threadContext,
@@ -66,9 +69,9 @@ public class APMHttpServerInstrumentationTests extends ESTestCase {
                     "gzip"
                 )
             );
-        inOrder.verify(tracer)
-            .setAttributes(
-                request,
+        inOrder.verify(tracer).getSpan(request);
+        inOrder.verify(span)
+            .setAllAttributes(
                 Attributes.builder()
                     .put(stringKey("http.request.method"), "GET")
                     .put(stringKey("url.scheme"), "https")
@@ -93,10 +96,11 @@ public class APMHttpServerInstrumentationTests extends ESTestCase {
             )
             .build();
         ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
+        when(tracer.getSpan(request)).thenReturn(span);
 
         instrumentation.start(threadContext, request, "/{index}/_search");
 
-        var inOrder = inOrder(tracer);
+        var inOrder = inOrder(tracer, span);
         inOrder.verify(tracer)
             .startTrace(
                 threadContext,
@@ -119,9 +123,9 @@ public class APMHttpServerInstrumentationTests extends ESTestCase {
                     "Firefox"
                 )
             );
-        inOrder.verify(tracer)
-            .setAttributes(
-                request,
+        inOrder.verify(tracer).getSpan(request);
+        inOrder.verify(span)
+            .setAllAttributes(
                 Attributes.builder()
                     .put(stringKey("http.request.method"), "GET")
                     .put(stringKey("http.route"), "/{index}/_search")
@@ -155,14 +159,15 @@ public class APMHttpServerInstrumentationTests extends ESTestCase {
             .withPath("/my-index/_search")
             .build();
         RestResponse response = new RestResponse(RestStatus.OK, RestResponse.TEXT_CONTENT_TYPE, BytesArray.EMPTY);
+        when(tracer.getSpan(request)).thenReturn(span);
 
         instrumentation.end(request, response);
 
-        var inOrder = inOrder(tracer, spanStatusBuilder);
-        inOrder.verify(tracer).setAttribute(request, "http.status_code", 200L);
-        inOrder.verify(tracer)
-            .setAttributes(
-                request,
+        var inOrder = inOrder(tracer, span, spanStatusBuilder);
+        inOrder.verify(tracer).getSpan(request);
+        inOrder.verify(span).setAttribute("http.status_code", 200L);
+        inOrder.verify(span)
+            .setAllAttributes(
                 Attributes.builder()
                     .put(longKey("http.response.status_code"), 200L)
                     .put(stringKey("network.protocol.version"), "1.1")
@@ -178,15 +183,16 @@ public class APMHttpServerInstrumentationTests extends ESTestCase {
             .build();
         RestResponse response = new RestResponse(RestStatus.INTERNAL_SERVER_ERROR, RestResponse.TEXT_CONTENT_TYPE, BytesArray.EMPTY);
 
+        when(tracer.getSpan(request)).thenReturn(span);
         when(tracer.spanStatusBuilder(request)).thenReturn(spanStatusBuilder);
 
         instrumentation.end(request, response);
 
-        var inOrder = inOrder(tracer, spanStatusBuilder);
-        inOrder.verify(tracer).setAttribute(request, "http.status_code", 500L);
-        inOrder.verify(tracer)
-            .setAttributes(
-                request,
+        var inOrder = inOrder(tracer, span, spanStatusBuilder);
+        inOrder.verify(tracer).getSpan(request);
+        inOrder.verify(span).setAttribute("http.status_code", 500L);
+        inOrder.verify(span)
+            .setAllAttributes(
                 Attributes.builder()
                     .put(longKey("http.response.status_code"), 500L)
                     .put(stringKey("error.type"), "500")

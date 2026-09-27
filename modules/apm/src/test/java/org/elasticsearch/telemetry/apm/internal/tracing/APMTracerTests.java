@@ -692,16 +692,19 @@ public class APMTracerTests extends ESTestCase {
         assertThat(attrs.getValue().get(AttributeKey.stringKey("exception.message")), nullValue());
     }
 
-    public void test_setAttributes_callsSetAllAttributes() {
+    public void test_getSpan_returnsRecordedSpanOrInvalidSpan() {
         Settings settings = Settings.builder().put(APMAgentSettings.TELEMETRY_TRACING_ENABLED_SETTING.getKey(), true).build();
         APMTracer tracer = buildTracer(settings);
+        assertFalse(tracer.getSpan(TRACEABLE1).getSpanContext().isValid());
         tracer.startTrace(new ThreadContext(settings), TRACEABLE1, "name1", Map.of());
         Span recordedSpan = Span.fromContext(tracer.getSpans().get(TRACEABLE1.getSpanId()));
 
         Attributes attributes = Attributes.of(AttributeKey.stringKey("http.method"), "GET", AttributeKey.longKey("http.status_code"), 200L);
-        tracer.setAttributes(TRACEABLE1, attributes);
+        tracer.getSpan(TRACEABLE1).setAllAttributes(attributes);
 
         Mockito.verify(recordedSpan).setAllAttributes(attributes);
+        tracer.stopTrace(TRACEABLE1);
+        assertFalse(tracer.getSpan(TRACEABLE1).getSpanContext().isValid());
     }
 
     static class SpyAPMTracer extends APMTracer {
