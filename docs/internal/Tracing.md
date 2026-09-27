@@ -20,7 +20,7 @@ not add ES|QL engine-specific spans.
 | `SanitizingSpanExporter` | Attribute privacy at the final export boundary |
 | `ThreadContext` | Capture and restore native context across ES execution boundaries |
 | `TracingContext` | Explicit activation, wire propagation, and common failure classification |
-| `SpanOwner` | Exactly-once completion of task and HTTP operation spans |
+| `Task` / `RestRequest` | Own their span's context and its exactly-once completion |
 | Instrumentation | Meaningful span boundaries, native attributes, and terminal outcomes |
 
 Core code depends on the OTel API and context libraries, not SDK implementations.
@@ -81,14 +81,23 @@ Manual registration sites must use `TaskManager.withTaskContext(task)` while
 executing or scheduling the task's work. An intentionally untraced task borrows
 context without gaining permission to mutate or end the parent's span.
 
-Unregistering ends the owned task span. Every failure path must record its failure
-**before** unregistering, including failures stored in async-response documents
-or represented inside response objects. An initial async response is not the
-completion of the background operation. Duplicate cleanup must not end a parent
-or export an additional span.
+Registration attaches the span before the task is published, so a concurrent
+unregister can never end a span that has not been attached yet.
 
-HTTP spans end at the response boundary, not when dispatch returns. HTTP request
-wrappers share their original request's span owner. Request dispatch and deferred
+Unregistering ends the owned task span. A task span records lifetime and
+parentage only: it carries no `es.outcome` or `error.type` attribute and its
+status is left `UNSET`, because `TaskManager.unregister` has no result to
+inspect and failure is already reported to the caller. Failure is never inferred
+from child spans. An initial async response is not the completion of the
+background operation, so the span ends when the background work does. Duplicate
+cleanup must not end a parent or export an additional span.
+
+HTTP spans end at the response boundary, not when dispatch returns. Unlike task
+unregistration, HTTP completion has a `RestResponse` to inspect, so HTTP spans
+keep their response attributes and status. A response that reaches the end hook
+without a start hook, and a duplicated end, annotate and end nothing. HTTP
+request wrappers and copies share the original request's tracing state, even
+when the copy was made before tracing started. Request dispatch and deferred
 interceptor continuations activate that context before invoking handlers.
 
 Incoming transport work extracts W3C context from the received headers using a
@@ -97,9 +106,9 @@ the active context at dispatch. Existing header-map serialization and W3C header
 names are unchanged; this migration adds no transport-version fields. Log
 correlation continues to use `trace.id`.
 
-Failure classification unwraps Elasticsearch wrapper exceptions. A transported
-`TaskCancelledException` yields `es.outcome=cancelled`, not `StatusCode.ERROR`.
-The first recorded task failure wins over subsequent cleanup failures.
+Failure classification for component spans unwraps Elasticsearch wrapper
+exceptions. A transported `TaskCancelledException` yields `es.outcome=cancelled`,
+not `StatusCode.ERROR`.
 
 ## Preserved policy and deliberate changes
 

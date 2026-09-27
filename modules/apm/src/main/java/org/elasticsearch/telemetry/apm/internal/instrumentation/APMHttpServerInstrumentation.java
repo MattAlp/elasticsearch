@@ -12,7 +12,6 @@ package org.elasticsearch.telemetry.apm.internal.instrumentation;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
-import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.api.trace.StatusCode;
 import io.opentelemetry.api.trace.Tracer;
@@ -60,70 +59,73 @@ public class APMHttpServerInstrumentation implements HttpServerInstrumentation {
 
     @Override
     public void start(ThreadContext threadContext, RestRequest request, String matchedRoute) {
-        synchronized (request) {
-            if (request.isTraceStarted()) {
-                return;
-            }
-            var req = new RequestAndRoute(request, matchedRoute);
-            Context parent = TracingContext.extract(threadContext);
-            var attributes = Attributes.builder();
-            httpServerAttributesExtractor.onStart(attributes, parent, req);
-            // TODO: Preserve header capture for compatibility; revisit an explicit allowlist independently of this migration.
-            req.request().getHeaders().forEach((key, values) -> {
-                attributes.put(
-                    AttributeKey.stringArrayKey("http.request.header." + key.toLowerCase(Locale.ROOT)),
-                    values == null ? List.of() : values
-                );
-            });
-            String opaqueId = threadContext.getHeader(Task.X_OPAQUE_ID_HTTP_HEADER);
-            if (opaqueId != null) {
-                attributes.put("es.x-opaque-id", opaqueId);
-            }
-            String projectId = threadContext.getHeader(Task.X_ELASTIC_PROJECT_ID_HTTP_HEADER);
-            if (projectId != null) {
-                attributes.put("project.id", projectId);
-            }
-            var builder = tracer.spanBuilder(spanNameExtractor.extract(req))
-                .setParent(parent)
-                .setSpanKind(SpanKind.SERVER)
-                .setAllAttributes(attributes.build());
-            Instant received = threadContext.getTransient(Task.TRACE_START_TIME);
-            if (received != null) {
-                builder.setStartTimestamp(received);
-            }
-            request.startTrace(parent, builder.startSpan());
+        if (request.isTraceStarted()) {
+            return;
         }
+        var req = new RequestAndRoute(request, matchedRoute);
+        Context parent = TracingContext.extract(threadContext);
+        var attributes = Attributes.builder();
+        httpServerAttributesExtractor.onStart(attributes, parent, req);
+        // TODO: Preserve header capture for compatibility; revisit an explicit allowlist independently of this migration.
+        req.request().getHeaders().forEach((key, values) -> {
+            attributes.put(
+                AttributeKey.stringArrayKey("http.request.header." + key.toLowerCase(Locale.ROOT)),
+                values == null ? List.of() : values
+            );
+        });
+        String opaqueId = threadContext.getHeader(Task.X_OPAQUE_ID_HTTP_HEADER);
+        if (opaqueId != null) {
+            attributes.put("es.x-opaque-id", opaqueId);
+        }
+        String projectId = threadContext.getHeader(Task.X_ELASTIC_PROJECT_ID_HTTP_HEADER);
+        if (projectId != null) {
+            attributes.put("project.id", projectId);
+        }
+        var builder = tracer.spanBuilder(spanNameExtractor.extract(req))
+            .setParent(parent)
+            .setSpanKind(SpanKind.SERVER)
+            .setAllAttributes(attributes.build());
+        Instant received = threadContext.getTransient(Task.TRACE_START_TIME);
+        if (received != null) {
+            builder.setStartTimestamp(received);
+        }
+        // Loses the race harmlessly: startTrace ends the span it rejects.
+        request.startTrace(parent, builder.startSpan());
     }
 
     @Override
     public void recordException(RestRequest request, Throwable t) {
-        Span.fromContext(request.getTraceContext()).recordException(t);
+        request.withTraceSpan(span -> span.recordException(t));
     }
 
     @Override
     public void end(RestRequest request, RestResponse response) {
-        var requestAndRoute = new RequestAndRoute(request, /* only needed at start */ null);
-        var attributes = Attributes.builder();
-        httpServerAttributesExtractor.onEnd(
-            attributes,
-            /* we don't care about the context in this case */ Context.root(),
-            requestAndRoute,
-            response,
-            null
-        );
-        Span span = Span.fromContext(request.getTraceContext());
-        response.getHeaders()
-            .forEach(
-                (key, values) -> attributes.put(AttributeKey.stringArrayKey("http.response.header." + key.toLowerCase(Locale.ROOT)), values)
+        // Bad requests can reach this hook without ever reaching start(); annotating and ending is then skipped entirely.
+        request.finishTrace(span -> {
+            var requestAndRoute = new RequestAndRoute(request, /* only needed at start */ null);
+            var attributes = Attributes.builder();
+            httpServerAttributesExtractor.onEnd(
+                attributes,
+                /* we don't care about the context in this case */ Context.root(),
+                requestAndRoute,
+                response,
+                null
             );
-        span.setAllAttributes(attributes.build());
-        httpSpanStatusExtractor.extract(new SpanStatusBuilder() {
-            @Override
-            public SpanStatusBuilder setStatus(StatusCode status, String description) {
-                span.setStatus(status, description);
-                return this;
-            }
-        }, requestAndRoute, response, null);
-        request.finishTrace();
+            response.getHeaders()
+                .forEach(
+                    (key, values) -> attributes.put(
+                        AttributeKey.stringArrayKey("http.response.header." + key.toLowerCase(Locale.ROOT)),
+                        values
+                    )
+                );
+            span.setAllAttributes(attributes.build());
+            httpSpanStatusExtractor.extract(new SpanStatusBuilder() {
+                @Override
+                public SpanStatusBuilder setStatus(StatusCode status, String description) {
+                    span.setStatus(status, description);
+                    return this;
+                }
+            }, requestAndRoute, response, null);
+        });
     }
 }

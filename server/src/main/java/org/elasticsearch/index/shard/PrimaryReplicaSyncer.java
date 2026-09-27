@@ -207,7 +207,6 @@ public class PrimaryReplicaSyncer {
 
             @Override
             public void onFailure(Exception e) {
-                resyncTask.recordTraceFailure(e);
                 resyncTask.setPhase("finished");
                 taskManager.unregister(resyncTask);
                 parentListener.onFailure(e);

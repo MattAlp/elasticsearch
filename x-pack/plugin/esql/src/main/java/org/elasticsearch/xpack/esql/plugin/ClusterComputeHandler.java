@@ -123,11 +123,7 @@ final class ClusterComputeHandler implements TransportRequestHandler<ClusterComp
                         return;
                     }
                     onGroupFailure = computeService.cancelQueryOnFailure(groupTask);
-                    l = ActionListener.runAfter(l, () -> transportService.getTaskManager().unregister(groupTask))
-                        .delegateResponse((failedListener, failure) -> {
-                            groupTask.recordTraceFailure(failure);
-                            failedListener.onFailure(failure);
-                        });
+                    l = ActionListener.runAfter(l, () -> transportService.getTaskManager().unregister(groupTask));
                 }
                 try (
                     Releasable taskScope = groupTask == rootTask ? () -> {} : transportService.getTaskManager().withTaskContext(groupTask);

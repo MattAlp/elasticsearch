@@ -86,22 +86,12 @@ public final class TracingContext {
 
     /** Transport envelopes must not turn routine cancellation into a server error. */
     public static void recordFailure(Span span, Throwable failure) {
-        failure(failure).record(span);
-    }
-
-    static Failure failure(Throwable failure) {
         Throwable cause = ExceptionsHelper.unwrapCause(failure);
-        return new Failure(cause.getClass().getName(), cause instanceof TaskCancelledException);
-    }
-
-    /** Bounded metadata survives registration/completion races without retaining an exception or its stack. */
-    record Failure(String type, boolean cancelled) {
-        void record(Span span) {
-            span.setAttribute("es.outcome", cancelled ? "cancelled" : "failure");
-            span.setAttribute("error.type", type);
-            if (cancelled == false) {
-                span.setStatus(StatusCode.ERROR);
-            }
+        boolean cancelled = cause instanceof TaskCancelledException;
+        span.setAttribute("es.outcome", cancelled ? "cancelled" : "failure");
+        span.setAttribute("error.type", cause.getClass().getName());
+        if (cancelled == false) {
+            span.setStatus(StatusCode.ERROR);
         }
     }
 }

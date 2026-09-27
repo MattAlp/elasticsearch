@@ -16,7 +16,6 @@ import org.elasticsearch.action.ActionResponse;
 import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.common.io.stream.NamedWriteable;
 import org.elasticsearch.core.Nullable;
-import org.elasticsearch.telemetry.tracing.SpanOwner;
 import org.elasticsearch.xcontent.ToXContent;
 import org.elasticsearch.xcontent.ToXContentObject;
 
@@ -24,6 +23,7 @@ import java.io.IOException;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static java.util.Objects.requireNonNull;
 
@@ -31,30 +31,47 @@ import static java.util.Objects.requireNonNull;
  * Current task information
  */
 public class Task {
-    private final SpanOwner tracing = new SpanOwner();
+    /**
+     * The span this task owns, if any, wrapped in the context it was started under.
+     * <p>
+     * A task either <em>owns</em> a span created for it at registration, or <em>borrows</em> the context of the work
+     * that created it. A borrowed context is downgraded to a non-recording span, so that an intentionally untraced
+     * task propagates causality to its children but can never end or annotate its parent's span.
+     * <p>
+     * {@link TaskManager} starts the span before publishing the task, so the span is always in place before any other
+     * thread can reach it. Cleanup, however, may be attempted more than once, hence {@link #traceFinished}.
+     */
+    private volatile Context traceContext = Context.root();
+
+    private final AtomicBoolean traceFinished = new AtomicBoolean();
 
     public Context getTraceContext() {
-        return tracing.context();
+        return traceContext;
     }
 
     /** Registration owns the span; executions and callbacks only borrow its context. */
     public void startTrace(Context parent, Span span) {
-        tracing.attach(parent, span);
+        assert traceFinished.get() == false : "task span started after the task was unregistered";
+        traceContext = parent.with(span);
     }
 
-    /** Carries causality through an intentionally uninstrumented task. */
+    /** Carries causality through an intentionally uninstrumented task, without taking ownership of the parent span. */
     public void borrowTraceContext(Context parent) {
-        tracing.borrow(parent);
+        var spanContext = Span.fromContext(parent).getSpanContext();
+        traceContext = spanContext.isValid() ? parent.with(Span.wrap(spanContext)) : parent;
     }
 
-    /** Terminal callbacks must record failure before unregistering. */
-    public void recordTraceFailure(Throwable failure) {
-        tracing.fail(failure);
-    }
-
-    /** Unregistration is the terminal boundary, not the end of an individual execution slice. */
+    /**
+     * Unregistration is the terminal boundary, not the end of an individual execution slice. Duplicate cleanup is a
+     * no-op, and so is cleanup of a borrowed context, whose span is non-recording.
+     * <p>
+     * The span carries no outcome of its own: a task has no universally available result at this point, and inferring
+     * one from cancellation state or from child spans is unreliable, so the OTel status is deliberately left unset.
+     */
     public void finishTrace() {
-        tracing.end(this instanceof CancellableTask task && task.isCancelled() ? "cancelled" : "success");
+        if (traceFinished.compareAndSet(false, true)) {
+            Span.fromContext(traceContext).end();
+        }
     }
 
     /**

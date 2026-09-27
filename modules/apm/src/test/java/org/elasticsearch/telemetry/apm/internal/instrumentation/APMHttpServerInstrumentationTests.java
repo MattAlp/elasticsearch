@@ -19,6 +19,7 @@ import io.opentelemetry.context.Context;
 
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.concurrent.ThreadContext;
+import org.elasticsearch.rest.FilteredRestRequest;
 import org.elasticsearch.rest.RestRequest;
 import org.elasticsearch.rest.RestResponse;
 import org.elasticsearch.rest.RestStatus;
@@ -30,6 +31,7 @@ import org.elasticsearch.test.rest.FakeRestRequest;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /** HTTP boundaries use native spans while retaining capture and sanitization policy. */
 public class APMHttpServerInstrumentationTests extends ESTestCase {
@@ -113,6 +115,62 @@ public class APMHttpServerInstrumentationTests extends ESTestCase {
             assertEquals(StatusCode.ERROR, span.getStatus().getStatusCode());
             assertEquals(1, span.getEvents().size());
             assertNull(span.getEvents().getFirst().getAttributes().get(AttributeKey.stringKey("exception.stacktrace")));
+        }
+    }
+
+    /**
+     * Malformed requests are rejected before routing, so they reach the end hook without ever reaching the start hook.
+     * Nothing may be ended or annotated then, in particular not the inbound parent span the request borrowed.
+     */
+    public void testResponseWithoutStartEndsAndAnnotatesNothing() {
+        try (var fixture = new NativeTracingFixture(Settings.EMPTY)) {
+            var instrumentation = new APMHttpServerInstrumentation(fixture.api);
+            var incoming = fixture.sdk.getTracer("client").spanBuilder("incoming").startSpan();
+            var context = new ThreadContext(Settings.EMPTY);
+            W3CTraceContextPropagator.getInstance().inject(Context.root().with(incoming), context, ThreadContext::putHeader);
+            var request = new FakeRestRequest.Builder(xContentRegistry()).withPath("/_test").build();
+            request.borrowTraceContext(TracingContext.extract(context));
+
+            instrumentation.recordException(request, new IllegalArgumentException("malformed"));
+            instrumentation.end(request, new RestResponse(RestStatus.BAD_REQUEST, "text/plain", "malformed"));
+
+            assertEquals(List.of(), fixture.exporter.getFinishedSpanItems());
+            assertTrue(incoming.isRecording());
+            incoming.end();
+            var borrowed = fixture.exporter.getFinishedSpanItems().getFirst();
+            assertEquals(StatusCode.UNSET, borrowed.getStatus().getStatusCode());
+            assertEquals(0, borrowed.getEvents().size());
+            assertNull(borrowed.getAttributes().get(AttributeKey.longKey("http.response.status_code")));
+        }
+    }
+
+    /**
+     * Handlers may wrap a request at any point, including before instrumentation starts. A wrapper and its original
+     * are the same HTTP operation, so a span started through either must be visible and endable through both.
+     */
+    public void testWrappedRequestSharesTracingStateWithTheOriginal() {
+        try (var fixture = new NativeTracingFixture(Settings.EMPTY)) {
+            var instrumentation = new APMHttpServerInstrumentation(fixture.api);
+            var context = new ThreadContext(Settings.EMPTY);
+            var request = new FakeRestRequest.Builder(xContentRegistry()).withPath("/_test").build();
+            // Copied before tracing starts, so it cannot have inherited a span at construction time.
+            var wrapper = new FilteredRestRequest(request, Set.of("secret"));
+            assertFalse(wrapper.isTraceStarted());
+
+            instrumentation.start(context, request, "/_test");
+            assertTrue(wrapper.isTraceStarted());
+            assertEquals(request.getTraceContext(), wrapper.getTraceContext());
+            // Starting again through the wrapper must not open a second span.
+            instrumentation.start(context, wrapper, "/_test");
+
+            instrumentation.end(wrapper, new RestResponse(RestStatus.OK, "text/plain", "ok"));
+            // The original now sees the completed span too, so responding twice cannot end it again.
+            instrumentation.end(request, new RestResponse(RestStatus.INTERNAL_SERVER_ERROR, "text/plain", "failed"));
+
+            assertEquals(1, fixture.exporter.getFinishedSpanItems().size());
+            var span = fixture.exporter.getFinishedSpanItems().getFirst();
+            assertEquals(Long.valueOf(200), span.getAttributes().get(AttributeKey.longKey("http.response.status_code")));
+            assertEquals(StatusCode.UNSET, span.getStatus().getStatusCode());
         }
     }
 

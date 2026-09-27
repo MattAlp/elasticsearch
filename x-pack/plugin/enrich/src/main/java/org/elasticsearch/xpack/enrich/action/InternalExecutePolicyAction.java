@@ -199,7 +199,6 @@ public class InternalExecutePolicyAction extends ActionType<Response> {
                             taskManager.unregister(task);
                             listener.onResponse(result);
                         }, e -> {
-                            task.recordTraceFailure(e);
                             taskManager.unregister(task);
                             listener.onFailure(e);
                         })
@@ -210,7 +209,6 @@ public class InternalExecutePolicyAction extends ActionType<Response> {
                         parentListener.onResponse(new Response(taskId));
                     }
                 } catch (Exception e) {
-                    task.recordTraceFailure(e);
                     taskManager.unregister(task);
                     throw e;
                 }

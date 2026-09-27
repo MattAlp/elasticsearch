@@ -189,7 +189,6 @@ public class TransportSubmitAsyncSearchAction extends HandledTransportAction<Sub
                     }
                 }, request.getWaitForCompletionTimeout(), true); // TODO do we want have the option for partial results in the submit?
             } catch (Exception failure) {
-                searchTask.recordTraceFailure(failure);
                 taskManager.unregister(searchTask);
                 searchTask.close();
                 throw failure;
@@ -248,7 +247,6 @@ public class TransportSubmitAsyncSearchAction extends HandledTransportAction<Sub
         try {
             task.addCompletionListener(finalResponse -> {
                 try (task) {
-                    task.recordTraceFailure(error);
                     taskManager.unregister(task);
                 }
             });

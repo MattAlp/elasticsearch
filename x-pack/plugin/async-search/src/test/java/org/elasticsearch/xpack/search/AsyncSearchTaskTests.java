@@ -215,18 +215,19 @@ public class AsyncSearchTaskTests extends ESTestCase {
         }
     }
 
-    public void testFailureBeforeInitialResponseIsTraced() throws Exception {
+    public void testTaskSpanOutlivesFailureBeforeInitialResponse() throws Exception {
         assertFailureIsTraced(false, new IllegalArgumentException("failure"));
     }
 
-    public void testFailureAfterInitialResponseIsTraced() throws Exception {
+    public void testTaskSpanOutlivesFailureAfterInitialResponse() throws Exception {
         assertFailureIsTraced(true, new IllegalArgumentException("failure"));
     }
 
-    public void testCancellationAfterInitialResponseIsTraced() throws Exception {
+    public void testTaskSpanOutlivesCancellationAfterInitialResponse() throws Exception {
         assertFailureIsTraced(true, new TaskCancelledException("cancelled"));
     }
 
+    /** The span must survive the initial response and end exactly once, when the search actually completes. */
     private void assertFailureIsTraced(boolean afterInitialResponse, Exception failure) throws Exception {
         var exporter = InMemorySpanExporter.create();
         try (
@@ -257,10 +258,10 @@ public class AsyncSearchTaskTests extends ESTestCase {
             task.getSearchProgressActionListener().onFailure(failure);
             assertBusy(() -> assertEquals(1, exporter.getFinishedSpanItems().size()));
             var recorded = exporter.getFinishedSpanItems().getFirst();
-            boolean cancelled = failure instanceof TaskCancelledException;
-            assertEquals(cancelled ? "cancelled" : "failure", recorded.getAttributes().get(AttributeKey.stringKey("es.outcome")));
-            assertEquals(cancelled ? StatusCode.UNSET : StatusCode.ERROR, recorded.getStatus().getStatusCode());
-            assertEquals(failure.getClass().getName(), recorded.getAttributes().get(AttributeKey.stringKey("error.type")));
+            // The task span records lifetime only; the failure is reported through the async search response.
+            assertEquals(StatusCode.UNSET, recorded.getStatus().getStatusCode());
+            assertNull(recorded.getAttributes().get(AttributeKey.stringKey("es.outcome")));
+            assertNull(recorded.getAttributes().get(AttributeKey.stringKey("error.type")));
         }
     }
 

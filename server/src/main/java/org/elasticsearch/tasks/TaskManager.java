@@ -164,28 +164,32 @@ public class TaskManager implements ClusterStateApplier {
             headers
         );
         Objects.requireNonNull(task);
-        if (traceRequest == false) {
+        assert task.getParentTaskId().equals(request.getParentTask()) : "Request [ " + request + "] didn't preserve it parentTaskId";
+        // The span must exist before the task is published, otherwise a concurrent unregister could complete the task
+        // before it has one, and the span would never be ended.
+        if (traceRequest) {
+            maybeStartTrace(threadContext, task);
+        } else {
             task.borrowTraceContext(Context.current());
         }
-        assert task.getParentTaskId().equals(request.getParentTask()) : "Request [ " + request + "] didn't preserve it parentTaskId";
         if (logger.isTraceEnabled()) {
             logger.trace("register {} [{}] [{}] [{}]", task.getId(), type, action, task.getDescription());
         }
 
         if (task instanceof CancellableTask) {
-            registerCancellableTask(task, request.getRequestId(), traceRequest);
+            registerCancellableTask(task, request.getRequestId());
         } else {
             Task previousTask = tasks.put(task.getId(), task);
             assert previousTask == null;
-            if (traceRequest) {
-                maybeStartTrace(threadContext, task);
-            }
         }
         return task;
     }
 
     /**
-     * Start a new trace span if a parent trace context already exists.
+     * Start a new trace span if a parent trace context already exists, otherwise borrow the caller's context so that an
+     * untraced task still carries causality to its children.
+     * <p>
+     * Must be called before the task is published, so that no other thread can unregister it before it has a span.
      * Registration does not activate the span; execution boundaries must use {@link #withTaskContext(Task)}.
      */
     void maybeStartTrace(ThreadContext threadContext, Task task) {
@@ -250,7 +254,6 @@ public class TaskManager implements ClusterStateApplier {
 
                     @Override
                     public void onFailure(Exception e) {
-                        task.recordTraceFailure(e);
                         try {
                             if (request.getParentTask().isSet()) {
                                 cancelChildLocal(request.getParentTask(), request.getRequestId(), e.toString());
@@ -275,13 +278,10 @@ public class TaskManager implements ClusterStateApplier {
         }
     }
 
-    private void registerCancellableTask(Task task, long requestId, boolean traceRequest) {
+    private void registerCancellableTask(Task task, long requestId) {
         CancellableTask cancellableTask = (CancellableTask) task;
         CancellableTaskHolder holder = new CancellableTaskHolder(cancellableTask);
         cancellableTasks.put(task, requestId, holder);
-        if (traceRequest) {
-            maybeStartTrace(threadPool.getThreadContext(), task);
-        }
         // Check if this task was banned before we start it.
         if (task.getParentTaskId().isSet()) {
             final Ban ban = bannedParents.get(task.getParentTaskId());

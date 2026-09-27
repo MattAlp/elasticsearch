@@ -442,7 +442,6 @@ public class IncrementalBulkService {
         }
 
         private void handleBulkFailure(boolean isFirstRequest, Exception e) {
-            bulkSessionTask.recordTraceFailure(e);
             assert bulkActionLevelFailure == null;
             globalFailure = isFirstRequest;
             bulkActionLevelFailure = e instanceof TaskCancelledException tce

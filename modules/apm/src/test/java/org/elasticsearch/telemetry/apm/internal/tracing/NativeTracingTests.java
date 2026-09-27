@@ -34,6 +34,7 @@ import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
 import org.elasticsearch.common.util.concurrent.ThreadContext;
 import org.elasticsearch.core.Releasable;
+import org.elasticsearch.tasks.CancellableTask;
 import org.elasticsearch.tasks.Task;
 import org.elasticsearch.tasks.TaskCancelledException;
 import org.elasticsearch.tasks.TaskId;
@@ -42,8 +43,11 @@ import org.elasticsearch.telemetry.tracing.TracingContext;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.test.transport.MockTransportService;
 import org.elasticsearch.threadpool.TestThreadPool;
+import org.elasticsearch.transport.AbstractTransportRequest;
 import org.elasticsearch.transport.EmptyRequest;
+import org.elasticsearch.transport.FakeTcpChannel;
 import org.elasticsearch.transport.RemoteTransportException;
+import org.elasticsearch.transport.TestTransportChannels;
 import org.elasticsearch.transport.TransportActionProxy;
 import org.elasticsearch.transport.TransportResponseHandler;
 import org.elasticsearch.transport.TransportService;
@@ -125,19 +129,66 @@ public class NativeTracingTests extends ESTestCase {
         }
     }
 
-    public void testCompletionBeforeAttachmentRetainsFailure() {
+    /**
+     * A banned parent makes registration unregister the task before {@code register} even returns. The span must
+     * already exist at that point, otherwise it would never be ended, and it must be ended exactly once.
+     */
+    public void testRegistrationRacingUnregisterStillEndsTheSpanExactlyOnce() {
+        var threadPool = new TestThreadPool(getTestName());
         try (var fixture = new NativeTracingFixture(Settings.EMPTY)) {
-            var owner = new org.elasticsearch.telemetry.tracing.SpanOwner();
-            owner.fail(new RemoteTransportException("remote", new TaskCancelledException("cancelled")));
-            owner.end("success");
-            var span = fixture.api.getTracer("component").spanBuilder("late-attachment").startSpan();
-            assertFalse(owner.attach(Context.root(), span));
-            assertFalse(span.isRecording());
-            owner.end("success");
-            assertEquals(1, fixture.exporter.getFinishedSpanItems().size());
-            var recorded = fixture.span("late-attachment");
-            assertEquals("cancelled", recorded.getAttributes().get(AttributeKey.stringKey("es.outcome")));
-            assertEquals(StatusCode.UNSET, recorded.getStatus().getStatusCode());
+            var manager = new TaskManager(Settings.EMPTY, threadPool, Set.of(), fixture.api);
+            var parentTaskId = new TaskId("other-node", 42);
+            manager.setBan(
+                parentTaskId,
+                "banned for test",
+                TestTransportChannels.newFakeTcpTransportChannel(
+                    "test",
+                    new FakeTcpChannel(),
+                    threadPool,
+                    "banned",
+                    randomNonNegativeLong(),
+                    TransportVersion.current()
+                )
+            );
+
+            var request = new CancellableRequest();
+            request.setParentTask(parentTaskId);
+            var parent = fixture.api.getTracer("client").spanBuilder("request").startSpan();
+            try (var scope = parent.makeCurrent()) {
+                expectThrows(TaskCancelledException.class, () -> manager.register("transport", "banned", request));
+            }
+            parent.end();
+
+            var banned = fixture.span("banned");
+            assertEquals(parent.getSpanContext().getSpanId(), banned.getParentSpanId());
+            assertEquals(StatusCode.UNSET, banned.getStatus().getStatusCode());
+            assertTrue(manager.getTasks().isEmpty());
+            assertEquals(2, fixture.exporter.getFinishedSpanItems().size());
+        } finally {
+            terminate(threadPool);
+        }
+    }
+
+    /** Cleanup can be attempted more than once for the same task; only the first attempt may end the span. */
+    public void testDuplicateUnregisterEndsTheTaskSpanOnce() {
+        var threadPool = new TestThreadPool(getTestName());
+        try (var fixture = new NativeTracingFixture(Settings.EMPTY)) {
+            var manager = new TaskManager(Settings.EMPTY, threadPool, Set.of(), fixture.api);
+            var parent = fixture.api.getTracer("client").spanBuilder("request").startSpan();
+            Task task;
+            try (var scope = parent.makeCurrent()) {
+                task = manager.register("transport", "repeated", new EmptyRequest());
+            }
+            assertTrue(Span.fromContext(task.getTraceContext()).isRecording());
+            manager.unregister(task);
+            manager.unregister(task);
+            task.finishTrace();
+            parent.end();
+
+            assertEquals(2, fixture.exporter.getFinishedSpanItems().size());
+            assertEquals(parent.getSpanContext().getSpanId(), fixture.span("repeated").getParentSpanId());
+        } finally {
+            terminate(threadPool);
         }
     }
 
@@ -308,8 +359,10 @@ public class NativeTracingTests extends ESTestCase {
                     assertEquals(received.getSpanId(), targetFixture.span("dependency").getParentSpanId());
                     assertEquals(parent.getSpanContext().getTraceId(), received.getTraceId());
                     for (var span : List.of(forwarded, received)) {
+                        // Task spans report no outcome of their own, whether the call succeeded or was cancelled.
                         assertEquals(StatusCode.UNSET, span.getStatus().getStatusCode());
-                        assertEquals(cancel ? "cancelled" : "success", span.getAttributes().get(AttributeKey.stringKey("es.outcome")));
+                        assertNull(span.getAttributes().get(AttributeKey.stringKey("es.outcome")));
+                        assertNull(span.getAttributes().get(AttributeKey.stringKey("error.type")));
                     }
                     assertTrue(proxy.getTaskManager().getTasks().isEmpty());
                     assertTrue(target.getTaskManager().getTasks().isEmpty());
@@ -558,7 +611,7 @@ public class NativeTracingTests extends ESTestCase {
         }
     }
 
-    public void testWrappedCancellationOnDeferredTaskCompletion() {
+    public void testDeferredTaskCompletionEndsTheSpanUnderItsOriginalParent() {
         var threadPool = new TestThreadPool(getTestName());
         try (var fixture = new NativeTracingFixture(Settings.EMPTY)) {
             var manager = new TaskManager(Settings.EMPTY, threadPool, Set.of(), fixture.api);
@@ -592,8 +645,9 @@ public class NativeTracingTests extends ESTestCase {
             completion.get().onFailure(new RemoteTransportException("remote", new TaskCancelledException("cancelled")));
             manager.unregister(task);
             var exported = fixture.span("background");
-            assertEquals("cancelled", exported.getAttributes().get(AttributeKey.stringKey("es.outcome")));
-            assertEquals(TaskCancelledException.class.getName(), exported.getAttributes().get(AttributeKey.stringKey("error.type")));
+            // The failure is reported to the caller, not stamped onto the task span.
+            assertNull(exported.getAttributes().get(AttributeKey.stringKey("es.outcome")));
+            assertNull(exported.getAttributes().get(AttributeKey.stringKey("error.type")));
             assertEquals(StatusCode.UNSET, exported.getStatus().getStatusCode());
             assertEquals(parent.getSpanContext().getSpanId(), exported.getParentSpanId());
             assertTrue(manager.getTasks().isEmpty());
@@ -615,7 +669,6 @@ public class NativeTracingTests extends ESTestCase {
                     Span.current().setStatus(StatusCode.ERROR);
                     Span.current().end();
                 }
-                task.recordTraceFailure(new IllegalArgumentException("ignored"));
                 manager.unregister(task);
                 assertTrue(parent.isRecording());
             }
@@ -624,6 +677,14 @@ public class NativeTracingTests extends ESTestCase {
             assertEquals(StatusCode.UNSET, fixture.span("parent").getStatus().getStatusCode());
         } finally {
             terminate(threadPool);
+        }
+    }
+
+    /** Only cancellable tasks take the ban-checking registration path, where unregister runs inside {@code register}. */
+    private static class CancellableRequest extends AbstractTransportRequest {
+        @Override
+        public Task createTask(long id, String type, String action, TaskId parentTaskId, Map<String, String> headers) {
+            return new CancellableTask(id, type, action, "", parentTaskId, headers);
         }
     }
 

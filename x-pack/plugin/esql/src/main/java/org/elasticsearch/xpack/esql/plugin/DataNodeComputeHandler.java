@@ -222,11 +222,7 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                                 return;
                             }
                             onGroupFailure = computeService.cancelQueryOnFailure(groupTask);
-                            l = ActionListener.runAfter(l, () -> transportService.getTaskManager().unregister(groupTask))
-                                .delegateResponse((failedListener, failure) -> {
-                                    groupTask.recordTraceFailure(failure);
-                                    failedListener.onFailure(failure);
-                                });
+                            l = ActionListener.runAfter(l, () -> transportService.getTaskManager().unregister(groupTask));
                         } else {
                             groupTask = parentTask;
                             onGroupFailure = runOnTaskFailure;
@@ -370,11 +366,7 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                             return;
                         }
                         onGroupFailure = computeService.cancelQueryOnFailure(groupTask);
-                        l = ActionListener.runAfter(l, () -> transportService.getTaskManager().unregister(groupTask))
-                            .delegateResponse((failedListener, failure) -> {
-                                groupTask.recordTraceFailure(failure);
-                                failedListener.onFailure(failure);
-                            });
+                        l = ActionListener.runAfter(l, () -> transportService.getTaskManager().unregister(groupTask));
                     } else {
                         groupTask = parentTask;
                         onGroupFailure = runOnTaskFailure;

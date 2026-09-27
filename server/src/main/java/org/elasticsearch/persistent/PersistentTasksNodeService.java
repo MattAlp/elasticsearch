@@ -315,13 +315,11 @@ public class PersistentTasksNodeService implements ClusterStateListener {
                 runningTasks.put(taskInProgress.getAllocationId(), task);
                 nodePersistentTasksExecutor.executeTask(taskInProgress.getParams(), taskInProgress.getState(), task, executor);
             } catch (Exception e) {
-                task.recordTraceFailure(e);
                 // Submit task failure
                 task.markAsFailed(e);
             }
             processed = true;
         } catch (Exception e) {
-            task.recordTraceFailure(e);
             initializationException = e;
         } finally {
             if (processed == false) {

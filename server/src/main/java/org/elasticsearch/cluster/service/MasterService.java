@@ -410,7 +410,6 @@ public class MasterService extends AbstractLifecycleComponent {
                     ActionListener.run(
                         new DelegatingActionListener<Void, Void>(
                             ActionListener.runAfter(parentListener, () -> taskManager.unregister(task)).delegateResponse((l, e) -> {
-                                task.recordTraceFailure(e);
                                 assert publicationMayFail() : e;
                                 handleException(summary, publicationStartTime, newClusterState, e);
                                 l.onResponse(null);

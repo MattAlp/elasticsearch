@@ -233,22 +233,23 @@ public class AsyncTaskManagementServiceTests extends ESSingleNodeTestCase {
         );
     }
 
-    public void testNativeFailureBeforeTimeout() throws Exception {
+    public void testNativeTaskSpanOnFailureBeforeTimeout() throws Exception {
         assertNativeFailure(false, false, new IllegalArgumentException("failed"));
     }
 
-    public void testNativeStoredFailureBeforeTimeout() throws Exception {
+    public void testNativeTaskSpanOnStoredFailureBeforeTimeout() throws Exception {
         assertNativeFailure(false, true, new IllegalArgumentException("failed"));
     }
 
-    public void testNativeFailureAfterTimeout() throws Exception {
+    public void testNativeTaskSpanOnFailureAfterTimeout() throws Exception {
         assertNativeFailure(true, randomBoolean(), new IllegalArgumentException("failed"));
     }
 
-    public void testNativeCancellationAfterTimeout() throws Exception {
+    public void testNativeTaskSpanOnCancellationAfterTimeout() throws Exception {
         assertNativeFailure(true, randomBoolean(), new TaskCancelledException("cancelled"));
     }
 
+    /** The task span must end exactly once under its submitter, regardless of how the operation failed. */
     private void assertNativeFailure(boolean afterTimeout, boolean keepOnCompletion, Exception failure) throws Exception {
         var exporter = InMemorySpanExporter.create();
         try (
@@ -298,9 +299,10 @@ public class AsyncTaskManagementServiceTests extends ESSingleNodeTestCase {
                     var spans = exporter.getFinishedSpanItems().stream().filter(span -> span.getName().equals("test_action[a]")).toList();
                     assertEquals(1, spans.size());
                     var recorded = spans.getFirst();
-                    boolean cancelled = failure instanceof TaskCancelledException;
-                    assertEquals(cancelled ? "cancelled" : "failure", recorded.getAttributes().get(AttributeKey.stringKey("es.outcome")));
-                    assertEquals(cancelled ? StatusCode.UNSET : StatusCode.ERROR, recorded.getStatus().getStatusCode());
+                    // The task span records lifetime and parentage only; the failure is reported to the caller.
+                    assertEquals(StatusCode.UNSET, recorded.getStatus().getStatusCode());
+                    assertNull(recorded.getAttributes().get(AttributeKey.stringKey("es.outcome")));
+                    assertNull(recorded.getAttributes().get(AttributeKey.stringKey("error.type")));
                     assertEquals(parent.getSpanContext().getSpanId(), recorded.getParentSpanId());
                 });
             } finally {
