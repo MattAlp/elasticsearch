@@ -13,6 +13,7 @@ import org.elasticsearch.action.ActionListenerResponseHandler;
 import org.elasticsearch.action.ActionRunnable;
 import org.elasticsearch.action.OriginalIndices;
 import org.elasticsearch.action.support.ChannelActionListener;
+import org.elasticsearch.action.support.ContextPreservingActionListener;
 import org.elasticsearch.action.support.IndicesOptions;
 import org.elasticsearch.action.support.RefCountingRunnable;
 import org.elasticsearch.cluster.node.DiscoveryNode;
@@ -230,6 +231,7 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                             groupTask = parentTask;
                             onGroupFailure = runOnTaskFailure;
                         }
+                        l = ContextPreservingActionListener.wrapPreservingContext(l, threadPool.getThreadContext());
                         final AtomicReference<DataNodeComputeResponse> nodeResponseRef = new AtomicReference<>();
                         try (
                             Releasable taskScope = groupTask == parentTask

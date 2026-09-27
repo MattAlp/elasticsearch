@@ -684,7 +684,13 @@ public class RestController implements HttpServerTransport.Dispatcher {
     }
 
     private void startTrace(ThreadContext threadContext, RestChannel channel, String restPath) {
-        this.instrumentation.start(threadContext, channel.request(), restPath);
+        RestRequest request = channel.request();
+        synchronized (request) {
+            if (request.isTraceStarted() == false) {
+                request.borrowTraceContext(TracingContext.extract(threadContext));
+            }
+            this.instrumentation.start(threadContext, request, restPath);
+        }
     }
 
     private void traceException(RestChannel channel, Throwable e) {

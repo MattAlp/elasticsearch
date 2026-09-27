@@ -70,6 +70,11 @@ public class RestRequest implements ToXContent.Params {
         return tracing.attach(parent, span);
     }
 
+    /** Preserves inbound causality when HTTP instrumentation does not create a span. */
+    public void borrowTraceContext(Context parent) {
+        tracing.borrow(parent);
+    }
+
     /** Completes at the response boundary, not when dispatch returns. */
     public void finishTrace() {
         tracing.end(null);
