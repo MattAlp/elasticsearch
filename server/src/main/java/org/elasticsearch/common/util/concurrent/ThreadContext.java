@@ -27,7 +27,6 @@ import org.elasticsearch.http.HttpTransportSettings;
 import org.elasticsearch.rest.RestController;
 import org.elasticsearch.rest.RestRequest;
 import org.elasticsearch.tasks.Task;
-import org.elasticsearch.telemetry.tracing.TraceContext;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -74,7 +73,7 @@ import static org.elasticsearch.tasks.Task.HEADERS_TO_COPY;
  * </pre>
  *
  */
-public final class ThreadContext implements Writeable, TraceContext {
+public final class ThreadContext implements Writeable {
 
     public static final String PREFIX = "request.headers";
     public static final Setting<Settings> DEFAULT_HEADERS_SETTING = Setting.groupSetting(PREFIX + ".", Property.NodeScope);

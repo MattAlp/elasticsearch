@@ -35,7 +35,6 @@ import org.elasticsearch.common.util.concurrent.ThreadContext;
 import org.elasticsearch.tasks.Task;
 import org.elasticsearch.telemetry.TelemetryProvider;
 import org.elasticsearch.telemetry.apm.internal.APMAgentSettings;
-import org.elasticsearch.telemetry.tracing.TraceContext;
 import org.elasticsearch.telemetry.tracing.Traceable;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.test.junit.annotations.TestLogging;
@@ -176,7 +175,7 @@ public class APMTracerTests extends ESTestCase {
         Settings settings = Settings.builder().put(APMAgentSettings.TELEMETRY_TRACING_ENABLED_SETTING.getKey(), true).build();
         APMTracer apmTracer = buildTracer(settings);
 
-        TraceContext traceContext = new ThreadContext(settings);
+        ThreadContext traceContext = new ThreadContext(settings);
         // 1_000_000L because of "toNanos" conversions that overflow for large long millis
         Instant spanStartTime = Instant.ofEpochMilli(randomLongBetween(0, Long.MAX_VALUE / 1_000_000L));
         traceContext.putTransient(Task.TRACE_START_TIME, spanStartTime);
@@ -249,6 +248,43 @@ public class APMTracerTests extends ESTestCase {
         ThreadContext threadContext = new ThreadContext(settings);
         apmTracer.startTrace(threadContext, TRACEABLE1, "name1", null);
         assertThat(threadContext.getTransient(Task.APM_TRACE_CONTEXT), notNullValue());
+    }
+
+    public void testThreadContextBridgeCarriesLocalAndRemoteParent() {
+        SdkTracerProvider provider = SdkTracerProvider.builder().setSampler(Sampler.alwaysOn()).build();
+        try (
+            OpenTelemetrySdk sdk = OpenTelemetrySdk.builder()
+                .setTracerProvider(provider)
+                .setPropagators(ContextPropagators.create(W3CTraceContextPropagator.getInstance()))
+                .build()
+        ) {
+            Span root = sdk.getTracer("test").spanBuilder("root").startSpan();
+            Context rootContext = Context.root().with(root);
+            ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
+            ThreadContextTraceBridge.setCurrent(threadContext, sdk, rootContext);
+            String traceParent = threadContext.getHeader(Task.TRACE_PARENT_HTTP_HEADER);
+            assertNotNull(traceParent);
+
+            try (var ignored = threadContext.newTraceContext()) {
+                assertSame(rootContext, ThreadContextTraceBridge.localParent(threadContext));
+                Span localChild = sdk.getTracer("test")
+                    .spanBuilder("local-child")
+                    .setParent(ThreadContextTraceBridge.localParent(threadContext))
+                    .startSpan();
+                assertEquals(root.getSpanContext().getTraceId(), localChild.getSpanContext().getTraceId());
+                localChild.end();
+            }
+
+            ThreadContext remoteThreadContext = new ThreadContext(Settings.EMPTY);
+            remoteThreadContext.putTransient(Task.PARENT_TRACE_PARENT_HEADER, traceParent);
+            remoteThreadContext.putTransient(Task.PARENT_TRACE_STATE, "vendor=foo");
+            Context remoteParent = ThreadContextTraceBridge.remoteParent(remoteThreadContext, sdk);
+            assertNotNull(remoteParent);
+            assertEquals(root.getSpanContext().getTraceId(), Span.fromContext(remoteParent).getSpanContext().getTraceId());
+            assertEquals(root.getSpanContext().getSpanId(), Span.fromContext(remoteParent).getSpanContext().getSpanId());
+            assertEquals("foo", Span.fromContext(remoteParent).getSpanContext().getTraceState().get("vendor"));
+            root.end();
+        }
     }
 
     /**
@@ -406,7 +442,7 @@ public class APMTracerTests extends ESTestCase {
         final String remoteParentSpanId = "b7ad6b7169203331";
         ThreadContext traceContext = new ThreadContext(settings);
         // Simulate transport propagation: the transport layer copies TRACE_PARENT_HTTP_HEADER into the
-        // PARENT_TRACE_PARENT_HEADER transient on the receiving node. getRemoteParentContext() reads this transient.
+        // PARENT_TRACE_PARENT_HEADER transient on the receiving node. The bridge reads this transient.
         traceContext.putTransient(Task.PARENT_TRACE_PARENT_HEADER, "00-" + traceId + "-" + remoteParentSpanId + "-01");
         // PARENT_APM_TRACE_CONTEXT is intentionally absent — transients are not serialised over transport.
 
