@@ -37,9 +37,10 @@ credentials in the endpoint URL or JVM options.
 
 When `telemetry.export.endpoint` is present, SDK tracing is selected
 automatically. Set `-Dtelemetry.otel.traces.enabled=false` in `config/jvm.options`
-to retain agent tracing during migration, or set it to `true` to require the SDK
-path even without an endpoint (in which case trace export remains disabled until
-an endpoint is supplied). This switch requires a restart. The setting
+to retain agent tracing during migration (including installations already using
+that endpoint only for SDK metrics), or set it to `true` to require the SDK path
+even without an endpoint (in which case trace export remains disabled until an
+endpoint is supplied). This switch requires a restart. The setting
 `telemetry.tracing.enabled` can still be changed dynamically.
 
 For the SDK path, use `telemetry.tracing.sample_rate` (default `0.001`),
@@ -54,12 +55,14 @@ recording are dynamic.
 Existing `telemetry.agent.server_url` installations continue to use the agent
 until an OTLP endpoint is configured. When migrating, map `server_url` to
 `telemetry.export.endpoint`, `transaction_sample_rate` to
-`telemetry.tracing.sample_rate`, `transaction_max_spans` to
-`telemetry.tracing.max_depth`, and `metrics_interval` to
-`telemetry.export.interval`. The old agent settings remain available for the
-legacy path; they are not all interchangeable with SDK settings. The SDK
-defaults to the old sample rate, queue size, and interval when those agent
-settings are present. Metrics are selected separately using
+`telemetry.tracing.sample_rate`, and `metrics_interval` to
+`telemetry.export.interval`. Choose `telemetry.tracing.max_depth` according
+to the child-span hierarchy you want: `0` preserves the old default of
+`transaction_max_spans=0`, but depth and total span count are not otherwise
+equivalent. The old agent settings remain available for the legacy path; they
+are not all interchangeable with SDK settings. The SDK defaults to the old
+sample rate, queue size, and interval when those agent settings are present.
+Metrics are selected separately using
 `-Dtelemetry.otel.metrics.enabled=true`; an OTLP trace endpoint alone does not
 migrate metrics.
 

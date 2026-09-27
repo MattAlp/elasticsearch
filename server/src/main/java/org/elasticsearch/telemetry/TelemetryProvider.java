@@ -32,6 +32,7 @@ public interface TelemetryProvider {
      * selects the agent or the SDK. The launcher must use the same selection when configuring the agent.
      */
     static boolean useOtelSdkTraces(Settings settings, String override) {
+        // Keep this key in sync with OtelSdkSettings.TELEMETRY_EXPORT_ENDPOINT in the apm module.
         return override == null
             ? settings.get("telemetry.export.endpoint", "").isBlank() == false
             : Booleans.parseBoolean(override);

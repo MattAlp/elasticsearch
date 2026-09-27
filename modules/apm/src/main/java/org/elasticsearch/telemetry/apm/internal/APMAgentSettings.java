@@ -39,7 +39,7 @@ import static org.elasticsearch.telemetry.TelemetryProvider.OTEL_TRACES_ENABLED_
 public class APMAgentSettings {
 
     private static final Logger LOGGER = LogManager.getLogger(APMAgentSettings.class);
-    private boolean otelSdkTraces;
+    private volatile boolean otelSdkTraces;
 
     public void addClusterSettingsListeners(ClusterService clusterService, APMTelemetryProvider apmTelemetryProvider) {
         final ClusterSettings clusterSettings = clusterService.getClusterSettings();

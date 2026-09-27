@@ -35,7 +35,8 @@ import static org.elasticsearch.telemetry.TelemetryProvider.OTEL_TRACES_ENABLED_
 
 /**
  * {@link TraceSupplier} that exports spans via OTLP/gRPC using its own {@link SdkTracerProvider},
- * used when {@code telemetry.otel.traces.enabled=true} is set as a JVM system property.
+ * selected when {@code telemetry.export.endpoint} is configured or the JVM system property
+ * {@code telemetry.otel.traces.enabled=true} explicitly selects it.
  */
 public class OtelSdkExportTracerSupplier implements TraceSupplier {
 
