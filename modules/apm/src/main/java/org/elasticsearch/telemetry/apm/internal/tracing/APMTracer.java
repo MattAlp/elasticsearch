@@ -159,7 +159,9 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
 
     private static TraceSupplier traceSupplierFor(Settings settings, Supplier<MeterProvider> meterProvider) {
         // AgentExportTracerSupplier delegates to GlobalOpenTelemetry, so the APM Java agent owns its own metrics.
-        return otelTracesEnabled(settings) ? new OtelSdkExportTracerSupplier(settings, meterProvider) : new AgentExportTracerSupplier(settings);
+        return otelTracesEnabled(settings)
+            ? new OtelSdkExportTracerSupplier(settings, meterProvider)
+            : new AgentExportTracerSupplier(settings);
     }
 
     private static int initialMaxTraceDepth(Settings settings) {

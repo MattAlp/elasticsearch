@@ -33,9 +33,7 @@ public interface TelemetryProvider {
      */
     static boolean useOtelSdkTraces(Settings settings, String override) {
         // Keep this key in sync with OtelSdkSettings.TELEMETRY_EXPORT_ENDPOINT in the apm module.
-        return override == null
-            ? settings.get("telemetry.export.endpoint", "").isBlank() == false
-            : Booleans.parseBoolean(override);
+        return override == null ? settings.get("telemetry.export.endpoint", "").isBlank() == false : Booleans.parseBoolean(override);
     }
 
     /**
