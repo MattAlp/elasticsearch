@@ -467,14 +467,18 @@ public class APMTracerTests extends ESTestCase {
         Span unrelated = sdk.getTracer("test").spanBuilder("unrelated").startSpan();
         try (var ignored = unrelated.makeCurrent()) {
             startAndStopSpan(tracer, settings, TRACEABLE1, "task-root");
+            var taskSpan = exporter.getFinishedSpanItems()
+                .stream()
+                .filter(span -> span.getName().equals("task-root"))
+                .findFirst()
+                .orElseThrow();
+            assertThat(taskSpan.getParentSpanId(), is(SpanId.getInvalid()));
+            assertThat(taskSpan.getTraceId(), not(equalTo(unrelated.getSpanContext().getTraceId())));
         } finally {
             unrelated.end();
             tracer.close();
             sdk.close();
         }
-        var taskSpan = exporter.getFinishedSpanItems().stream().filter(span -> span.getName().equals("task-root")).findFirst().orElseThrow();
-        assertThat(taskSpan.getParentSpanId(), is(SpanId.getInvalid()));
-        assertThat(taskSpan.getTraceId(), not(equalTo(unrelated.getSpanContext().getTraceId())));
     }
 
     private static void startAndStopSpan(APMTracer tracer, Settings settings, Traceable traceable, String spanName) {
