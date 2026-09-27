@@ -37,11 +37,11 @@ import org.elasticsearch.common.component.AbstractLifecycleComponent;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.Maps;
 import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
-import org.elasticsearch.core.Booleans;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.Releasable;
 import org.elasticsearch.lucene.util.automaton.MinimizationOperations;
 import org.elasticsearch.tasks.Task;
+import org.elasticsearch.telemetry.TelemetryProvider;
 import org.elasticsearch.telemetry.apm.internal.APMAgentSettings;
 import org.elasticsearch.telemetry.apm.internal.export.TraceSupplier;
 import org.elasticsearch.telemetry.apm.internal.export.agent.AgentExportTracerSupplier;
@@ -126,7 +126,7 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
         this(
             settings,
             traceSupplierFor(settings, meterProvider),
-            otelTracesEnabled(),
+            otelTracesEnabled(settings),
             initialMaxTraceDepth(settings),
             initialRecordExceptionStacks(settings)
         );
@@ -153,21 +153,21 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
         this.recordExceptionStacks = recordExceptionStacks;
     }
 
-    private static boolean otelTracesEnabled() {
-        return Booleans.parseBoolean(System.getProperty(OTEL_TRACES_ENABLED_SYSTEM_PROPERTY, "false"));
+    private static boolean otelTracesEnabled(Settings settings) {
+        return TelemetryProvider.useOtelSdkTraces(settings, System.getProperty(OTEL_TRACES_ENABLED_SYSTEM_PROPERTY));
     }
 
     private static TraceSupplier traceSupplierFor(Settings settings, Supplier<MeterProvider> meterProvider) {
         // AgentExportTracerSupplier delegates to GlobalOpenTelemetry, so the APM Java agent owns its own metrics.
-        return otelTracesEnabled() ? new OtelSdkExportTracerSupplier(settings, meterProvider) : new AgentExportTracerSupplier(settings);
+        return otelTracesEnabled(settings) ? new OtelSdkExportTracerSupplier(settings, meterProvider) : new AgentExportTracerSupplier(settings);
     }
 
     private static int initialMaxTraceDepth(Settings settings) {
-        return otelTracesEnabled() ? OtelSdkSettings.TELEMETRY_TRACING_MAX_DEPTH.get(settings) : 0;
+        return otelTracesEnabled(settings) ? OtelSdkSettings.TELEMETRY_TRACING_MAX_DEPTH.get(settings) : 0;
     }
 
     private static boolean initialRecordExceptionStacks(Settings settings) {
-        return otelTracesEnabled() && OtelSdkSettings.TELEMETRY_TRACING_RECORD_EXCEPTION_STACKS.get(settings);
+        return otelTracesEnabled(settings) && OtelSdkSettings.TELEMETRY_TRACING_RECORD_EXCEPTION_STACKS.get(settings);
     }
 
     public CompletableResultCode attemptFlushTraces() {
@@ -305,6 +305,8 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
             final Context parentContext = localParentContext != null ? localParentContext : getRemoteParentContext(traceContext);
             if (parentContext != null) {
                 spanBuilder.setParent(parentContext);
+            } else {
+                spanBuilder.setNoParent();
             }
 
             setSpanAttributes(traceContext, attributes, spanBuilder);
@@ -327,7 +329,7 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
                 return null; // return null to discard and not record in map of spans
             }
 
-            final Context contextForNewSpan = Context.current().with(span).with(SPAN_LOCAL_DEPTH_KEY, localDepth);
+            final Context contextForNewSpan = Context.root().with(span).with(SPAN_LOCAL_DEPTH_KEY, localDepth);
             if (span.isRecording()) {
                 logger.trace("Recording trace [{}] [{}]", spanId, spanName);
                 updateThreadContext(traceContext, services, contextForNewSpan);
@@ -387,7 +389,7 @@ public class APMTracer extends AbstractLifecycleComponent implements org.elastic
 
             return services.openTelemetry.getPropagators()
                 .getTextMapPropagator()
-                .extract(Context.current(), traceContextMap, new MapKeyGetter());
+                .extract(Context.root(), traceContextMap, new MapKeyGetter());
         }
         return null;
     }

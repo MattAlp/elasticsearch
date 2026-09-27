@@ -14,6 +14,7 @@ import org.elasticsearch.cli.ExitCodes;
 import org.elasticsearch.cli.ProcessInfo;
 import org.elasticsearch.cli.UserException;
 import org.elasticsearch.core.Booleans;
+import org.elasticsearch.telemetry.TelemetryProvider;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -167,8 +168,9 @@ public final class JvmOptionsParser {
         final boolean otelMetricsEnabled = Booleans.parseBoolean(
             assembledSystemProperties.getOrDefault(OTEL_METRICS_ENABLED_SYSTEM_PROPERTY, "false")
         );
-        final boolean otelTracesEnabled = Booleans.parseBoolean(
-            assembledSystemProperties.getOrDefault(OTEL_TRACES_ENABLED_SYSTEM_PROPERTY, "false")
+        final boolean otelTracesEnabled = TelemetryProvider.useOtelSdkTraces(
+            args.nodeSettings(),
+            assembledSystemProperties.get(OTEL_TRACES_ENABLED_SYSTEM_PROPERTY)
         );
         final List<String> apmOptions = APMJvmOptions.apmJvmOptions(
             args.nodeSettings(),

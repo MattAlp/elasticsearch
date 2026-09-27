@@ -9,52 +9,90 @@ The Elasticsearch server code contains a [tracing][tracing] package, which is
 an abstraction over the OpenTelemetry API. All locations in the code that
 perform instrumentation and tracing must use these abstractions.
 
-Separately, there is the [apm](./modules/apm) module, which works with the
-OpenTelemetry API directly to record trace data.  Underneath the OTel API, we
-use Elastic's [APM agent for Java][agent], which attaches at runtime to the
-Elasticsearch JVM and removes the need for Elasticsearch to hard-code the use of
-an OTel implementation. Note that while it is possible to programmatically start
-the APM agent, the Security Manager permissions required make this essentially
-impossible.
+Separately, the [apm](./modules/apm) module implements this interface using the
+OpenTelemetry API. When an OTLP endpoint is configured, the module uses its own
+OpenTelemetry SDK and exports traces over OTLP/gRPC. Existing installations
+without an OTLP endpoint continue to use Elastic's [APM agent for Java][agent]
+when configured with an agent server URL. The SDK path does not require the
+agent for tracing; the agent can still be used independently for metrics.
 
 ## How is tracing configured?
 
-You must supply configuration and credentials for the APM server (see below).
-In your `elasticsearch.yml` add the following configuration:
+To export traces via OTLP/gRPC, configure an endpoint and enable tracing in
+`elasticsearch.yml`:
 
 ```
 telemetry.tracing.enabled: true
-telemetry.agent.server_url: https://<your-apm-server>:443
+telemetry.export.endpoint: https://<your-otlp-receiver>:4317
 ```
 
-When using a secret token to authenticate with the APM server, you must add it to the Elasticsearch keystore under `telemetry.secret_token`. For example, execute:
+The endpoint is a host and port without a path. For authentication, add an API
+key under `telemetry.api_key` or a secret token under `telemetry.secret_token`
+in the Elasticsearch keystore. For example:
 
-    bin/elasticsearch-keystore add telemetry.secret_token
+    bin/elasticsearch-keystore add telemetry.api_key
 
-then enter the token when prompted. If you are using API keys, change the keystore key name to `telemetry.api_key`.
+The OTLP exporter uses these credentials in an Authorization header. Do not put
+credentials in the endpoint URL or JVM options.
 
-All APM settings live under `telemetry`. Tracing related settings go under `telemetry.tracing` and settings
-related to the Java agent go under `telemetry.agent`. Anything you set under there will be propagated to
-the agent.
+When `telemetry.export.endpoint` is present, SDK tracing is selected
+automatically. Set `-Dtelemetry.otel.traces.enabled=false` in `config/jvm.options`
+to retain agent tracing during migration, or set it to `true` to require the SDK
+path even without an endpoint (in which case trace export remains disabled until
+an endpoint is supplied). This switch requires a restart. The setting
+`telemetry.tracing.enabled` can still be changed dynamically.
 
-For agent settings that can be changed dynamically, you can use the cluster
-settings REST API. For example, to change the sampling rate:
+For the SDK path, use `telemetry.tracing.sample_rate` (default `0.001`),
+`telemetry.tracing.max_depth` (default `0`, exporting only entry-point spans),
+`telemetry.tracing.max_queue_size`, `telemetry.tracing.max_batch_size`,
+`telemetry.tracing.record_exception_stacks`, and `telemetry.export.interval`.
+The SDK batches spans with a bounded queue and flushes on shutdown. Sampling,
+batch size, endpoint, and export interval are node settings that require a
+restart; trace enablement, maximum depth, name filters, and exception-stack
+recording are dynamic.
 
-    curl -XPUT \
-      -H "Content-type: application/json" \
-      -u "$USERNAME:$PASSWORD" \
-      -d '{ "persistent": { "telemetry.agent.transaction_sample_rate": "0.75" } }' \
-      https://localhost:9200/_cluster/settings
+Existing `telemetry.agent.server_url` installations continue to use the agent
+until an OTLP endpoint is configured. When migrating, map `server_url` to
+`telemetry.export.endpoint`, `transaction_sample_rate` to
+`telemetry.tracing.sample_rate`, `transaction_max_spans` to
+`telemetry.tracing.max_depth`, and `metrics_interval` to
+`telemetry.export.interval`. The old agent settings remain available for the
+legacy path; they are not all interchangeable with SDK settings. The SDK
+defaults to the old sample rate, queue size, and interval when those agent
+settings are present. Metrics are selected separately using
+`-Dtelemetry.otel.metrics.enabled=true`; an OTLP trace endpoint alone does not
+migrate metrics.
 
+### Trace compatibility
 
-### More details about configuration
+HTTP requests are SERVER spans named by the matched REST route; tasks are
+spans named by their action. The `es.cluster.name`, `es.node.name`, and task
+identifiers remain available as span attributes. The SDK also emits
+OpenTelemetry HTTP semantic-convention attributes and resource attributes such
+as `service.name`, `service.version`, and `service.instance.id`. Dashboards that
+use the agent's intake-specific fields may need to query the corresponding
+OTLP attributes. W3C `traceparent` and `tracestate` preserve parentage across
+HTTP and transport boundaries; locally created child spans remain filtered by
+default. Incoming sampled traces retain parent-based sampling, including
+Elastic tracestate information used for representative counts.
+
+Span name inclusion/exclusion and sensitive-field redaction continue to use
+`telemetry.tracing.names.include`, `telemetry.tracing.names.exclude`, and
+`telemetry.tracing.sanitize_field_names`. Avoid adding request bodies or
+sensitive headers as attributes. Exceptions omit stack traces by default on
+the SDK path; HTTP 5xx responses set ERROR status, whereas 4xx responses do not.
+
+### Legacy agent configuration
 
 For context, the APM agent pulls configuration from [multiple
 sources][agent-config], with a hierarchy that means, for example, that options
 set in the config file cannot be overridden via system properties.
 
-Now, in order to send tracing data to the APM server, ES needs to be configured with
-either a `secret_key` or an `api_key`. We could configure these in the agent via
+For agent-only installations, set `telemetry.agent.server_url` and enable
+tracing. Agent settings live under `telemetry.agent` and are propagated to the
+agent. Dynamic settings can be changed through the cluster settings REST API.
+In order to send tracing data to the APM server, ES needs either a secret token
+or an API key. We could configure these in the agent via
 system properties, but then their values would be available to any Java code in
 Elasticsearch that can read system properties.
 

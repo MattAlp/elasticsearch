@@ -27,7 +27,7 @@ import static org.hamcrest.Matchers.not;
 /**
  * Runs the shared {@link AbstractTracesIT} test suite against the OTel SDK export path.
  *
- * Activated by setting the JVM system property {@code telemetry.otel.traces.enabled=true}.
+ * Selected automatically when {@code telemetry.export.endpoint} is configured.
  * Spans are exported via {@code SdkTracerProvider} + OTLP/gRPC, bypassing the Elastic APM
  * Java agent. Child-span filtering is enforced by ES code in {@code APMTracer} when
  * {@code telemetry.tracing.max_depth=0} (the default). Exception-stack suppression
@@ -42,8 +42,10 @@ public class OtelSdkTracesIT extends AbstractTracesIT {
 
     public static RecordingApmServer recordingApmServer = new RecordingApmServer();
 
-    public static ElasticsearchCluster cluster = baseTracesClusterBuilder().systemProperty("telemetry.otel.traces.enabled", "true")
-        .setting("telemetry.export.endpoint", () -> recordingApmServer.getGrpcEndpoint())
+    public static ElasticsearchCluster cluster = baseTracesClusterBuilder().setting(
+        "telemetry.export.endpoint",
+        () -> recordingApmServer.getGrpcEndpoint()
+    )
         .setting("telemetry.tracing.sample_rate", "1.0")
         // Mirrors the three labels ServerlessServerCli writes via telemetry.agent.global_labels.* on the APM-agent path,
         // bridged here to the OTel resource via the telemetry.resource.* affix.

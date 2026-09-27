@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Set;
 
 import static org.elasticsearch.telemetry.TelemetryProvider.OTEL_METRICS_ENABLED_SYSTEM_PROPERTY;
+import static org.elasticsearch.telemetry.TelemetryProvider.OTEL_TRACES_ENABLED_SYSTEM_PROPERTY;
 import static org.elasticsearch.telemetry.apm.internal.APMAgentSettings.APM_AGENT_SETTINGS;
 import static org.elasticsearch.telemetry.apm.internal.APMAgentSettings.TELEMETRY_METRICS_ENABLED_SETTING;
 import static org.elasticsearch.telemetry.apm.internal.APMAgentSettings.TELEMETRY_TRACING_ENABLED_SETTING;
@@ -40,12 +41,14 @@ import static org.mockito.Mockito.when;
 @SuppressForbidden(reason = "Need to change value of system property to cover all the scenarios")
 public class APMAgentSettingsTests extends ESTestCase {
     private final String otelMetricsEnabled = System.getProperty(OTEL_METRICS_ENABLED_SYSTEM_PROPERTY);
+    private final String otelTracesEnabled = System.getProperty(OTEL_TRACES_ENABLED_SYSTEM_PROPERTY);
     APMAgentSettings apmAgentSettings = spy(new APMAgentSettings());
     APMTelemetryProvider apmTelemetryProvider = mock(Mockito.RETURNS_DEEP_STUBS);
 
     @After
     public void restoreSystemProperty() {
         restoreSystemProperty(otelMetricsEnabled, OTEL_METRICS_ENABLED_SYSTEM_PROPERTY);
+        restoreSystemProperty(otelTracesEnabled, OTEL_TRACES_ENABLED_SYSTEM_PROPERTY);
     }
 
     /**
@@ -135,6 +138,23 @@ public class APMAgentSettingsTests extends ESTestCase {
 
         verify(apmAgentSettings).setAgentSetting("recording", "true");
         verify(apmTelemetryProvider.getTracer()).setEnabled(true);
+    }
+
+    public void testOtelEndpointLeavesLegacyAgentIdle() {
+        System.clearProperty(OTEL_TRACES_ENABLED_SYSTEM_PROPERTY);
+        System.setProperty(OTEL_METRICS_ENABLED_SYSTEM_PROPERTY, "true");
+        Settings settings = Settings.builder()
+            .put(TELEMETRY_TRACING_ENABLED_SETTING.getKey(), true)
+            .put(TELEMETRY_METRICS_ENABLED_SETTING.getKey(), true)
+            .put(OtelSdkSettings.TELEMETRY_EXPORT_ENDPOINT.getKey(), "http://localhost:4317")
+            .build();
+
+        apmAgentSettings.initAgentSystemProperties(settings);
+        verify(apmAgentSettings).setAgentSetting("recording", "false");
+
+        System.setProperty(OTEL_TRACES_ENABLED_SYSTEM_PROPERTY, "false");
+        apmAgentSettings.initAgentSystemProperties(settings);
+        verify(apmAgentSettings).setAgentSetting("recording", "true");
     }
 
     public void testMetricsDisabledWhenOTelMetricsEnabled() {

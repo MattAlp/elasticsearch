@@ -21,11 +21,21 @@ public interface TelemetryProvider {
     String OTEL_METRICS_ENABLED_SYSTEM_PROPERTY = "telemetry.otel.metrics.enabled";
 
     /**
-     * JVM system property that activates the OTel SDK trace export path.
+     * JVM system property that overrides automatic selection of the OTel SDK trace export path.
      * Set via {@code config/jvm.options} (or {@code -D} on the command line); not settable via
      * {@code elasticsearch.yml} or the cluster settings API.
      */
     String OTEL_TRACES_ENABLED_SYSTEM_PROPERTY = "telemetry.otel.traces.enabled";
+
+    /**
+     * Use the OTel SDK for traces when an OTLP endpoint is configured, unless the JVM switch explicitly
+     * selects the agent or the SDK. The launcher must use the same selection when configuring the agent.
+     */
+    static boolean useOtelSdkTraces(Settings settings, String override) {
+        return override == null
+            ? settings.get("telemetry.export.endpoint", "").isBlank() == false
+            : Booleans.parseBoolean(override);
+    }
 
     /**
      * Resolves the interval at which node and indices metrics are collected to use for {@code NodeMetrics} cached.

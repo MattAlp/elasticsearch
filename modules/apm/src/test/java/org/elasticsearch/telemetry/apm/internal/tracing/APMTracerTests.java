@@ -16,6 +16,7 @@ import io.opentelemetry.api.metrics.MeterProvider;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.SpanBuilder;
 import io.opentelemetry.api.trace.SpanContext;
+import io.opentelemetry.api.trace.SpanId;
 import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.api.trace.StatusCode;
 import io.opentelemetry.api.trace.Tracer;
@@ -32,6 +33,7 @@ import org.apache.lucene.util.automaton.CharacterRunAutomaton;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.concurrent.ThreadContext;
 import org.elasticsearch.tasks.Task;
+import org.elasticsearch.telemetry.TelemetryProvider;
 import org.elasticsearch.telemetry.apm.internal.APMAgentSettings;
 import org.elasticsearch.telemetry.tracing.TraceContext;
 import org.elasticsearch.telemetry.tracing.Traceable;
@@ -78,6 +80,14 @@ public class APMTracerTests extends ESTestCase {
      */
     public void testConstructorWithMeterProviderSupplierDoesNotThrow() {
         assertNotNull(new APMTracer(Settings.EMPTY, MeterProvider::noop));
+    }
+
+    public void testOtelSdkTraceSelection() {
+        Settings withEndpoint = Settings.builder().put("telemetry.export.endpoint", "http://localhost:4317").build();
+        assertTrue(TelemetryProvider.useOtelSdkTraces(withEndpoint, null));
+        assertFalse(TelemetryProvider.useOtelSdkTraces(Settings.EMPTY, null));
+        assertFalse(TelemetryProvider.useOtelSdkTraces(withEndpoint, "false"));
+        assertTrue(TelemetryProvider.useOtelSdkTraces(Settings.EMPTY, "true"));
     }
 
     /**
@@ -439,6 +449,32 @@ public class APMTracerTests extends ESTestCase {
         assertThat(exporter.getFinishedSpanItems(), hasSize(1));
 
         sdk.close();
+    }
+
+    public void testTaskRootIgnoresUnrelatedCurrentOtelScope() {
+        InMemorySpanExporter exporter = InMemorySpanExporter.create();
+        SdkTracerProvider provider = SdkTracerProvider.builder()
+            .addSpanProcessor(SimpleSpanProcessor.create(exporter))
+            .setSampler(Sampler.alwaysOn())
+            .build();
+        OpenTelemetrySdk sdk = OpenTelemetrySdk.builder().setTracerProvider(provider).build();
+        Settings settings = Settings.builder().put(APMAgentSettings.TELEMETRY_TRACING_ENABLED_SETTING.getKey(), true).build();
+        APMTracer tracer = new APMTracer(settings, () -> sdk, true, 0, false);
+        tracer.setNodeName("test-node");
+        tracer.setClusterName("test-cluster");
+        tracer.start();
+
+        Span unrelated = sdk.getTracer("test").spanBuilder("unrelated").startSpan();
+        try (var ignored = unrelated.makeCurrent()) {
+            startAndStopSpan(tracer, settings, TRACEABLE1, "task-root");
+        } finally {
+            unrelated.end();
+            tracer.close();
+            sdk.close();
+        }
+        var taskSpan = exporter.getFinishedSpanItems().stream().filter(span -> span.getName().equals("task-root")).findFirst().orElseThrow();
+        assertThat(taskSpan.getParentSpanId(), is(SpanId.getInvalid()));
+        assertThat(taskSpan.getTraceId(), not(equalTo(unrelated.getSpanContext().getTraceId())));
     }
 
     private static void startAndStopSpan(APMTracer tracer, Settings settings, Traceable traceable, String spanName) {

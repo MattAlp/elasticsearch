@@ -19,6 +19,7 @@ import org.elasticsearch.common.settings.Setting;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.core.Booleans;
 import org.elasticsearch.core.SuppressForbidden;
+import org.elasticsearch.telemetry.TelemetryProvider;
 import org.elasticsearch.telemetry.apm.internal.export.otelsdk.OtelSdkSettings;
 import org.elasticsearch.telemetry.apm.internal.tracing.APMTracer;
 
@@ -38,6 +39,7 @@ import static org.elasticsearch.telemetry.TelemetryProvider.OTEL_TRACES_ENABLED_
 public class APMAgentSettings {
 
     private static final Logger LOGGER = LogManager.getLogger(APMAgentSettings.class);
+    private boolean otelSdkTraces;
 
     public void addClusterSettingsListeners(ClusterService clusterService, APMTelemetryProvider apmTelemetryProvider) {
         final ClusterSettings clusterSettings = clusterService.getClusterSettings();
@@ -81,6 +83,7 @@ public class APMAgentSettings {
     public void initAgentSystemProperties(Settings settings) {
         boolean tracing = TELEMETRY_TRACING_ENABLED_SETTING.get(settings);
         boolean metrics = TELEMETRY_METRICS_ENABLED_SETTING.get(settings);
+        otelSdkTraces = TelemetryProvider.useOtelSdkTraces(settings, System.getProperty(OTEL_TRACES_ENABLED_SYSTEM_PROPERTY));
 
         this.setAgentSetting("recording", Boolean.toString(shouldRecord(tracing, metrics)));
         // Apply values from the settings in the cluster state
@@ -89,8 +92,7 @@ public class APMAgentSettings {
 
     // Keep the agent active only when it still has work to do: tracing or metrics when OTEL does not own them.
     private boolean shouldRecord(boolean tracingEnabled, boolean metricsEnabled) {
-        boolean tracingOwnedByAgent = tracingEnabled
-            && Booleans.parseBoolean(System.getProperty(OTEL_TRACES_ENABLED_SYSTEM_PROPERTY, "false")) == false;
+        boolean tracingOwnedByAgent = tracingEnabled && otelSdkTraces == false;
         boolean metricsOwnedByAgent = metricsEnabled
             && Booleans.parseBoolean(System.getProperty(OTEL_METRICS_ENABLED_SYSTEM_PROPERTY, "false")) == false;
         return tracingOwnedByAgent || metricsOwnedByAgent;
