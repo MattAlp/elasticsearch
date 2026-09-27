@@ -9,192 +9,142 @@
 
 package org.elasticsearch.telemetry.apm.internal.instrumentation;
 
-import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.metrics.MeterProvider;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.api.trace.StatusCode;
-import io.opentelemetry.instrumentation.api.instrumenter.SpanStatusBuilder;
+import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator;
+import io.opentelemetry.context.Context;
 
-import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.concurrent.ThreadContext;
 import org.elasticsearch.rest.RestRequest;
 import org.elasticsearch.rest.RestResponse;
 import org.elasticsearch.rest.RestStatus;
-import org.elasticsearch.telemetry.apm.internal.tracing.APMTracer;
+import org.elasticsearch.telemetry.apm.internal.tracing.APMTracingService;
+import org.elasticsearch.telemetry.apm.internal.tracing.NativeTracingFixture;
+import org.elasticsearch.telemetry.tracing.TracingContext;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.test.rest.FakeRestRequest;
 
 import java.util.List;
 import java.util.Map;
 
-import static io.opentelemetry.api.common.AttributeKey.longKey;
-import static io.opentelemetry.api.common.AttributeKey.stringKey;
-import static java.util.Map.entry;
-import static org.mockito.Mockito.inOrder;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
-
+/** HTTP boundaries use native spans while retaining capture and sanitization policy. */
 public class APMHttpServerInstrumentationTests extends ESTestCase {
-
-    final SpanStatusBuilder spanStatusBuilder = mock(SpanStatusBuilder.class);
-    final APMTracer tracer = mock(APMTracer.class);
-    final APMHttpServerInstrumentation instrumentation = new APMHttpServerInstrumentation(tracer);
-
-    public void test_start_setsRequestAttributes_minimal() {
-        RestRequest request = new FakeRestRequest.Builder(xContentRegistry()).withMethod(RestRequest.Method.GET)
-            .withScheme("https")
-            .withPath("/my-index/_search")
-            .withHeaders(Map.of("Accept-Encoding", List.of("gzip")))
-            .build();
-        ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
-
-        instrumentation.start(threadContext, request, "/{index}/_search");
-
-        var inOrder = inOrder(tracer);
-        inOrder.verify(tracer)
-            .startTrace(
-                threadContext,
-                request,
-                "GET /{index}/_search",
-                Map.of(
-                    "http.method",
-                    "GET",
-                    "http.url",
-                    "/my-index/_search",
-                    "http.flavour",
-                    "1.1",
-                    "http.request.headers.accept_encoding",
-                    "gzip"
-                )
+    public void testModernAttributesAndHeaderCapture() {
+        try (var fixture = new NativeTracingFixture(Settings.EMPTY)) {
+            var instrumentation = new APMHttpServerInstrumentation(fixture.api);
+            var request = new FakeRestRequest.Builder(xContentRegistry()).withMethod(RestRequest.Method.GET)
+                .withScheme("https")
+                .withPath("/my-index/_search")
+                .withHeaders(Map.of("Accept-Encoding", List.of("gzip"), "Authorization", List.of("secret")))
+                .build();
+            var context = new ThreadContext(Settings.EMPTY);
+            instrumentation.start(context, request, "/{index}/_search");
+            try (var scope = TracingContext.activate(context, request.getTraceContext())) {
+                fixture.api.getTracer("arbitrary-component").spanBuilder("child").startSpan().end();
+            }
+            var response = new RestResponse(RestStatus.OK, "text/plain", "ok");
+            response.addHeader("X-Debug-Tag", "response-tag");
+            instrumentation.end(request, response);
+            var span = fixture.span("GET /{index}/_search");
+            assertEquals(SpanKind.SERVER, span.getKind());
+            assertEquals("GET", span.getAttributes().get(AttributeKey.stringKey("http.request.method")));
+            assertEquals("https", span.getAttributes().get(AttributeKey.stringKey("url.scheme")));
+            assertEquals("/{index}/_search", span.getAttributes().get(AttributeKey.stringKey("http.route")));
+            assertEquals("/my-index/_search", span.getAttributes().get(AttributeKey.stringKey("url.path")));
+            assertEquals(Long.valueOf(200), span.getAttributes().get(AttributeKey.longKey("http.response.status_code")));
+            assertNull(span.getAttributes().get(AttributeKey.stringKey("http.method")));
+            assertNull(span.getAttributes().get(AttributeKey.longKey("http.status_code")));
+            assertEquals(List.of("gzip"), span.getAttributes().get(AttributeKey.stringArrayKey("http.request.header.accept-encoding")));
+            assertEquals("[REDACTED]", span.getAttributes().get(AttributeKey.stringKey("http.request.header.authorization")));
+            assertEquals(
+                List.of("response-tag"),
+                span.getAttributes().get(AttributeKey.stringArrayKey("http.response.header.x-debug-tag"))
             );
-        inOrder.verify(tracer)
-            .setAttributes(
-                request,
-                Attributes.builder()
-                    .put(stringKey("http.request.method"), "GET")
-                    .put(stringKey("url.scheme"), "https")
-                    .put(stringKey("http.route"), "/{index}/_search")
-                    .put(stringKey("url.path"), "/my-index/_search")
-                    .build()
-            );
-        inOrder.verifyNoMoreInteractions();
+            assertEquals(span.getSpanId(), fixture.span("child").getParentSpanId());
+        }
     }
 
-    public void test_start_setsRequestAttributes_full() {
-        RestRequest request = new FakeRestRequest.Builder(xContentRegistry()).withMethod(RestRequest.Method.GET)
-            .withScheme("http")
-            .withPath("/my-index/_search?from=0")
-            .withHeaders(
-                Map.ofEntries(
-                    entry("Accept-Encoding", List.of("gzip")),
-                    entry("Forwarded", List.of("for=1.1.1.1;proto=https")),
-                    entry("Host", List.of("elastic.co:443")),
-                    entry("User-Agent", List.of("Firefox"))
-                )
+    public void testLegacySanitizerNamesStillProtectModernAttributes() {
+        try (
+            var fixture = new NativeTracingFixture(
+                Settings.builder()
+                    .putList(
+                        "telemetry.tracing.sanitize_field_names",
+                        "http.request.headers.x_private",
+                        "http.response.headers.X-Private",
+                        "http.url"
+                    )
+                    .build()
             )
-            .build();
-        ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
-
-        instrumentation.start(threadContext, request, "/{index}/_search");
-
-        var inOrder = inOrder(tracer);
-        inOrder.verify(tracer)
-            .startTrace(
-                threadContext,
-                request,
-                "GET /{index}/_search",
-                Map.of(
-                    "http.method",
-                    "GET",
-                    "http.url",
-                    "/my-index/_search?from=0",
-                    "http.flavour",
-                    "1.1",
-                    "http.request.headers.accept_encoding",
-                    "gzip",
-                    "http.request.headers.forwarded",
-                    "for=1.1.1.1;proto=https",
-                    "http.request.headers.host",
-                    "elastic.co:443",
-                    "http.request.headers.user_agent",
-                    "Firefox"
-                )
-            );
-        inOrder.verify(tracer)
-            .setAttributes(
-                request,
-                Attributes.builder()
-                    .put(stringKey("http.request.method"), "GET")
-                    .put(stringKey("http.route"), "/{index}/_search")
-                    .put(stringKey("url.scheme"), "https")
-                    .put(stringKey("url.path"), "/my-index/_search")
-                    .put(stringKey("url.query"), "from=0")
-                    .put(stringKey("server.address"), "elastic.co")
-                    .put(longKey("server.port"), 443L)
-                    .put(stringKey("client.address"), "1.1.1.1")
-                    .put(stringKey("user_agent.original"), "Firefox")
-                    .build()
-            );
-        inOrder.verifyNoMoreInteractions();
+        ) {
+            var instrumentation = new APMHttpServerInstrumentation(fixture.api);
+            var request = new FakeRestRequest.Builder(xContentRegistry()).withPath("/sensitive?value=secret")
+                .withHeaders(Map.of("X-Private", List.of("secret")))
+                .build();
+            instrumentation.start(new ThreadContext(Settings.EMPTY), request, "/sensitive");
+            var response = new RestResponse(RestStatus.OK, "text/plain", "ok");
+            response.addHeader("X-Private", "secret");
+            instrumentation.end(request, response);
+            var attributes = fixture.exporter.getFinishedSpanItems().getFirst().getAttributes();
+            assertEquals("[REDACTED]", attributes.get(AttributeKey.stringKey("http.request.header.x-private")));
+            assertEquals("[REDACTED]", attributes.get(AttributeKey.stringKey("http.response.header.x-private")));
+            assertEquals("[REDACTED]", attributes.get(AttributeKey.stringKey("url.path")));
+            assertEquals("[REDACTED]", attributes.get(AttributeKey.stringKey("url.query")));
+        }
     }
 
-    public void test_recordException_delegatesToTracer() {
-        RestRequest request = new FakeRestRequest.Builder(xContentRegistry()).withMethod(RestRequest.Method.GET)
-            .withPath("/my-index/_search")
-            .build();
-        var exception = new RuntimeException("test");
-
-        instrumentation.recordException(request, exception);
-
-        var inOrder = inOrder(tracer);
-        inOrder.verify(tracer).addError(request, exception);
-        inOrder.verifyNoMoreInteractions();
+    public void testServerErrorAndRepeatedLifecycleCalls() {
+        try (var fixture = new NativeTracingFixture(Settings.EMPTY)) {
+            var instrumentation = new APMHttpServerInstrumentation(fixture.api);
+            var context = new ThreadContext(Settings.EMPTY);
+            var request = new FakeRestRequest.Builder(xContentRegistry()).withPath("/_test").build();
+            instrumentation.start(context, request, "/_test");
+            instrumentation.start(context, request, "/_test");
+            instrumentation.recordException(request, new IllegalArgumentException("failed"));
+            var response = new RestResponse(RestStatus.INTERNAL_SERVER_ERROR, "text/plain", "failed");
+            instrumentation.end(request, response);
+            instrumentation.end(request, response);
+            assertEquals(1, fixture.exporter.getFinishedSpanItems().size());
+            var span = fixture.exporter.getFinishedSpanItems().getFirst();
+            assertEquals(StatusCode.ERROR, span.getStatus().getStatusCode());
+            assertEquals(1, span.getEvents().size());
+            assertNull(span.getEvents().getFirst().getAttributes().get(AttributeKey.stringKey("exception.stacktrace")));
+        }
     }
 
-    public void test_end_setsResponseAttributes_minimal() {
-        RestRequest request = new FakeRestRequest.Builder(xContentRegistry()).withMethod(RestRequest.Method.GET)
-            .withPath("/my-index/_search")
-            .build();
-        RestResponse response = new RestResponse(RestStatus.OK, RestResponse.TEXT_CONTENT_TYPE, BytesArray.EMPTY);
-
-        instrumentation.end(request, response);
-
-        var inOrder = inOrder(tracer, spanStatusBuilder);
-        inOrder.verify(tracer).setAttribute(request, "http.status_code", 200L);
-        inOrder.verify(tracer)
-            .setAttributes(
-                request,
-                Attributes.builder()
-                    .put(longKey("http.response.status_code"), 200L)
-                    .put(stringKey("network.protocol.version"), "1.1")
-                    .build()
-            );
-        inOrder.verify(tracer).stopTrace(request);
-        inOrder.verifyNoMoreInteractions();
+    public void testIncomingParentOverridesAmbientSpan() {
+        try (var fixture = new NativeTracingFixture(Settings.EMPTY)) {
+            var instrumentation = new APMHttpServerInstrumentation(fixture.api);
+            var incoming = fixture.sdk.getTracer("client").spanBuilder("incoming").startSpan();
+            var unrelated = fixture.sdk.getTracer("client").spanBuilder("unrelated").startSpan();
+            var context = new ThreadContext(Settings.EMPTY);
+            W3CTraceContextPropagator.getInstance().inject(Context.root().with(incoming), context, ThreadContext::putHeader);
+            var request = new FakeRestRequest.Builder(xContentRegistry()).withPath("/_test").build();
+            try (var scope = unrelated.makeCurrent()) {
+                instrumentation.start(context, request, "/_test");
+                assertEquals(unrelated.getSpanContext(), Span.current().getSpanContext());
+                instrumentation.end(request, new RestResponse(RestStatus.OK, "text/plain", "ok"));
+            }
+            var serverSpan = fixture.exporter.getFinishedSpanItems().getFirst();
+            assertEquals(incoming.getSpanContext().getSpanId(), serverSpan.getParentSpanId());
+            incoming.end();
+            unrelated.end();
+        }
     }
 
-    public void test_end_setsResponseAttributes_full() {
-        RestRequest request = new FakeRestRequest.Builder(xContentRegistry()).withMethod(RestRequest.Method.GET)
-            .withPath("/my-index/_search")
-            .build();
-        RestResponse response = new RestResponse(RestStatus.INTERNAL_SERVER_ERROR, RestResponse.TEXT_CONTENT_TYPE, BytesArray.EMPTY);
-
-        when(tracer.spanStatusBuilder(request)).thenReturn(spanStatusBuilder);
-
-        instrumentation.end(request, response);
-
-        var inOrder = inOrder(tracer, spanStatusBuilder);
-        inOrder.verify(tracer).setAttribute(request, "http.status_code", 500L);
-        inOrder.verify(tracer)
-            .setAttributes(
-                request,
-                Attributes.builder()
-                    .put(longKey("http.response.status_code"), 500L)
-                    .put(stringKey("error.type"), "500")
-                    .put(stringKey("network.protocol.version"), "1.1")
-                    .build()
-            );
-        inOrder.verify(spanStatusBuilder).setStatus(StatusCode.ERROR);
-        inOrder.verify(tracer).stopTrace(request);
-        inOrder.verifyNoMoreInteractions();
+    public void testUnconfiguredServiceUsesNoExporter() {
+        try (var service = new APMTracingService(Settings.EMPTY, MeterProvider::noop)) {
+            var instrumentation = new APMHttpServerInstrumentation(service.getOpenTelemetry());
+            for (int index = 0; index < 10; index++) {
+                var request = new FakeRestRequest.Builder(xContentRegistry()).build();
+                instrumentation.start(new ThreadContext(Settings.EMPTY), request, "/");
+                assertFalse(Span.fromContext(request.getTraceContext()).isRecording());
+                instrumentation.end(request, new RestResponse(RestStatus.OK, "text/plain", "ok"));
+            }
+        }
     }
 }

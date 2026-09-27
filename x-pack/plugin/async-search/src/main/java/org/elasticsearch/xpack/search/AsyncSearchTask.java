@@ -697,6 +697,7 @@ final class AsyncSearchTask extends SearchTask implements AsyncTask, Releasable 
 
         @Override
         public void onFailure(Exception exc) {
+            recordTraceFailure(exc);
             searchResponse.updateWithFailure(
                 new ElasticsearchStatusException("error while executing search", ExceptionsHelper.status(exc), exc)
             );

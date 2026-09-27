@@ -9,11 +9,14 @@
 
 package org.elasticsearch.tasks;
 
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.context.Context;
+
 import org.elasticsearch.action.ActionResponse;
 import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.common.io.stream.NamedWriteable;
 import org.elasticsearch.core.Nullable;
-import org.elasticsearch.telemetry.tracing.Traceable;
+import org.elasticsearch.telemetry.tracing.SpanOwner;
 import org.elasticsearch.xcontent.ToXContent;
 import org.elasticsearch.xcontent.ToXContentObject;
 
@@ -27,7 +30,32 @@ import static java.util.Objects.requireNonNull;
 /**
  * Current task information
  */
-public class Task implements Traceable {
+public class Task {
+    private final SpanOwner tracing = new SpanOwner();
+
+    public Context getTraceContext() {
+        return tracing.context();
+    }
+
+    /** Registration owns the span; executions and callbacks only borrow its context. */
+    public void startTrace(Context parent, Span span) {
+        tracing.attach(parent, span);
+    }
+
+    /** Carries causality through an intentionally uninstrumented task. */
+    public void borrowTraceContext(Context parent) {
+        tracing.borrow(parent);
+    }
+
+    /** Terminal callbacks must record failure before unregistering. */
+    public void recordTraceFailure(Throwable failure) {
+        tracing.fail(failure);
+    }
+
+    /** Unregistration is the terminal boundary, not the end of an individual execution slice. */
+    public void finishTrace() {
+        tracing.end(this instanceof CancellableTask task && task.isCancelled() ? "cancelled" : "success");
+    }
 
     /**
      * The request header to mark tasks with specific ids
@@ -65,20 +93,9 @@ public class Task implements Traceable {
 
     /**
      * Optional transient header allowing to override the start time of the root trace.
-     * This is discarded when creating a new trace context once an APM trace context exists.
+     * Only HTTP root instrumentation consumes this override; task spans use their actual registration time.
      */
     public static final String TRACE_START_TIME = "trace.starttime";
-
-    /**
-     * Used internally to pass the apm trace context between the nodes
-     */
-    public static final String APM_TRACE_CONTEXT = "apm.local.context";
-
-    public static final String PARENT_TRACE_PARENT_HEADER = "parent_" + Task.TRACE_PARENT_HTTP_HEADER;
-
-    public static final String PARENT_TRACE_STATE = "parent_" + Task.TRACE_STATE;
-
-    public static final String PARENT_APM_TRACE_CONTEXT = "parent_" + Task.APM_TRACE_CONTEXT;
 
     public static final Set<String> HEADERS_TO_COPY = Set.of(
         X_OPAQUE_ID_HTTP_HEADER,
@@ -306,11 +323,6 @@ public class Task implements Traceable {
         } else {
             throw new IllegalStateException("response has to implement ToXContent to be able to store the results");
         }
-    }
-
-    @Override
-    public String getSpanId() {
-        return "task-" + getId();
     }
 
     protected record OriginalTaskInfo(TaskId originalTaskId, long originalStartTimeMillis) {

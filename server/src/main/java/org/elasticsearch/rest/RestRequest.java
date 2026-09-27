@@ -9,6 +9,9 @@
 
 package org.elasticsearch.rest;
 
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.context.Context;
+
 import org.apache.lucene.util.SetOnce;
 import org.elasticsearch.ElasticsearchParseException;
 import org.elasticsearch.ElasticsearchStatusException;
@@ -30,7 +33,7 @@ import org.elasticsearch.http.HttpChannel;
 import org.elasticsearch.http.HttpRequest;
 import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
-import org.elasticsearch.telemetry.tracing.Traceable;
+import org.elasticsearch.telemetry.tracing.SpanOwner;
 import org.elasticsearch.xcontent.ParsedMediaType;
 import org.elasticsearch.xcontent.ToXContent;
 import org.elasticsearch.xcontent.XContentParser;
@@ -51,7 +54,26 @@ import java.util.regex.Pattern;
 import static org.elasticsearch.common.unit.ByteSizeValue.parseBytesSizeValue;
 import static org.elasticsearch.core.TimeValue.parseTimeValue;
 
-public class RestRequest implements ToXContent.Params, Traceable {
+public class RestRequest implements ToXContent.Params {
+    private final SpanOwner tracing;
+
+    public Context getTraceContext() {
+        return tracing.context();
+    }
+
+    public boolean isTraceStarted() {
+        return tracing.isStarted();
+    }
+
+    /** Routing can revisit instrumentation; a request owns at most one span. */
+    public boolean startTrace(Context parent, Span span) {
+        return tracing.attach(parent, span);
+    }
+
+    /** Completes at the response boundary, not when dispatch returns. */
+    public void finishTrace() {
+        tracing.end(null);
+    }
 
     private static final Logger logger = LogManager.getLogger(RestRequest.class);
 
@@ -127,6 +149,7 @@ public class RestRequest implements ToXContent.Params, Traceable {
         HttpChannel httpChannel,
         long requestId
     ) {
+        this.tracing = new SpanOwner();
         try {
             this.parsedAccept = parseHeaderWithMediaType(httpRequest.getHeaders(), "Accept");
         } catch (IllegalArgumentException e) {
@@ -159,6 +182,7 @@ public class RestRequest implements ToXContent.Params, Traceable {
     }
 
     protected RestRequest(RestRequest other) {
+        this.tracing = other.tracing;
         assert other.parserConfig.restApiVersion().equals(other.getRestApiVersion());
         this.parsedAccept = other.parsedAccept;
         this.parsedContentType = other.parsedContentType;
@@ -751,11 +775,6 @@ public class RestRequest implements ToXContent.Params, Traceable {
         params.put(param, "true");
         // this parameter is intended be consumed via ToXContent.Params.param(..), not this.params(..) so don't require it is consumed here
         consumedParams.add(param);
-    }
-
-    @Override
-    public String getSpanId() {
-        return "rest-" + getRequestId();
     }
 
     public static class MediaTypeHeaderException extends RuntimeException {

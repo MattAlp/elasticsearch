@@ -138,7 +138,11 @@ public class InternalExecutePolicyAction extends ActionType<Response> {
                 return;
             }
 
-            try (var ignored = transportService.getThreadPool().getThreadContext().newTraceContext()) {
+            var parentListener = org.elasticsearch.action.support.ContextPreservingActionListener.wrapPreservingContext(
+                actionListener,
+                transportService.getThreadPool().getThreadContext()
+            );
+            try (var ignored = transportService.getThreadPool().getThreadContext().newStoredContextPreservingResponseHeaders()) {
                 // Can't use provided task, because in the case wait_for_completion=false then
                 // as soon as actionListener#onResponse is invoked then the provided task get unregistered and
                 // then there no way to see the policy execution in the list tasks or get task APIs.
@@ -170,10 +174,10 @@ public class InternalExecutePolicyAction extends ActionType<Response> {
                     }
                 });
 
-                try {
+                try (var scope = taskManager.withTaskContext(task)) {
                     ActionListener<ExecuteEnrichPolicyStatus> listener;
                     if (request.isWaitForCompletion()) {
-                        listener = actionListener.delegateFailureAndWrap((l, result) -> l.onResponse(new Response(result)));
+                        listener = parentListener.delegateFailureAndWrap((l, result) -> l.onResponse(new Response(result)));
                     } else {
                         listener = ActionListener.wrap(
                             result -> LOGGER.debug("successfully executed policy [{}]", request.getName()),
@@ -195,6 +199,7 @@ public class InternalExecutePolicyAction extends ActionType<Response> {
                             taskManager.unregister(task);
                             listener.onResponse(result);
                         }, e -> {
+                            task.recordTraceFailure(e);
                             taskManager.unregister(task);
                             listener.onFailure(e);
                         })
@@ -202,9 +207,10 @@ public class InternalExecutePolicyAction extends ActionType<Response> {
 
                     if (request.isWaitForCompletion() == false) {
                         TaskId taskId = new TaskId(clusterState.nodes().getLocalNodeId(), task.getId());
-                        actionListener.onResponse(new Response(taskId));
+                        parentListener.onResponse(new Response(taskId));
                     }
                 } catch (Exception e) {
+                    task.recordTraceFailure(e);
                     taskManager.unregister(task);
                     throw e;
                 }

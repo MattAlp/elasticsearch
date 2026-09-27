@@ -12,6 +12,7 @@ import org.apache.logging.log4j.Logger;
 import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.ActionResponse;
+import org.elasticsearch.action.support.ContextPreservingActionListener;
 import org.elasticsearch.action.support.ListenerTimeouts;
 import org.elasticsearch.client.internal.Client;
 import org.elasticsearch.cluster.service.ClusterService;
@@ -185,18 +186,25 @@ public class AsyncTaskManagementService<
         boolean keepOnCompletion,
         ActionListener<Response> listener
     ) {
+        var parentListener = ContextPreservingActionListener.wrapPreservingContext(listener, threadPool.getThreadContext());
         String nodeId = clusterService.localNode().getId();
-        try (var ignored = threadPool.getThreadContext().newTraceContext()) {
+        try (var ignored = threadPool.getThreadContext().newStoredContextPreservingResponseHeaders()) {
             @SuppressWarnings("unchecked")
             T searchTask = (T) taskManager.register("transport", action + ASYNC_ACTION_SUFFIX, new AsyncRequestWrapper(request, nodeId));
             boolean operationStarted = false;
-            try {
+            try (var scope = taskManager.withTaskContext(searchTask)) {
                 operation.execute(
                     request,
                     searchTask,
-                    wrapStoringListener(searchTask, waitForCompletionTimeout, keepOnCompletion, listener)
+                    ContextPreservingActionListener.wrapPreservingContext(
+                        wrapStoringListener(searchTask, waitForCompletionTimeout, keepOnCompletion, parentListener),
+                        threadPool.getThreadContext()
+                    )
                 );
                 operationStarted = true;
+            } catch (Exception failure) {
+                searchTask.recordTraceFailure(failure);
+                throw failure;
             } finally {
                 // If we didn't start operation for any reason, we need to clean up the task that we have created
                 if (operationStarted == false) {
@@ -248,6 +256,7 @@ public class AsyncTaskManagementService<
                 );
             }
         }, e -> {
+            searchTask.recordTraceFailure(e);
             ActionListener<Response> acquiredListener = exclusiveListener.getAndSet(null);
             if (acquiredListener != null) {
                 // We finished before timeout
@@ -297,6 +306,7 @@ public class AsyncTaskManagementService<
                         }
                     },
                     exc -> {
+                        searchTask.recordTraceFailure(exc);
                         taskManager.unregister(searchTask);
                         searchTask.onFailure(exc);
                         Throwable cause = ExceptionsHelper.unwrapCause(exc);
@@ -310,6 +320,7 @@ public class AsyncTaskManagementService<
                 )
             );
         } catch (Exception exc) {
+            searchTask.recordTraceFailure(exc);
             taskManager.unregister(searchTask);
             searchTask.onFailure(exc);
             logStoreResultFailure(searchTask, exc);

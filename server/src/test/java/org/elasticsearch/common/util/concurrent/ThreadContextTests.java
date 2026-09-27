@@ -21,7 +21,6 @@ import org.elasticsearch.test.MockLog;
 import org.hamcrest.Matcher;
 
 import java.io.IOException;
-import java.time.Instant;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -35,7 +34,6 @@ import java.util.stream.Stream;
 
 import static com.carrotsearch.randomizedtesting.RandomizedTest.randomAsciiLettersOfLengthBetween;
 import static org.elasticsearch.tasks.Task.HEADERS_TO_COPY;
-import static org.hamcrest.Matchers.anEmptyMap;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.empty;
@@ -43,7 +41,6 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.instanceOf;
-import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.nullValue;
 import static org.hamcrest.Matchers.sameInstance;
@@ -1277,79 +1274,27 @@ public class ThreadContextTests extends ESTestCase {
         assertNotNull(threadContext.getHeader(header));
     }
 
-    public void testNewTraceContext() {
+    public void testNewTraceContextPreservesParentAndResponseHeaders() {
         final var threadContext = new ThreadContext(Settings.EMPTY);
-
-        var rootTraceContext = Map.of(Task.TRACE_PARENT_HTTP_HEADER, randomIdentifier(), Task.TRACE_STATE, randomIdentifier());
-        var apmTraceContext = new Object();
-        var traceStartTime = Instant.now();
-        var responseKey = randomIdentifier();
-        var responseValue = randomAlphaOfLength(10);
-
-        threadContext.putHeader(rootTraceContext);
-        threadContext.putTransient(Task.TRACE_START_TIME, traceStartTime);
-        threadContext.putTransient(Task.APM_TRACE_CONTEXT, apmTraceContext);
-
-        assertThat(threadContext.hasApmTraceContext(), equalTo(true));
-        assertThat(threadContext.hasParentApmTraceContext(), equalTo(false));
-
-        try (var ignored = threadContext.newTraceContext()) {
-            assertThat(threadContext.hasApmTraceContext(), equalTo(false)); // no trace started yet
-            assertThat(threadContext.hasParentApmTraceContext(), equalTo(true));
-
-            assertThat(threadContext.getHeaders(), is(anEmptyMap()));
-            // trace start time is not propagated
-            assertThat(
-                threadContext.getTransientHeaders(),
-                equalTo(
-                    Map.of(
-                        Task.PARENT_TRACE_PARENT_HEADER,
-                        rootTraceContext.get(Task.TRACE_PARENT_HTTP_HEADER),
-                        Task.PARENT_TRACE_STATE,
-                        rootTraceContext.get(Task.TRACE_STATE),
-                        Task.PARENT_APM_TRACE_CONTEXT,
-                        apmTraceContext
+        var parent = io.opentelemetry.context.Context.root()
+            .with(
+                io.opentelemetry.api.trace.Span.wrap(
+                    io.opentelemetry.api.trace.SpanContext.create(
+                        "0123456789abcdef0123456789abcdef",
+                        "0123456789abcdef",
+                        io.opentelemetry.api.trace.TraceFlags.getSampled(),
+                        io.opentelemetry.api.trace.TraceState.getDefault()
                     )
                 )
             );
-            // response headers shall be propagated
-            threadContext.addResponseHeader(responseKey, responseValue);
+        try (var scope = parent.makeCurrent()) {
+            try (var stored = threadContext.newStoredContextPreservingResponseHeaders()) {
+                assertSame(parent, io.opentelemetry.context.Context.current());
+                threadContext.addResponseHeader("test", "value");
+            }
+            assertSame(parent, io.opentelemetry.context.Context.current());
+            assertEquals(List.of("value"), threadContext.getResponseHeaders().get("test"));
         }
-
-        assertThat(threadContext.hasApmTraceContext(), equalTo(true));
-        assertThat(threadContext.hasParentApmTraceContext(), equalTo(false));
-
-        assertThat(threadContext.getHeaders(), equalTo(rootTraceContext));
-        assertThat(
-            threadContext.getTransientHeaders(),
-            equalTo(Map.of(Task.APM_TRACE_CONTEXT, apmTraceContext, Task.TRACE_START_TIME, traceStartTime))
-        );
-        assertThat(threadContext.getResponseHeaders(), equalTo(Map.of(responseKey, List.of(responseValue))));
-    }
-
-    public void testNewTraceContextWithoutParentTrace() {
-        final var threadContext = new ThreadContext(Settings.EMPTY);
-
-        var responseKey = randomIdentifier();
-        var responseValue = randomAlphaOfLength(10);
-
-        assertThat(threadContext.hasApmTraceContext(), equalTo(false));
-        assertThat(threadContext.hasParentApmTraceContext(), equalTo(false));
-
-        try (var ignored = threadContext.newTraceContext()) {
-            assertTrue(threadContext.isDefaultContext());
-            assertThat(threadContext.hasApmTraceContext(), equalTo(false));
-            assertThat(threadContext.hasParentApmTraceContext(), equalTo(false));
-
-            // discared, just making sure the context is isolated
-            threadContext.putTransient(randomIdentifier(), randomAlphaOfLength(10));
-            // response headers shall be propagated
-            threadContext.addResponseHeader(responseKey, responseValue);
-        }
-
-        assertThat(threadContext.getHeaders(), is(anEmptyMap()));
-        assertThat(threadContext.getTransientHeaders(), is(anEmptyMap()));
-        assertThat(threadContext.getResponseHeaders(), equalTo(Map.of(responseKey, List.of(responseValue))));
     }
 
     public void testRestoreExistingContext() {

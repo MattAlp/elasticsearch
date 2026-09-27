@@ -11,15 +11,26 @@ package org.elasticsearch.transport;
 
 import org.elasticsearch.TransportVersion;
 import org.elasticsearch.core.Releasable;
+import org.elasticsearch.tasks.Task;
 
 public class TaskTransportChannel implements TransportChannel {
 
     private final long taskId;
+    private final Task task;
     private final TransportChannel channel;
     private final Releasable onTaskFinished;
 
     TaskTransportChannel(long taskId, TransportChannel channel, Releasable onTaskFinished) {
+        this(taskId, null, channel, onTaskFinished);
+    }
+
+    TaskTransportChannel(Task task, TransportChannel channel, Releasable onTaskFinished) {
+        this(task.getId(), task, channel, onTaskFinished);
+    }
+
+    private TaskTransportChannel(long taskId, Task task, TransportChannel channel, Releasable onTaskFinished) {
         this.taskId = taskId;
+        this.task = task;
         this.channel = channel;
         this.onTaskFinished = onTaskFinished;
     }
@@ -41,6 +52,9 @@ public class TaskTransportChannel implements TransportChannel {
     @Override
     public void sendResponse(Exception exception) {
         try {
+            if (task != null) {
+                task.recordTraceFailure(exception);
+            }
             channel.sendResponse(exception);
         } finally {
             onTaskFinished.close();

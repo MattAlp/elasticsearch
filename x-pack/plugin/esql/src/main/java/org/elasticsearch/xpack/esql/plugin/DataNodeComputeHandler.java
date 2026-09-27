@@ -221,13 +221,22 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                                 return;
                             }
                             onGroupFailure = computeService.cancelQueryOnFailure(groupTask);
-                            l = ActionListener.runAfter(l, () -> transportService.getTaskManager().unregister(groupTask));
+                            l = ActionListener.runAfter(l, () -> transportService.getTaskManager().unregister(groupTask))
+                                .delegateResponse((failedListener, failure) -> {
+                                    groupTask.recordTraceFailure(failure);
+                                    failedListener.onFailure(failure);
+                                });
                         } else {
                             groupTask = parentTask;
                             onGroupFailure = runOnTaskFailure;
                         }
                         final AtomicReference<DataNodeComputeResponse> nodeResponseRef = new AtomicReference<>();
-                        try (var computeListener = new ComputeListener(onGroupFailure, l.map(ignored -> nodeResponseRef.get()))) {
+                        try (
+                            Releasable taskScope = groupTask == parentTask
+                                ? () -> {}
+                                : transportService.getTaskManager().withTaskContext(groupTask);
+                            var computeListener = new ComputeListener(onGroupFailure, l.map(ignored -> nodeResponseRef.get()))
+                        ) {
                             final boolean sameNodeAsCoordinator = transportService.getLocalNode()
                                 .getId()
                                 .equals(connection.getNode().getId());
@@ -359,7 +368,11 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                             return;
                         }
                         onGroupFailure = computeService.cancelQueryOnFailure(groupTask);
-                        l = ActionListener.runAfter(l, () -> transportService.getTaskManager().unregister(groupTask));
+                        l = ActionListener.runAfter(l, () -> transportService.getTaskManager().unregister(groupTask))
+                            .delegateResponse((failedListener, failure) -> {
+                                groupTask.recordTraceFailure(failure);
+                                failedListener.onFailure(failure);
+                            });
                     } else {
                         groupTask = parentTask;
                         onGroupFailure = runOnTaskFailure;
@@ -369,19 +382,24 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                     // into a dedicated parentComputeListener.acquireCompute() slot.
                     final ActionListener<DriverCompletionInfo> profileSlot = parentComputeListener.acquireCompute();
                     final ActionListener<Void> outerL = l;
-                    try (var computeListener = new ComputeListener(onGroupFailure, ActionListener.wrap(info -> {
-                        try {
-                            profileSlot.onResponse(info);
-                        } finally {
-                            outerL.onResponse(null);
-                        }
-                    }, e -> {
-                        try {
-                            profileSlot.onFailure(e);
-                        } finally {
-                            outerL.onFailure(e);
-                        }
-                    }))) {
+                    try (
+                        Releasable taskScope = groupTask == parentTask
+                            ? () -> {}
+                            : transportService.getTaskManager().withTaskContext(groupTask);
+                        var computeListener = new ComputeListener(onGroupFailure, ActionListener.wrap(info -> {
+                            try {
+                                profileSlot.onResponse(info);
+                            } finally {
+                                outerL.onResponse(null);
+                            }
+                        }, e -> {
+                            try {
+                                profileSlot.onFailure(e);
+                            } finally {
+                                outerL.onFailure(e);
+                            }
+                        }))
+                    ) {
                         var dataNodeRequest = new DataNodeRequest(
                             childSessionId,
                             configuration,
