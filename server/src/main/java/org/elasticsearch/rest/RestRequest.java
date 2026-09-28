@@ -155,8 +155,11 @@ public class RestRequest implements ToXContent.Params {
             }
             origin.traceFinished = true;
             Span span = Span.fromContext(origin.traceContext);
-            annotator.accept(span);
-            span.end();
+            try {
+                annotator.accept(span);
+            } finally {
+                span.end();
+            }
             return true;
         }
     }

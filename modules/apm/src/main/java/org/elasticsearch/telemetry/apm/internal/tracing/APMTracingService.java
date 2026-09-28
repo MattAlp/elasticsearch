@@ -185,14 +185,14 @@ public final class APMTracingService extends AbstractLifecycleComponent {
     /** Canonical HTTP header names must retain protection from selectors written against their original casing. */
     private record Redaction(CharacterRunAutomaton fields, CharacterRunAutomaton headers) {
         boolean matches(String name) {
-            if (fields == null || fields.run(name)) {
+            if (fields != null && fields.run(name)) {
                 return true;
             }
             boolean header = name.startsWith("http.request.header.")
                 || name.startsWith("http.request.headers.")
                 || name.startsWith("http.response.header.")
                 || name.startsWith("http.response.headers.");
-            return header && headers.run(name.toLowerCase(Locale.ROOT));
+            return header && headers != null && headers.run(name.toLowerCase(Locale.ROOT));
         }
     }
 

@@ -420,6 +420,13 @@ public class NativeTracingTests extends ESTestCase {
         }
     }
 
+    public void testNativeTracerBuilderWithoutOptionalMetadata() {
+        try (var fixture = new NativeTracingFixture(Settings.EMPTY)) {
+            fixture.api.getTracerProvider().tracerBuilder("component").build().spanBuilder("operation").startSpan().end();
+            assertEquals("component", fixture.span("operation").getInstrumentationScopeInfo().getName());
+        }
+    }
+
     public void testExcludedSpansDoNotHideDescendantsOrMutateParents() {
         try (var fixture = new NativeTracingFixture(Settings.builder().putList("telemetry.tracing.names.exclude", "excluded").build())) {
             var tracer = fixture.api.getTracer("component");
@@ -590,6 +597,17 @@ public class NativeTracingTests extends ESTestCase {
             assertEquals("[REDACTED]", exported.getEvents().getFirst().getAttributes().get(AttributeKey.stringKey("private.event")));
             assertEquals("[REDACTED]", exported.getLinks().getFirst().getAttributes().get(AttributeKey.stringKey("private.link")));
             assertEquals("[REDACTED]", exported.getLinks().getLast().getAttributes().get(AttributeKey.stringKey("private.late-link")));
+        }
+    }
+
+    public void testEmptySanitizationListDoesNotRedactAttributes() {
+        try (var fixture = new NativeTracingFixture(Settings.EMPTY)) {
+            fixture.service.setLabelFilters(List.of());
+            fixture.api.getTracer("component").spanBuilder("unredacted").setAttribute("private.value", 42L).startSpan().end();
+
+            var attributes = fixture.span("unredacted").getAttributes();
+            assertEquals(Long.valueOf(42), attributes.get(AttributeKey.longKey("private.value")));
+            assertNull(attributes.get(AttributeKey.stringKey("private.value")));
         }
     }
 

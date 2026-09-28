@@ -40,8 +40,8 @@ public class APMHttpServerInstrumentationTests extends ESTestCase {
             var instrumentation = new APMHttpServerInstrumentation(fixture.api);
             var request = new FakeRestRequest.Builder(xContentRegistry()).withMethod(RestRequest.Method.GET)
                 .withScheme("https")
-                .withPath("/my-index/_search")
-                .withHeaders(Map.of("Accept-Encoding", List.of("gzip"), "Authorization", List.of("secret")))
+                .withPath("/my-index/_search?pretty=true")
+                .withHeaders(Map.of("Accept-Encoding", List.of("gzip", "br"), "Authorization", List.of("secret")))
                 .build();
             var context = new ThreadContext(Settings.EMPTY);
             instrumentation.start(context, request, "/{index}/_search");
@@ -50,6 +50,7 @@ public class APMHttpServerInstrumentationTests extends ESTestCase {
             }
             var response = new RestResponse(RestStatus.OK, "text/plain", "ok");
             response.addHeader("X-Debug-Tag", "response-tag");
+            response.addHeader("X-Debug-Tag", "second-tag");
             instrumentation.end(request, response);
             var span = fixture.span("GET /{index}/_search");
             assertEquals(SpanKind.SERVER, span.getKind());
@@ -57,13 +58,17 @@ public class APMHttpServerInstrumentationTests extends ESTestCase {
             assertEquals("https", span.getAttributes().get(AttributeKey.stringKey("url.scheme")));
             assertEquals("/{index}/_search", span.getAttributes().get(AttributeKey.stringKey("http.route")));
             assertEquals("/my-index/_search", span.getAttributes().get(AttributeKey.stringKey("url.path")));
+            assertEquals("pretty=true", span.getAttributes().get(AttributeKey.stringKey("url.query")));
             assertEquals(Long.valueOf(200), span.getAttributes().get(AttributeKey.longKey("http.response.status_code")));
             assertNull(span.getAttributes().get(AttributeKey.stringKey("http.method")));
             assertNull(span.getAttributes().get(AttributeKey.longKey("http.status_code")));
-            assertEquals(List.of("gzip"), span.getAttributes().get(AttributeKey.stringArrayKey("http.request.header.accept-encoding")));
+            assertEquals(
+                List.of("gzip", "br"),
+                span.getAttributes().get(AttributeKey.stringArrayKey("http.request.header.accept-encoding"))
+            );
             assertEquals("[REDACTED]", span.getAttributes().get(AttributeKey.stringKey("http.request.header.authorization")));
             assertEquals(
-                List.of("response-tag"),
+                List.of("response-tag", "second-tag"),
                 span.getAttributes().get(AttributeKey.stringArrayKey("http.response.header.x-debug-tag"))
             );
             assertEquals(span.getSpanId(), fixture.span("child").getParentSpanId());
@@ -115,6 +120,25 @@ public class APMHttpServerInstrumentationTests extends ESTestCase {
             assertEquals(StatusCode.ERROR, span.getStatus().getStatusCode());
             assertEquals(1, span.getEvents().size());
             assertNull(span.getEvents().getFirst().getAttributes().get(AttributeKey.stringKey("exception.stacktrace")));
+        }
+    }
+
+    public void testAnnotatorFailureStillEndsRequestSpan() {
+        try (var fixture = new NativeTracingFixture(Settings.EMPTY)) {
+            var instrumentation = new APMHttpServerInstrumentation(fixture.api);
+            var request = new FakeRestRequest.Builder(xContentRegistry()).withPath("/_test").build();
+            instrumentation.start(new ThreadContext(Settings.EMPTY), request, "/_test");
+
+            expectThrows(
+                IllegalArgumentException.class,
+                () -> request.finishTrace(span -> { throw new IllegalArgumentException("failed to annotate"); })
+            );
+            instrumentation.end(request, new RestResponse(RestStatus.OK, "text/plain", "ok"));
+            assertEquals(1, fixture.exporter.getFinishedSpanItems().size());
+            assertEquals(
+                "/_test",
+                fixture.exporter.getFinishedSpanItems().getFirst().getAttributes().get(AttributeKey.stringKey("url.path"))
+            );
         }
     }
 

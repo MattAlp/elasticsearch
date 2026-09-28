@@ -113,8 +113,10 @@ not `StatusCode.ERROR`.
 ## Preserved policy and deliberate changes
 
 - Existing settings, defaults, OTLP export, authentication, batching, name
-  filters, and sampling configuration remain in place. The tracing-specific
-  sampling setting takes precedence over the legacy agent-setting fallback.
+  filters, and sampling configuration remain in place. An empty
+  `telemetry.tracing.sanitize_field_names` list disables field-name redaction.
+  The tracing-specific sampling setting takes precedence over the legacy
+  agent-setting fallback.
 - `telemetry.tracing.max_depth=0` retains root-only local recording. Remote
   parents do not consume the local depth budget. A suppressed local span borrows
   its effective parent's identity and does not change distributed sampling.
