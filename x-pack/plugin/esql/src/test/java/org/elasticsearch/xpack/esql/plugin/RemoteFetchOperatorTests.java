@@ -275,6 +275,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             input = new Page(handles(driverContext), carry(driverContext));
             operator.addInput(input);
             input = null;
+            operator.finish();
             output = operator.getOutput();
 
             assertNotNull(output);
@@ -304,6 +305,168 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             }
             if (output != null) {
                 output.releaseBlocks();
+            }
+        }
+    }
+
+    public void testCoalescesInputPagesIntoOneBatchPerTarget() {
+        DriverContext driverContext = driverContext();
+        List<RemoteFetchService.FetchField> fields = List.of(new RemoteFetchService.FetchField("salary", DataType.INTEGER));
+        List<Attribute> outputFields = List.of(new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER));
+        AtomicInteger requests = new AtomicInteger();
+        RecordingClient client = new RecordingClient(driverContext) {
+            @Override
+            void onBatch(String nodeId, String sessionId, long batchId, List<RemoteFetchHandle> handles) {
+                requests.incrementAndGet();
+                switch (nodeId) {
+                    case "node-a" -> {
+                        assertEquals("session-a", sessionId);
+                        assertEquals(List.of(11, 33, 44), handles.stream().map(RemoteFetchHandle::doc).toList());
+                        enqueue(batchId, intPage(driverContext, 110, 330, 440), true);
+                    }
+                    case "node-b" -> {
+                        assertEquals("session-b", sessionId);
+                        assertEquals(List.of(22, 55), handles.stream().map(RemoteFetchHandle::doc).toList());
+                        enqueue(batchId, intPage(driverContext, 220, 550), true);
+                    }
+                    default -> throw new IllegalStateException("unexpected node [" + nodeId + "]");
+                }
+            }
+        };
+
+        Page input1 = null;
+        Page input2 = null;
+        Page output1 = null;
+        Page output2 = null;
+        try (
+            RemoteFetchOperator operator = new RemoteFetchOperator(
+                driverContext,
+                0,
+                fields,
+                outputFields,
+                null,
+                ConfigurationAware.CONFIGURATION_MARKER,
+                2,
+                client
+            )
+        ) {
+            input1 = new Page(handles(driverContext));
+            operator.addInput(input1);
+            input1 = null;
+            assertEquals(0, requests.get());
+
+            input2 = new Page(
+                handles(
+                    driverContext,
+                    new RemoteFetchHandle("node-b", "session-b", 2, 0, 55),
+                    new RemoteFetchHandle("node-a", "session-a", 1, 0, 44)
+                )
+            );
+            operator.addInput(input2);
+            input2 = null;
+            assertEquals(2, requests.get());
+
+            output1 = operator.getOutput();
+            output2 = operator.getOutput();
+            assertNotNull(output1);
+            assertNotNull(output2);
+
+            IntBlock fetched1 = output1.getBlock(1);
+            assertEquals(110, fetched1.getInt(0));
+            assertEquals(220, fetched1.getInt(1));
+            assertEquals(330, fetched1.getInt(2));
+
+            IntBlock fetched2 = output2.getBlock(1);
+            assertEquals(550, fetched2.getInt(0));
+            assertEquals(440, fetched2.getInt(1));
+
+            RemoteFetchOperator.Status status = (RemoteFetchOperator.Status) operator.status();
+            assertThat(status, equalTo(new RemoteFetchOperator.Status(2, 2, 5, 5, 2, 2)));
+
+            operator.finish();
+            assertTrue(operator.isFinished());
+        } finally {
+            if (input1 != null) {
+                input1.releaseBlocks();
+            }
+            if (input2 != null) {
+                input2.releaseBlocks();
+            }
+            if (output1 != null) {
+                output1.releaseBlocks();
+            }
+            if (output2 != null) {
+                output2.releaseBlocks();
+            }
+        }
+    }
+
+    public void testCoalescedPushdownPositionsSpanInputPages() {
+        DriverContext driverContext = driverContext();
+        List<RemoteFetchService.FetchField> fields = List.of(new RemoteFetchService.FetchField("salary", DataType.INTEGER));
+        List<Attribute> outputFields = List.of(new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER));
+        RecordingClient client = new RecordingClient(driverContext) {
+            @Override
+            void onBatch(String nodeId, String sessionId, long batchId, List<RemoteFetchHandle> handles) {
+                switch (nodeId) {
+                    case "node-a" -> {
+                        assertEquals(List.of(11, 33, 44), handles.stream().map(RemoteFetchHandle::doc).toList());
+                        enqueue(batchId, intPageWithPosition(driverContext, 330, 1), false);
+                        enqueue(batchId, intPageWithPosition(driverContext, 440, 2), true);
+                    }
+                    case "node-b" -> {
+                        assertEquals(List.of(22, 55), handles.stream().map(RemoteFetchHandle::doc).toList());
+                        enqueue(batchId, intPageWithPosition(driverContext, 550, 1), true);
+                    }
+                    default -> throw new IllegalStateException("unexpected node [" + nodeId + "]");
+                }
+            }
+        };
+
+        Page output1 = null;
+        Page output2 = null;
+        try (
+            RemoteFetchOperator operator = new RemoteFetchOperator(
+                driverContext,
+                0,
+                fields,
+                outputFields,
+                pushdownPlan(),
+                ConfigurationAware.CONFIGURATION_MARKER,
+                2,
+                client
+            )
+        ) {
+            operator.addInput(new Page(handles(driverContext)));
+            operator.addInput(
+                new Page(
+                    handles(
+                        driverContext,
+                        new RemoteFetchHandle("node-b", "session-b", 2, 0, 55),
+                        new RemoteFetchHandle("node-a", "session-a", 1, 0, 44)
+                    )
+                )
+            );
+
+            output1 = operator.getOutput();
+            output2 = operator.getOutput();
+
+            assertNotNull(output1);
+            assertNotNull(output2);
+            assertEquals(1, output1.getPositionCount());
+            assertEquals(330, ((IntBlock) output1.getBlock(1)).getInt(0));
+            assertEquals(2, output2.getPositionCount());
+            assertEquals(550, ((IntBlock) output2.getBlock(1)).getInt(0));
+            assertEquals(440, ((IntBlock) output2.getBlock(1)).getInt(1));
+
+            operator.finish();
+            assertTrue(operator.isFinished());
+        } finally {
+            if (output1 != null) {
+                output1.releaseBlocks();
+            }
+            if (output2 != null) {
+                output2.releaseBlocks();
             }
         }
     }
@@ -389,6 +552,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             input = new Page(handles(driverContext), carry(driverContext));
             operator.addInput(input);
             input = null;
+            operator.finish();
 
             IllegalStateException exception = expectThrows(IllegalStateException.class, operator::getOutput);
             assertThat(exception.getMessage(), containsString("remote fetch returned [0] rows but expected [2]"));
@@ -435,6 +599,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             input = new Page(handles(driverContext), driverContext.blockFactory().newConstantIntBlockWith(7, 3));
             operator.addInput(input);
             input = null;
+            operator.finish();
             output = operator.getOutput();
 
             assertNotNull(output);
@@ -503,6 +668,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             input = new Page(handles(driverContext), carry(driverContext));
             operator.addInput(input);
             input = null;
+            operator.finish();
             output = operator.getOutput();
 
             assertNotNull(output);
@@ -566,6 +732,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             input = new Page(handles(driverContext), carry(driverContext));
             operator.addInput(input);
             input = null;
+            operator.finish();
 
             assertNull("node-b has not completed yet, so conservative output must wait", operator.getOutput());
 
@@ -620,6 +787,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             input = new Page(handles(driverContext), carry(driverContext));
             operator.addInput(input);
             input = null;
+            operator.finish();
             output = operator.getOutput();
 
             assertNotNull(output);
@@ -671,6 +839,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             input = new Page(handles(driverContext), carry(driverContext));
             operator.addInput(input);
             input = null;
+            operator.finish();
 
             IllegalStateException exception = expectThrows(IllegalStateException.class, operator::getOutput);
             assertThat(exception.getMessage(), containsString("remote fetch returned plain response pages for a pushdown fetch"));
@@ -712,6 +881,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             input = new Page(handles(driverContext), carry(driverContext));
             operator.addInput(input);
             input = null;
+            operator.finish();
 
             IllegalStateException exception = expectThrows(IllegalStateException.class, operator::getOutput);
             assertThat(exception.getMessage(), containsString("remote fetch returned mapped response pages for a plain fetch"));
@@ -866,6 +1036,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
                 input = new Page(handles(driverContext), carry(driverContext));
                 operator.addInput(input);
                 input = null;
+                operator.finish();
 
                 IllegalStateException exception = expectThrows(IllegalStateException.class, operator::getOutput);
                 assertThat(exception.getMessage(), containsString(testCase.message));
@@ -998,7 +1169,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
         }
     }
 
-    public void testIsBlockedWaitsForRemoteFetchEvenWhenMoreInputCanBeAccepted() {
+    public void testIsBlockedWaitsForDispatchedRemoteFetch() {
         DriverContext driverContext = driverContext();
         List<RemoteFetchService.FetchField> fields = List.of(new RemoteFetchService.FetchField("salary", DataType.INTEGER));
         List<Attribute> outputFields = List.of(new ReferenceAttribute(Source.EMPTY, null, "salary", DataType.INTEGER));
@@ -1019,7 +1190,8 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             )
         ) {
             operator.addInput(new Page(handles(driverContext), carry(driverContext)));
-            assertTrue(operator.needsInput());
+            operator.finish();
+            assertFalse(operator.needsInput());
 
             IsBlockedResult blocked = operator.isBlocked();
             assertFalse(blocked.listener().isDone());
@@ -1049,6 +1221,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             )
         ) {
             operator.addInput(new Page(handles(driverContext), carry(driverContext)));
+            operator.finish();
             long enclosingStartNanos = System.nanoTime();
             IsBlockedResult first = operator.isBlocked();
             IsBlockedResult second = operator.isBlocked();
@@ -1088,6 +1261,7 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
             )
         ) {
             operator.addInput(new Page(handles(driverContext), carry(driverContext)));
+            operator.finish();
             assertThat(client.queuedPageCount(), equalTo(2));
 
             assertTrue(operator.isBlocked().listener().isDone());
@@ -1175,10 +1349,19 @@ public class RemoteFetchOperatorTests extends OperatorTestCase {
     }
 
     private static BytesRefBlock handles(DriverContext driverContext) {
-        try (BytesRefBlock.Builder builder = driverContext.blockFactory().newBytesRefBlockBuilder(3)) {
-            builder.appendBytesRef(new RemoteFetchHandle("node-a", "session-a", 1, 0, 11).toBytesRef());
-            builder.appendBytesRef(new RemoteFetchHandle("node-b", "session-b", 2, 0, 22).toBytesRef());
-            builder.appendBytesRef(new RemoteFetchHandle("node-a", "session-a", 1, 0, 33).toBytesRef());
+        return handles(
+            driverContext,
+            new RemoteFetchHandle("node-a", "session-a", 1, 0, 11),
+            new RemoteFetchHandle("node-b", "session-b", 2, 0, 22),
+            new RemoteFetchHandle("node-a", "session-a", 1, 0, 33)
+        );
+    }
+
+    private static BytesRefBlock handles(DriverContext driverContext, RemoteFetchHandle... handles) {
+        try (BytesRefBlock.Builder builder = driverContext.blockFactory().newBytesRefBlockBuilder(handles.length)) {
+            for (RemoteFetchHandle handle : handles) {
+                builder.appendBytesRef(handle.toBytesRef());
+            }
             return builder.build();
         }
     }

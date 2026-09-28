@@ -48,13 +48,14 @@ import java.util.concurrent.atomic.AtomicLong;
  * narrowed the candidate row set.
  * <p>
  * Each input page carries a column of serialized {@link RemoteFetchHandle}s plus any coordinator columns that
- * should be retained. For every input page the operator:
+ * should be retained. The operator:
  * <ol>
- *     <li>decodes and groups handles by target session ({@code nodeId}, {@code retainedSessionId})</li>
+ *     <li>buffers a bounded window of input pages and groups their handles by target session
+ *         ({@code nodeId}, {@code retainedSessionId})</li>
  *     <li>opens a {@link RemoteFetchService.TargetExchange} per target session when needed</li>
- *     <li>sends batches of handles to the data node via the exchange</li>
+ *     <li>sends one batch per target session for the whole window</li>
  *     <li>collects response pages from the exchange and merges fetched columns back onto the input rows</li>
- *     <li>emits one output page once every group for that input page has completed</li>
+ *     <li>emits the original input pages in order once every group for the window has completed</li>
  * </ol>
  * An optional {@code pushdownPlan} may be supplied so filtering happens on the data node. Mapped responses
  * include a trailing position-mapping column ({@link org.elasticsearch.xpack.esql.plan.logical.RemoteFetchSource#POSITION_ATTRIBUTE_NAME})
@@ -111,32 +112,34 @@ public final class RemoteFetchOperator implements Operator {
         private final Page inputPage;
         private final int[] groupByPosition;
         private final int[] offsetByPosition;
-        private final List<PendingGroup> groups;
 
-        private PendingInput(Page inputPage, int[] groupByPosition, int[] offsetByPosition, List<PendingGroup> groups) {
+        private PendingInput(Page inputPage, int[] groupByPosition, int[] offsetByPosition) {
             this.inputPage = inputPage;
             this.groupByPosition = groupByPosition;
             this.offsetByPosition = offsetByPosition;
-            this.groups = groups;
         }
+    }
 
-        /**
-         * A pending input with no rows to fetch. It is immediately complete and flows through the regular merge
-         * path so the emitted page carries the same schema (input columns plus fetched columns) as every other
-         * output page; downstream operators address the fetched columns by channel even on empty pages.
-         */
-        static PendingInput empty(Page inputPage) {
-            return new PendingInput(inputPage, new int[0], new int[0], List.of());
-        }
+    /**
+     * A bounded set of input pages whose handles are fetched together. Groups and offsets span every input in the
+     * window, so each target session receives one batch rather than one batch per input page.
+     */
+    private static final class FetchWindow {
+        private final Map<TargetSession, Integer> groupLookup = new LinkedHashMap<>();
+        private final List<Group> groups = new ArrayList<>();
+        private final Deque<PendingInput> inputs = new ArrayDeque<>();
+        private final List<PendingGroup> pendingGroups = new ArrayList<>();
+        private FetchedRowRef[][] groupMappings;
+        private boolean dispatched;
 
         boolean isComplete() {
-            return groups.stream().allMatch(PendingGroup::isComplete);
+            return dispatched && pendingGroups.stream().allMatch(PendingGroup::isComplete);
         }
 
         List<GroupPages> pagesByGroup() {
-            List<GroupPages> pagesByGroup = new ArrayList<>(groups.size());
-            for (PendingGroup group : groups) {
-                pagesByGroup.add(new GroupPages(group.pages, group.hasPositionMapping, group.group.handles.size()));
+            List<GroupPages> pagesByGroup = new ArrayList<>(pendingGroups.size());
+            for (PendingGroup pendingGroup : pendingGroups) {
+                pagesByGroup.add(new GroupPages(pendingGroup.pages, pendingGroup.hasPositionMapping, pendingGroup.group.handles.size()));
             }
             return pagesByGroup;
         }
@@ -176,7 +179,7 @@ public final class RemoteFetchOperator implements Operator {
     // returns; _tasks reads the cached snapshot and does not call status() live.
     private final Map<TargetSession, RemoteFetchService.TargetExchange> exchanges = new HashMap<>();
     private final Map<Long, PendingGroup> pendingByBatch = new HashMap<>();
-    private final Deque<PendingInput> pendingInputs = new ArrayDeque<>();
+    private FetchWindow fetchWindow = new FetchWindow();
     private boolean finishing;
     private Exception failure;
     private int pagesReceived;
@@ -233,7 +236,10 @@ public final class RemoteFetchOperator implements Operator {
 
     @Override
     public boolean needsInput() {
-        return finishing == false && failure == null && pendingInputs.size() < maxOutstandingRequests;
+        return finishing == false
+            && failure == null
+            && fetchWindow.dispatched == false
+            && fetchWindow.inputs.size() < maxOutstandingRequests;
     }
 
     @Override
@@ -243,20 +249,30 @@ public final class RemoteFetchOperator implements Operator {
         }
         pagesReceived++;
         rowsReceived += inputPage.getPositionCount();
-        if (inputPage.getPositionCount() == 0) {
-            pendingInputs.addLast(PendingInput.empty(inputPage));
-            return;
-        }
 
         boolean success = false;
-        PendingInput pendingInput = null;
         try {
-            GroupedHandles groupedHandles = decodeHandles(inputPage);
-            assert groupedHandles.groups().isEmpty() == false : "non-empty pages always produce at least one group";
-            List<PendingGroup> pendingGroups = new ArrayList<>(groupedHandles.groups().size());
-            pendingInput = new PendingInput(inputPage, groupedHandles.groupByPosition(), groupedHandles.offsetByPosition(), pendingGroups);
-            pendingInputs.addLast(pendingInput);
-            for (Group group : groupedHandles.groups()) {
+            fetchWindow.inputs.addLast(bufferInput(inputPage));
+            success = true;
+            if (fetchWindow.inputs.size() == maxOutstandingRequests) {
+                dispatchFetchWindow();
+            }
+        } catch (Exception e) {
+            setFailure(e);
+        } finally {
+            if (success == false) {
+                inputPage.releaseBlocks();
+            }
+        }
+    }
+
+    private void dispatchFetchWindow() {
+        if (failure != null || fetchWindow.dispatched || fetchWindow.inputs.isEmpty()) {
+            return;
+        }
+        fetchWindow.dispatched = true;
+        try {
+            for (Group group : fetchWindow.groups) {
                 RemoteFetchService.TargetExchange exchange = exchanges.get(group.target);
                 if (exchange == null) {
                     exchange = client.openTargetExchange(
@@ -271,30 +287,22 @@ public final class RemoteFetchOperator implements Operator {
                 }
                 long batchId = batchIds.incrementAndGet();
                 PendingGroup pendingGroup = new PendingGroup(group, exchange, batchId);
-                pendingGroups.add(pendingGroup);
+                fetchWindow.pendingGroups.add(pendingGroup);
                 pendingByBatch.put(batchId, pendingGroup);
                 exchange.sendBatch(batchId, group.handles);
                 pendingGroup.batchSent = true;
                 batchesSent++;
             }
-            success = true;
         } catch (Exception e) {
             setFailure(e);
-        } finally {
-            if (success == false) {
-                if (pendingInput != null) {
-                    pendingInputs.remove(pendingInput);
-                    releasePendingInput(pendingInput);
-                } else {
-                    inputPage.releaseBlocks();
-                }
-            }
+            releaseFetchWindow();
         }
     }
 
     @Override
     public void finish() {
         finishing = true;
+        dispatchFetchWindow();
         for (RemoteFetchService.TargetExchange exchange : exchanges.values()) {
             exchange.finish();
         }
@@ -307,7 +315,7 @@ public final class RemoteFetchOperator implements Operator {
         if (failure != null) {
             return false;
         }
-        if (finishing == false || pendingInputs.isEmpty() == false) {
+        if (finishing == false || fetchWindow.inputs.isEmpty() == false) {
             return false;
         }
         for (RemoteFetchService.TargetExchange exchange : exchanges.values()) {
@@ -323,7 +331,7 @@ public final class RemoteFetchOperator implements Operator {
 
     @Override
     public boolean canProduceMoreDataWithoutExtraInput() {
-        return pendingInputs.isEmpty() == false || failure != null;
+        return failure != null || (fetchWindow.dispatched && fetchWindow.inputs.isEmpty() == false);
     }
 
     @Override
@@ -331,29 +339,27 @@ public final class RemoteFetchOperator implements Operator {
         throwIfFailed();
         drainFetchedPages();
         throwIfFailed();
-        PendingInput pendingInput = pendingInputs.peekFirst();
-        if (pendingInput == null) {
+        if (fetchWindow.dispatched == false || fetchWindow.isComplete() == false) {
             return null;
         }
-        if (pendingInput.isComplete() == false) {
-            return null;
+        if (fetchWindow.groupMappings == null) {
+            fetchWindow.groupMappings = buildGroupMappings(fetchWindow.pagesByGroup());
         }
-        pendingInputs.removeFirst();
-        /*
-         * This is the deliberately conservative streaming boundary: responses are collected incrementally, but the
-         * coordinator emits only when every group for the input page is complete. A future evolution can relax this
-         * to prefix output once the position-mapping column and last-page markers prove which rows survived.
-         */
+        PendingInput pendingInput = fetchWindow.inputs.removeFirst();
         long mergeStartNanos = profile ? System.nanoTime() : 0L;
         try {
-            return emit(
-                mergeFetchedPage(
-                    pendingInput.inputPage,
-                    pendingInput.groupByPosition,
-                    pendingInput.offsetByPosition,
-                    pendingInput.pagesByGroup()
-                )
+            Page output = mergeFetchedPage(
+                pendingInput.inputPage,
+                pendingInput.groupByPosition,
+                pendingInput.offsetByPosition,
+                fetchWindow.pagesByGroup(),
+                fetchWindow.groupMappings
             );
+            if (fetchWindow.inputs.isEmpty()) {
+                releaseFetchWindow();
+                fetchWindow = new FetchWindow();
+            }
+            return emit(output);
         } finally {
             if (profile) {
                 mergeNanos += System.nanoTime() - mergeStartNanos;
@@ -377,8 +383,7 @@ public final class RemoteFetchOperator implements Operator {
         if (failure != null) {
             return NOT_BLOCKED;
         }
-        PendingInput pendingInput = pendingInputs.peekFirst();
-        if (pendingInput == null) {
+        if (fetchWindow.inputs.isEmpty()) {
             if (needsInput()) {
                 return NOT_BLOCKED;
             }
@@ -389,10 +394,10 @@ public final class RemoteFetchOperator implements Operator {
             }
             return NOT_BLOCKED;
         }
-        if (pendingInput.isComplete()) {
+        if (fetchWindow.dispatched == false || fetchWindow.isComplete()) {
             return NOT_BLOCKED;
         }
-        for (PendingGroup group : pendingInput.groups) {
+        for (PendingGroup group : fetchWindow.pendingGroups) {
             if (group.isComplete() == false) {
                 return trackWait(group.exchange.isBlocked());
             }
@@ -405,10 +410,7 @@ public final class RemoteFetchOperator implements Operator {
         if (profile && firstInputNanos != 0L && processEndNanos == 0L) {
             processEndNanos = System.nanoTime();
         }
-        for (PendingInput pendingInput : pendingInputs) {
-            releasePendingInput(pendingInput);
-        }
-        pendingInputs.clear();
+        releaseFetchWindow();
         pendingByBatch.clear();
         for (RemoteFetchService.TargetExchange exchange : exchanges.values()) {
             Releasables.closeExpectNoException(exchange);
@@ -537,13 +539,17 @@ public final class RemoteFetchOperator implements Operator {
         throw new IllegalStateException("remote fetch operator failed", e);
     }
 
-    private void releasePendingInput(PendingInput pendingInput) {
-        pendingInput.inputPage.releaseBlocks();
-        for (PendingGroup pendingGroup : pendingInput.groups) {
+    private void releaseFetchWindow() {
+        for (PendingInput pendingInput : fetchWindow.inputs) {
+            pendingInput.inputPage.releaseBlocks();
+        }
+        fetchWindow.inputs.clear();
+        for (PendingGroup pendingGroup : fetchWindow.pendingGroups) {
             markBatchCompleted(pendingGroup);
             pendingByBatch.remove(pendingGroup.batchId);
             releasePages(pendingGroup.pages);
         }
+        fetchWindow.pendingGroups.clear();
     }
 
     private static void markBatchCompleted(PendingGroup pendingGroup) {
@@ -880,10 +886,8 @@ public final class RemoteFetchOperator implements Operator {
         }
     }
 
-    private GroupedHandles decodeHandles(Page inputPage) {
+    private PendingInput bufferInput(Page inputPage) {
         BytesRefBlock handlesBlock = inputPage.getBlock(handleChannel);
-        Map<TargetSession, Integer> groupLookup = new LinkedHashMap<>();
-        List<Group> groups = new ArrayList<>();
         int[] groupByPosition = new int[inputPage.getPositionCount()];
         int[] offsetByPosition = new int[inputPage.getPositionCount()];
         BytesRef scratch = new BytesRef();
@@ -899,18 +903,18 @@ public final class RemoteFetchOperator implements Operator {
                 handlesBlock.getBytesRef(handlesBlock.getFirstValueIndex(position), scratch)
             );
             TargetSession target = new TargetSession(handle.nodeId(), handle.retainedSessionId());
-            Integer groupIndex = groupLookup.get(target);
+            Integer groupIndex = fetchWindow.groupLookup.get(target);
             if (groupIndex == null) {
-                groupIndex = groups.size();
-                groupLookup.put(target, groupIndex);
-                groups.add(new Group(target));
+                groupIndex = fetchWindow.groups.size();
+                fetchWindow.groupLookup.put(target, groupIndex);
+                fetchWindow.groups.add(new Group(target));
             }
-            Group group = groups.get(groupIndex);
+            Group group = fetchWindow.groups.get(groupIndex);
             groupByPosition[position] = groupIndex;
             offsetByPosition[position] = group.handles.size();
             group.handles.add(handle);
         }
-        return new GroupedHandles(groups, groupByPosition, offsetByPosition);
+        return new PendingInput(inputPage, groupByPosition, offsetByPosition);
     }
 
     /**
@@ -990,11 +994,17 @@ public final class RemoteFetchOperator implements Operator {
         RemoteFetchPushdownOperatorBuilder.validateSupportedPlan(plan);
     }
 
-    private Page mergeFetchedPage(Page inputPage, int[] groupByPosition, int[] offsetByPosition, List<GroupPages> pagesByGroup) {
+    private Page mergeFetchedPage(
+        Page inputPage,
+        int[] groupByPosition,
+        int[] offsetByPosition,
+        List<GroupPages> pagesByGroup,
+        FetchedRowRef[][] groupMappings
+    ) {
         if (pagesByGroup.stream().anyMatch(g -> g != null && g.hasPositionMapping())) {
-            return mergeFetchedPageWithFiltering(inputPage, groupByPosition, offsetByPosition, pagesByGroup);
+            return mergeFetchedPageWithFiltering(inputPage, groupByPosition, offsetByPosition, pagesByGroup, groupMappings);
         }
-        FetchedRowRef[] fetchedRows = resolveFetchedRows(groupByPosition, offsetByPosition, buildGroupMappings(pagesByGroup));
+        FetchedRowRef[] fetchedRows = resolveFetchedRows(groupByPosition, offsetByPosition, groupMappings);
         for (FetchedRowRef rowRef : fetchedRows) {
             if (rowRef == null) {
                 throw new IllegalStateException("remote fetch response did not contain the expected row");
@@ -1022,7 +1032,6 @@ public final class RemoteFetchOperator implements Operator {
             return output;
         } finally {
             inputPage.releaseBlocks();
-            releasePagesByGroup(pagesByGroup);
             Releasables.closeExpectNoException(builders);
             if (success == false) {
                 Releasables.closeExpectNoException(outputBlocks);
@@ -1039,9 +1048,10 @@ public final class RemoteFetchOperator implements Operator {
         Page inputPage,
         int[] groupByPosition,
         int[] offsetByPosition,
-        List<GroupPages> pagesByGroup
+        List<GroupPages> pagesByGroup,
+        FetchedRowRef[][] groupMappings
     ) {
-        FetchedRowRef[] fetchedRows = resolveFetchedRows(groupByPosition, offsetByPosition, buildGroupMappings(pagesByGroup));
+        FetchedRowRef[] fetchedRows = resolveFetchedRows(groupByPosition, offsetByPosition, groupMappings);
 
         // Keep only input positions whose corresponding rows survived the pushdown filter.
         int[] survivingPositions = new int[inputPage.getPositionCount()];
@@ -1079,7 +1089,6 @@ public final class RemoteFetchOperator implements Operator {
             return output;
         } finally {
             inputPage.releaseBlocks();
-            releasePagesByGroup(pagesByGroup);
             Releasables.closeExpectNoException(builders);
             if (success == false) {
                 Releasables.closeExpectNoException(outputBlocks);
@@ -1118,19 +1127,11 @@ public final class RemoteFetchOperator implements Operator {
         return fetchedRows;
     }
 
-    private static void releasePagesByGroup(List<GroupPages> pagesByGroup) {
-        for (GroupPages group : pagesByGroup) {
-            releasePages(group == null ? null : group.pages());
-        }
-    }
-
     private static void releasePages(List<Page> pages) {
         if (pages != null) {
             Releasables.closeExpectNoException(Releasables.wrap(pages));
         }
     }
-
-    private record GroupedHandles(List<Group> groups, int[] groupByPosition, int[] offsetByPosition) {}
 
     private record FetchedRowRef(int group, int pageIndex, int position) {}
 }
