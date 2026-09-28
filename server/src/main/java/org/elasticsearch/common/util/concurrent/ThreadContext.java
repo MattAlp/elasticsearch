@@ -492,9 +492,17 @@ public final class ThreadContext implements Writeable {
      * Returns the header for the given key or <code>null</code> if not present
      */
     public String getHeader(String key) {
-        if (Task.TRACE_ID.equals(key) && Span.current().getSpanContext().isValid()) {
-            return Span.current().getSpanContext().getTraceId();
+        if (Task.TRACE_ID.equals(key) || Task.TRACE_PARENT_HTTP_HEADER.equals(key) || Task.TRACE_STATE.equals(key)) {
+            var spanContext = Span.current().getSpanContext();
+            if (spanContext.isValid()) {
+                return Task.TRACE_ID.equals(key) ? spanContext.getTraceId() : TracingContext.headers(Map.of()).get(key);
+            }
         }
+        return getStoredHeader(key);
+    }
+
+    /** Reads an incoming trace header without substituting a span already active on this thread. */
+    public String getStoredHeader(String key) {
         String value = threadLocal.get().requestHeaders.get(key);
         if (value == null) {
             return defaultHeader.get(key);

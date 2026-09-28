@@ -36,7 +36,7 @@ public final class TracingContext {
 
         @Override
         public String get(ThreadContext carrier, String key) {
-            return carrier.getHeader(key);
+            return carrier.getStoredHeader(key);
         }
     };
 

@@ -8,6 +8,12 @@
  */
 package org.elasticsearch.common.util.concurrent;
 
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.SpanContext;
+import io.opentelemetry.api.trace.TraceFlags;
+import io.opentelemetry.api.trace.TraceState;
+import io.opentelemetry.context.Context;
+
 import org.apache.logging.log4j.Level;
 import org.elasticsearch.common.ReferenceDocs;
 import org.elasticsearch.common.io.stream.BytesStreamOutput;
@@ -16,6 +22,7 @@ import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.http.HttpTransportSettings;
 import org.elasticsearch.tasks.Task;
+import org.elasticsearch.telemetry.tracing.TracingContext;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.test.MockLog;
 import org.hamcrest.Matcher;
@@ -1295,6 +1302,42 @@ public class ThreadContextTests extends ESTestCase {
             assertSame(parent, io.opentelemetry.context.Context.current());
             assertEquals(List.of("value"), threadContext.getResponseHeaders().get("test"));
         }
+    }
+
+    public void testDirectTraceHeadersFollowActiveSpanWithoutChangingIncomingHeaders() {
+        var threadContext = new ThreadContext(Settings.EMPTY);
+        String traceId = "0123456789abcdef0123456789abcdef";
+        String incomingParent = "00-" + traceId + "-aaaaaaaaaaaaaaaa-01";
+        threadContext.putHeader(Task.TRACE_PARENT_HTTP_HEADER, incomingParent);
+        threadContext.putHeader(Task.TRACE_STATE, "vendor=parent");
+
+        var child = SpanContext.create(
+            traceId,
+            "bbbbbbbbbbbbbbbb",
+            TraceFlags.getSampled(),
+            TraceState.builder().put("vendor", "child").build()
+        );
+        try (var scope = Context.root().with(Span.wrap(child)).makeCurrent()) {
+            assertEquals(traceId, threadContext.getHeader(Task.TRACE_ID));
+            assertEquals("00-" + traceId + "-bbbbbbbbbbbbbbbb-01", threadContext.getHeader(Task.TRACE_PARENT_HTTP_HEADER));
+            assertEquals("vendor=child", threadContext.getHeader(Task.TRACE_STATE));
+            assertEquals(
+                threadContext.getHeaders().get(Task.TRACE_PARENT_HTTP_HEADER),
+                threadContext.getHeader(Task.TRACE_PARENT_HTTP_HEADER)
+            );
+            assertEquals(threadContext.getHeaders().get(Task.TRACE_STATE), threadContext.getHeader(Task.TRACE_STATE));
+
+            var extracted = Span.fromContext(TracingContext.extract(threadContext)).getSpanContext();
+            assertEquals("aaaaaaaaaaaaaaaa", extracted.getSpanId());
+            assertEquals("parent", extracted.getTraceState().get("vendor"));
+        }
+
+        var childWithoutTraceState = SpanContext.create(traceId, "cccccccccccccccc", TraceFlags.getSampled(), TraceState.getDefault());
+        try (var scope = Context.root().with(Span.wrap(childWithoutTraceState)).makeCurrent()) {
+            assertNull(threadContext.getHeader(Task.TRACE_STATE));
+        }
+        assertEquals(incomingParent, threadContext.getHeader(Task.TRACE_PARENT_HTTP_HEADER));
+        assertEquals("vendor=parent", threadContext.getHeader(Task.TRACE_STATE));
     }
 
     public void testRestoreExistingContext() {
