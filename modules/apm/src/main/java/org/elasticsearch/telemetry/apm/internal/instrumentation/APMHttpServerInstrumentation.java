@@ -62,8 +62,15 @@ public class APMHttpServerInstrumentation implements HttpServerInstrumentation {
         if (request.isTraceStarted()) {
             return;
         }
+        start(threadContext, request, matchedRoute, TracingContext.extract(threadContext));
+    }
+
+    @Override
+    public void start(ThreadContext threadContext, RestRequest request, String matchedRoute, Context parent) {
+        if (request.isTraceStarted()) {
+            return;
+        }
         var req = new RequestAndRoute(request, matchedRoute);
-        Context parent = TracingContext.extract(threadContext);
         var attributes = Attributes.builder();
         httpServerAttributesExtractor.onStart(attributes, parent, req);
         // TODO: Preserve header capture for compatibility; revisit an explicit allowlist independently of this migration.

@@ -686,8 +686,9 @@ public class RestController implements HttpServerTransport.Dispatcher {
     private void startTrace(ThreadContext threadContext, RestChannel channel, String restPath) {
         RestRequest request = channel.request();
         // Routing can revisit instrumentation; both calls below are no-ops once a span has been started for the request.
-        request.borrowTraceContext(TracingContext.extract(threadContext));
-        this.instrumentation.start(threadContext, request, restPath);
+        var parent = TracingContext.extract(threadContext);
+        request.borrowTraceContext(parent);
+        this.instrumentation.start(threadContext, request, restPath, parent);
     }
 
     private void traceException(RestChannel channel, Throwable e) {

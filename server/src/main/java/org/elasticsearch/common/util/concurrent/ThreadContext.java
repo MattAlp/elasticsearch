@@ -251,7 +251,7 @@ public final class ThreadContext implements Writeable {
      */
     public Writeable captureAsWriteable() {
         final ThreadContextStruct context = threadLocal.get();
-        final var headers = TracingContext.headers(defaultHeader.isEmpty() ? context.requestHeaders : getHeaders());
+        final var headers = defaultHeader.isEmpty() ? TracingContext.headers(context.requestHeaders) : getHeaders();
         return out -> {
             out.writeMap(headers, StreamOutput::writeString);
             out.writeMap(context.responseHeaders, StreamOutput::writeStringCollection);

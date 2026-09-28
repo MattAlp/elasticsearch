@@ -327,7 +327,7 @@ public class RestControllerTests extends ESTestCase {
         });
         AssertingChannel channel = new AssertingChannel(fakeRequest, randomBoolean(), RestStatus.BAD_REQUEST);
         restController.dispatchRequest(fakeRequest, channel, threadContext);
-        verify(instrumentation).start(eq(threadContext), eq(fakeRequest), isNull());
+        verify(instrumentation).start(eq(threadContext), eq(fakeRequest), isNull(), any(Context.class));
     }
 
     public void testRequestWithDisallowedMultiValuedHeaderButSameValues() {
@@ -1038,7 +1038,7 @@ public class RestControllerTests extends ESTestCase {
 
         final AssertingChannel channel = new AssertingChannel(request, randomBoolean(), RestStatus.METHOD_NOT_ALLOWED);
         restController.dispatchRequest(request, channel, client.threadPool().getThreadContext());
-        verify(instrumentation).start(any(), any(RestRequest.class), isNull());
+        verify(instrumentation).start(any(), any(RestRequest.class), isNull(), any(Context.class));
         verify(instrumentation).recordException(any(RestRequest.class), any(IllegalArgumentException.class));
     }
 

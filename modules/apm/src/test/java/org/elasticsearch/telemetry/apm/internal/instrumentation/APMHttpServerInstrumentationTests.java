@@ -218,6 +218,26 @@ public class APMHttpServerInstrumentationTests extends ESTestCase {
         }
     }
 
+    public void testPreExtractedParentIsUsedForServerSpan() {
+        try (var fixture = new NativeTracingFixture(Settings.EMPTY)) {
+            var instrumentation = new APMHttpServerInstrumentation(fixture.api);
+            var incoming = fixture.sdk.getTracer("client").spanBuilder("incoming").startSpan();
+            var unrelated = fixture.sdk.getTracer("client").spanBuilder("unrelated").startSpan();
+            var threadContext = new ThreadContext(Settings.EMPTY);
+            W3CTraceContextPropagator.getInstance().inject(Context.root().with(unrelated), threadContext, ThreadContext::putHeader);
+            var request = new FakeRestRequest.Builder(xContentRegistry()).withPath("/_test").build();
+            var parent = Context.root().with(incoming);
+            request.borrowTraceContext(parent);
+
+            instrumentation.start(threadContext, request, "/_test", parent);
+            instrumentation.end(request, new RestResponse(RestStatus.OK, "text/plain", "ok"));
+            assertEquals(incoming.getSpanContext().getSpanId(), fixture.exporter.getFinishedSpanItems().getFirst().getParentSpanId());
+
+            incoming.end();
+            unrelated.end();
+        }
+    }
+
     public void testUnconfiguredServiceUsesNoExporter() {
         try (var service = new APMTracingService(Settings.EMPTY, MeterProvider::noop)) {
             var instrumentation = new APMHttpServerInstrumentation(service.getOpenTelemetry());
