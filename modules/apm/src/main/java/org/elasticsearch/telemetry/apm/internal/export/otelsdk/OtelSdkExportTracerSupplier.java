@@ -174,7 +174,9 @@ public class OtelSdkExportTracerSupplier implements TraceSupplier {
 
     private void startPyroscopeProfiler() {
         Config config = new Config.Builder().setApplicationName(OtelSdkSettings.TELEMETRY_TRACING_PYROSCOPE_APPLICATION_NAME.get(settings))
-            .setProfilingEvent(EventType.ITIMER)
+            .setProfilingEvent(EventType.WALL)
+            .setProfilingAlloc("512k")
+            .setProfilingLock("10ms")
             .setFormat(Format.JFR)
             .setServerAddress(OtelSdkSettings.TELEMETRY_TRACING_PYROSCOPE_ENDPOINT.get(settings))
             .build();
