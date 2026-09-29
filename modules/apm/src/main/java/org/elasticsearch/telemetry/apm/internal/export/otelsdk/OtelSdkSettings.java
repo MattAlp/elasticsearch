@@ -187,6 +187,24 @@ public final class OtelSdkSettings {
         NodeScope
     );
 
+    public static final Setting<Boolean> TELEMETRY_TRACING_PYROSCOPE_ENABLED = Setting.boolSetting(
+        "telemetry.tracing.pyroscope.enabled",
+        false,
+        NodeScope
+    );
+
+    public static final Setting<String> TELEMETRY_TRACING_PYROSCOPE_ENDPOINT = Setting.simpleString(
+        "telemetry.tracing.pyroscope.endpoint",
+        "http://localhost:4040",
+        NodeScope
+    );
+
+    public static final Setting<String> TELEMETRY_TRACING_PYROSCOPE_APPLICATION_NAME = Setting.simpleString(
+        "telemetry.tracing.pyroscope.application_name",
+        "elasticsearch",
+        NodeScope
+    );
+
     /** Per-trace sample rate applied to locally-started traces. Defaults to the legacy
      * {@code telemetry.agent.transaction_sample_rate} when set, otherwise 0.001. */
     public static final Setting<Double> TELEMETRY_TRACING_SAMPLE_RATE = new Setting<>(

@@ -13,6 +13,7 @@ import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.StatusCode;
 import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator;
 import io.opentelemetry.context.Context;
+import io.opentelemetry.context.Scope;
 import io.opentelemetry.context.propagation.TextMapGetter;
 
 import org.elasticsearch.ExceptionsHelper;
@@ -24,9 +25,13 @@ import org.elasticsearch.tasks.TaskCancelledException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 
 /** Connects native OTel contexts to Elasticsearch execution and wire boundaries without owning spans. */
 public final class TracingContext {
+    private static final Consumer<Context> NOOP_CONTEXT_SCOPE_LISTENER = context -> {};
+    private static volatile Consumer<Context> contextScopeListener = NOOP_CONTEXT_SCOPE_LISTENER;
+
     private static final List<String> TRACE_HEADERS = List.of(Task.TRACE_PARENT_HTTP_HEADER, Task.TRACE_STATE, Task.TRACE_ID);
     private static final TextMapGetter<ThreadContext> GETTER = new TextMapGetter<>() {
         @Override
@@ -42,6 +47,35 @@ public final class TracingContext {
 
     private TracingContext() {}
 
+    /** Activates a context and keeps registered scope listeners in sync across thread handoffs. */
+    public static Scope makeCurrent(Context context) {
+        Context previous = Context.current();
+        Scope scope = context.makeCurrent();
+        Consumer<Context> listener = contextScopeListener;
+        try {
+            listener.accept(context);
+        } catch (RuntimeException | Error failure) {
+            try {
+                scope.close();
+            } finally {
+                listener.accept(previous);
+            }
+            throw failure;
+        }
+        return () -> {
+            try {
+                scope.close();
+            } finally {
+                listener.accept(previous);
+            }
+        };
+    }
+
+    /** Installs an optional observer for active native context changes. */
+    public static void setContextScopeListener(Consumer<Context> listener) {
+        contextScopeListener = listener == null ? NOOP_CONTEXT_SCOPE_LISTENER : listener;
+    }
+
     /** Incoming work must not inherit context left on a reused worker by another request. */
     public static Context extract(ThreadContext threadContext) {
         return W3CTraceContextPropagator.getInstance().extract(Context.root(), threadContext, GETTER);
@@ -56,7 +90,7 @@ public final class TracingContext {
             if (spanContext.isValid()) {
                 threadContext.putHeader(Task.TRACE_ID, spanContext.getTraceId());
             }
-            var scope = context.makeCurrent();
+            Scope scope = makeCurrent(context);
             return () -> {
                 try {
                     scope.close();

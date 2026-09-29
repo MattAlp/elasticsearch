@@ -16,6 +16,10 @@ def otelVersion = versions.opentelemetry
 def otelInstrumentationVersion = '2.30.0-alpha'
 def otelContribDiskBufferingVersion = '1.59.0-alpha'
 
+repositories {
+  maven { url = uri("/tmp/tracedemo/m2") }
+}
+
 dependencies {
   implementation project(":libs:ssl-config")
   implementation "io.opentelemetry:opentelemetry-sdk:${otelVersion}"
@@ -36,6 +40,8 @@ dependencies {
 
   implementation "io.opentelemetry:opentelemetry-sdk-common:${otelVersion}"
   implementation "io.opentelemetry:opentelemetry-sdk-trace:${otelVersion}"
+  implementation "io.pyroscope:otel:2.1.2"
+  implementation "io.pyroscope:agent:2.6.0"
   runtimeOnly "io.opentelemetry:opentelemetry-exporter-sender-okhttp:${otelVersion}"
   implementation "com.squareup.okhttp3:okhttp-jvm:5.3.2"
   runtimeOnly "io.opentelemetry:opentelemetry-exporter-common:${otelVersion}"

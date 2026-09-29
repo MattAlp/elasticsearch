@@ -189,7 +189,7 @@ public final class ThreadContext implements Writeable {
             List.of(Task.TRACE_START_TIME),
             List.of(Task.TRACE_PARENT_HTTP_HEADER, Task.TRACE_STATE, Task.TRACE_ID)
         );
-        var scope = Context.root().makeCurrent();
+        var scope = TracingContext.makeCurrent(Context.root());
         return () -> {
             try {
                 scope.close();
@@ -204,7 +204,7 @@ public final class ThreadContext implements Writeable {
     }
 
     private StoredContext detachedContext(ThreadContextStruct originalContext) {
-        var scope = Context.root().makeCurrent();
+        var scope = TracingContext.makeCurrent(Context.root());
         return () -> {
             try {
                 scope.close();
@@ -427,7 +427,7 @@ public final class ThreadContext implements Writeable {
             storedContext.restore();
             final org.elasticsearch.core.Releasable activation;
             try {
-                activation = tracing.makeCurrent()::close;
+                activation = TracingContext.makeCurrent(tracing)::close;
             } catch (RuntimeException | Error failure) {
                 previous.close();
                 throw failure;

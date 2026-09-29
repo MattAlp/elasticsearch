@@ -145,3 +145,8 @@ io.opentelemetry.instrumentation.runtime_telemetry:
 
 io.opentelemetry.sdk.common:
   - manage_threads
+
+agent:
+  - manage_threads # Observed NotEntitledException when QueuedExporter creates the Pyroscope profile worker.
+  - load_native_libraries # Observed NotEntitledException in AsyncProfiler while loading the profiler native library.
+  - outbound_network # Observed NotEntitledException in Pyroscope HTTP profile upload.

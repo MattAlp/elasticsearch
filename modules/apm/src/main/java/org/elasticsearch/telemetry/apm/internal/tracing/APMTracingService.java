@@ -68,6 +68,9 @@ public final class APMTracingService extends AbstractLifecycleComponent {
 
     APMTracingService(Settings settings, TraceSupplier supplier) {
         this.supplier = supplier;
+        if (OtelSdkSettings.TELEMETRY_TRACING_PYROSCOPE_ENABLED.get(settings)) {
+            PyroscopeContextActivation.install();
+        }
         enabled = APMAgentSettings.TELEMETRY_TRACING_ENABLED_SETTING.get(settings);
         maxDepth = OtelSdkSettings.TELEMETRY_TRACING_MAX_DEPTH.get(settings);
         recordExceptionStacks = OtelSdkSettings.TELEMETRY_TRACING_RECORD_EXCEPTION_STACKS.get(settings);
@@ -84,6 +87,16 @@ public final class APMTracingService extends AbstractLifecycleComponent {
 
     public OpenTelemetry getOpenTelemetry() {
         return openTelemetry;
+    }
+
+    /** Starts the demo profiler's active-context label bridge. */
+    public static void startDemoPyroscopeContext() {
+        PyroscopeContextActivation.start();
+    }
+
+    /** Stops the demo profiler's active-context label bridge. */
+    public static void stopDemoPyroscopeContext() {
+        PyroscopeContextActivation.stop();
     }
 
     public void setEnabled(boolean enabled) {

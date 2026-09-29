@@ -24,7 +24,10 @@ import io.opentelemetry.api.trace.TracerProvider;
 import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator;
 import io.opentelemetry.context.Context;
 import io.opentelemetry.context.ContextKey;
+import io.opentelemetry.context.Scope;
 import io.opentelemetry.context.propagation.ContextPropagators;
+
+import org.elasticsearch.telemetry.tracing.TracingContext;
 
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
@@ -218,6 +221,11 @@ final class PolicyOpenTelemetry implements OpenTelemetry {
         LocalSpan(Span delegate, Integer depth) {
             this.delegate = delegate;
             this.depth = depth;
+        }
+
+        @Override
+        public Scope makeCurrent() {
+            return TracingContext.makeCurrent(storeInContext(Context.current()));
         }
 
         @Override
