@@ -132,9 +132,8 @@ public class APM extends Plugin implements NetworkPlugin, TelemetryPlugin, Exten
             OtelSdkSettings.TELEMETRY_TRACING_MAX_QUEUE_SIZE,
             OtelSdkSettings.TELEMETRY_TRACING_MAX_BATCH_SIZE,
             OtelSdkSettings.TELEMETRY_TRACING_RECORD_EXCEPTION_STACKS,
-            OtelSdkSettings.TELEMETRY_TRACING_PYROSCOPE_ENABLED,
-            OtelSdkSettings.TELEMETRY_TRACING_PYROSCOPE_ENDPOINT,
-            OtelSdkSettings.TELEMETRY_TRACING_PYROSCOPE_APPLICATION_NAME,
+            OtelSdkSettings.TELEMETRY_TRACING_UNIVERSAL_PROFILING_ENABLED,
+            OtelSdkSettings.TELEMETRY_TRACING_UNIVERSAL_PROFILING_SOCKET_DIR,
             // Logs
             OtelSdkSettings.TELEMETRY_LOGS_ENDPOINT,
             OtelSdkSettings.TELEMETRY_LOGS_AUDIT_ENABLED,

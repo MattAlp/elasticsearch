@@ -19,15 +19,12 @@ import io.opentelemetry.exporter.otlp.trace.OtlpGrpcSpanExporterBuilder;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
 import io.opentelemetry.sdk.common.CompletableResultCode;
 import io.opentelemetry.sdk.common.InternalTelemetryVersion;
+import io.opentelemetry.sdk.resources.Resource;
 import io.opentelemetry.sdk.trace.SdkTracerProvider;
+import io.opentelemetry.sdk.trace.SpanProcessor;
 import io.opentelemetry.sdk.trace.export.BatchSpanProcessor;
+import io.opentelemetry.sdk.trace.export.SpanExporter;
 import io.opentelemetry.sdk.trace.samplers.Sampler;
-import io.otel.pyroscope.PyroscopeOtelConfiguration;
-import io.otel.pyroscope.PyroscopeOtelSpanProcessor;
-import io.pyroscope.http.Format;
-import io.pyroscope.javaagent.EventType;
-import io.pyroscope.javaagent.PyroscopeAgent;
-import io.pyroscope.javaagent.config.Config;
 
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.core.TimeValue;
@@ -36,6 +33,8 @@ import org.elasticsearch.logging.Logger;
 import org.elasticsearch.telemetry.apm.internal.export.TraceSupplier;
 import org.elasticsearch.telemetry.apm.internal.tracing.APMTracingService;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
@@ -53,7 +52,6 @@ public class OtelSdkExportTracerSupplier implements TraceSupplier {
     private volatile OpenTelemetrySdk openTelemetrySdk;
     private boolean initialized;
     private boolean closed;
-    private boolean pyroscopeStarted;
     private volatile UnaryOperator<Attributes> attributeSanitizer = UnaryOperator.identity();
 
     /** Installs privacy enforcement before the SDK exporter is initialized. */
@@ -101,11 +99,6 @@ public class OtelSdkExportTracerSupplier implements TraceSupplier {
                 openTelemetrySdk.getSdkTracerProvider().close();
                 openTelemetrySdk = null;
             }
-            if (pyroscopeStarted) {
-                APMTracingService.stopDemoPyroscopeContext();
-                PyroscopeAgent.stop();
-                pyroscopeStarted = false;
-            }
             initialized = false;
         }
     }
@@ -121,10 +114,7 @@ public class OtelSdkExportTracerSupplier implements TraceSupplier {
         double sampleRate = OtelSdkSettings.TELEMETRY_TRACING_SAMPLE_RATE.get(settings);
         int maxQueueSize = OtelSdkSettings.TELEMETRY_TRACING_MAX_QUEUE_SIZE.get(settings);
         int maxExportBatchSize = OtelSdkSettings.TELEMETRY_TRACING_MAX_BATCH_SIZE.get(settings);
-        boolean pyroscopeEnabled = OtelSdkSettings.TELEMETRY_TRACING_PYROSCOPE_ENABLED.get(settings);
-        if (pyroscopeEnabled) {
-            startPyroscopeProfiler();
-        }
+        boolean universalProfilingEnabled = OtelSdkSettings.TELEMETRY_TRACING_UNIVERSAL_PROFILING_ENABLED.get(settings);
 
         // InternalTelemetryVersion is @Internal but is the only way to opt into stable SemConv names in 1.62.0.
         OtlpGrpcSpanExporterBuilder builder = OtlpGrpcSpanExporter.builder()
@@ -139,7 +129,10 @@ public class OtelSdkExportTracerSupplier implements TraceSupplier {
             builder.addHeader("Authorization", authHeader);
         }
         OtelSdkExportMeterSupplier.configureTls(settings, builder::setSslContext);
-        OtlpGrpcSpanExporter exporter = builder.build();
+        SpanExporter exporter = builder.build();
+        if (universalProfilingEnabled) {
+            exporter = applyProfilerHostId(exporter);
+        }
 
         BatchSpanProcessor processor = BatchSpanProcessor.builder(
             new SanitizingSpanExporter(exporter, attributes -> attributeSanitizer.apply(attributes))
@@ -154,11 +147,20 @@ public class OtelSdkExportTracerSupplier implements TraceSupplier {
         // TODO: emit the modern th: tracestate instead of ot=p: once exporting to EDOT gateway
         Sampler sampler = new ElasticTracestateSampler(sampleRate);
 
-        var tracerProviderBuilder = SdkTracerProvider.builder().setResource(OtelSdkResource.get(settings)).setSampler(sampler);
-        if (pyroscopeEnabled) {
-            tracerProviderBuilder.addSpanProcessor(newPyroscopeSpanProcessor());
+        Resource resource = OtelSdkResource.get(settings);
+        SpanProcessor traceProcessor = processor;
+        if (universalProfilingEnabled) {
+            traceProcessor = newUniversalProfilingProcessor(
+                processor,
+                resource,
+                OtelSdkSettings.TELEMETRY_TRACING_UNIVERSAL_PROFILING_SOCKET_DIR.get(settings)
+            );
         }
-        SdkTracerProvider tracerProvider = tracerProviderBuilder.addSpanProcessor(processor).build();
+        SdkTracerProvider tracerProvider = SdkTracerProvider.builder()
+            .setResource(resource)
+            .setSampler(sampler)
+            .addSpanProcessor(traceProcessor)
+            .build();
 
         return OpenTelemetrySdk.builder()
             .setTracerProvider(tracerProvider)
@@ -166,30 +168,34 @@ public class OtelSdkExportTracerSupplier implements TraceSupplier {
             .build();
     }
 
-    @SuppressWarnings("deprecation")
-    private static PyroscopeOtelSpanProcessor newPyroscopeSpanProcessor() {
-        PyroscopeOtelConfiguration configuration = new PyroscopeOtelConfiguration.Builder().setRootSpanOnly(false).build();
-        return new PyroscopeOtelSpanProcessor(configuration);
+    private static SpanExporter applyProfilerHostId(SpanExporter exporter) {
+        try {
+            Class<?> exporterClass = loadUniversalProfilingClass("co.elastic.otel.hostid.ProfilerHostIdApplyingSpanExporter");
+            return (SpanExporter) exporterClass.getConstructor(SpanExporter.class).newInstance(exporter);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Could not initialize the universal profiling host.id exporter", e);
+        }
     }
 
-    private void startPyroscopeProfiler() {
-        Config config = new Config.Builder().setApplicationName(OtelSdkSettings.TELEMETRY_TRACING_PYROSCOPE_APPLICATION_NAME.get(settings))
-            .setProfilingEvent(EventType.WALL)
-            .setProfilingAlloc("512k")
-            .setProfilingLock("10ms")
-            .setFormat(Format.JFR)
-            .setServerAddress(OtelSdkSettings.TELEMETRY_TRACING_PYROSCOPE_ENDPOINT.get(settings))
-            .build();
-        PyroscopeAgent.start(config);
-        if (PyroscopeAgent.isStarted() == false) {
-            throw new IllegalStateException("Pyroscope profiling agent did not start");
-        }
+    private static SpanProcessor newUniversalProfilingProcessor(SpanProcessor processor, Resource resource, String socketDir) {
         try {
-            APMTracingService.startDemoPyroscopeContext();
-            pyroscopeStarted = true;
-        } catch (RuntimeException | Error failure) {
-            PyroscopeAgent.stop();
-            throw failure;
+            Class<?> processorClass = loadUniversalProfilingClass("co.elastic.otel.UniversalProfilingProcessor");
+            Method builderMethod = processorClass.getMethod("builder", SpanProcessor.class, Resource.class);
+            Object processorBuilder = builderMethod.invoke(null, processor, resource);
+            processorBuilder.getClass().getMethod("socketDir", String.class).invoke(processorBuilder, socketDir);
+            return (SpanProcessor) processorBuilder.getClass().getMethod("build").invoke(processorBuilder);
+        } catch (ReflectiveOperationException e) {
+            Throwable cause = e instanceof InvocationTargetException invocationException && invocationException.getCause() != null
+                ? invocationException.getCause()
+                : e;
+            throw new IllegalStateException("Could not initialize universal profiling trace correlation", cause);
         }
+    }
+
+    private static Class<?> loadUniversalProfilingClass(String className) throws ClassNotFoundException {
+        Class<?> extensionClass = Class.forName(className, true, OtelSdkExportTracerSupplier.class.getClassLoader());
+        // The extension is runtime-only because its dependency graph has split packages; reflection needs a dynamic read edge.
+        OtelSdkExportTracerSupplier.class.getModule().addReads(extensionClass.getModule());
+        return extensionClass;
     }
 }

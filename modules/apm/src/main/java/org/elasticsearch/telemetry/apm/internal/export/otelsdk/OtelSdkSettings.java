@@ -187,21 +187,15 @@ public final class OtelSdkSettings {
         NodeScope
     );
 
-    public static final Setting<Boolean> TELEMETRY_TRACING_PYROSCOPE_ENABLED = Setting.boolSetting(
-        "telemetry.tracing.pyroscope.enabled",
+    public static final Setting<Boolean> TELEMETRY_TRACING_UNIVERSAL_PROFILING_ENABLED = Setting.boolSetting(
+        "telemetry.tracing.universal_profiling.enabled",
         false,
         NodeScope
     );
 
-    public static final Setting<String> TELEMETRY_TRACING_PYROSCOPE_ENDPOINT = Setting.simpleString(
-        "telemetry.tracing.pyroscope.endpoint",
-        "http://localhost:4040",
-        NodeScope
-    );
-
-    public static final Setting<String> TELEMETRY_TRACING_PYROSCOPE_APPLICATION_NAME = Setting.simpleString(
-        "telemetry.tracing.pyroscope.application_name",
-        "elasticsearch",
+    public static final Setting<String> TELEMETRY_TRACING_UNIVERSAL_PROFILING_SOCKET_DIR = Setting.simpleString(
+        "telemetry.tracing.universal_profiling.socket_dir",
+        System.getProperty("java.io.tmpdir"),
         NodeScope
     );
 

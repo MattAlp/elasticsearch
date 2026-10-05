@@ -146,7 +146,10 @@ io.opentelemetry.instrumentation.runtime_telemetry:
 io.opentelemetry.sdk.common:
   - manage_threads
 
-agent:
-  - manage_threads # Observed NotEntitledException when QueuedExporter creates the Pyroscope profile worker.
-  - load_native_libraries # Observed NotEntitledException in AsyncProfiler while loading the profiler native library.
-  - outbound_network # Observed NotEntitledException in Pyroscope HTTP profile upload.
+co.elastic.otel:
+  - manage_threads # Required by the universal profiling correlation message poller.
+  - load_native_libraries # Required to load the JVMTI helper used to publish trace context to the host profiler.
+  - files:
+      - path_setting: telemetry.tracing.universal_profiling.socket_dir
+        basedir_if_relative: config
+        mode: read_write
