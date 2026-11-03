@@ -12,7 +12,9 @@ package org.elasticsearch.telemetry.apm.internal.export.otelsdk;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.metrics.MeterProvider;
+import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator;
+import io.opentelemetry.context.Context;
 import io.opentelemetry.context.propagation.ContextPropagators;
 import io.opentelemetry.exporter.otlp.trace.OtlpGrpcSpanExporter;
 import io.opentelemetry.exporter.otlp.trace.OtlpGrpcSpanExporterBuilder;
@@ -31,11 +33,11 @@ import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
 import org.elasticsearch.telemetry.apm.internal.export.TraceSupplier;
-import org.elasticsearch.telemetry.apm.internal.tracing.APMTracingService;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
 
@@ -48,6 +50,7 @@ public class OtelSdkExportTracerSupplier implements TraceSupplier {
 
     private final Settings settings;
     private final Supplier<MeterProvider> meterProvider;
+    private final Consumer<Span> profilingContextUpdater;
     private final Object mutex = new Object();
     private volatile OpenTelemetrySdk openTelemetrySdk;
     private boolean initialized;
@@ -66,6 +69,19 @@ public class OtelSdkExportTracerSupplier implements TraceSupplier {
     public OtelSdkExportTracerSupplier(Settings settings, Supplier<MeterProvider> meterProvider) {
         this.settings = settings;
         this.meterProvider = meterProvider;
+        profilingContextUpdater = OtelSdkSettings.TELEMETRY_TRACING_UNIVERSAL_PROFILING_ENABLED.get(settings)
+            ? newProfilingContextUpdater()
+            : null;
+    }
+
+    /** Returns whether context activations must be mirrored to the profiler. */
+    public boolean hasProfilingContextUpdater() {
+        return profilingContextUpdater != null;
+    }
+
+    /** Mirrors an OTel context to the profiler's thread-local correlation storage. */
+    public void updateProfilingContext(Context context) {
+        profilingContextUpdater.accept(Span.fromContext(context));
     }
 
     @Override
@@ -177,11 +193,24 @@ public class OtelSdkExportTracerSupplier implements TraceSupplier {
         }
     }
 
+    @SuppressWarnings("unchecked")
+    private static Consumer<Span> newProfilingContextUpdater() {
+        try {
+            Class<?> updaterClass = loadUniversalProfilingClass("co.elastic.otel.ElasticsearchSpanActivation");
+            return (Consumer<Span>) updaterClass.getConstructor().newInstance();
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Could not initialize universal profiling context propagation", e);
+        }
+    }
+
     private static SpanProcessor newUniversalProfilingProcessor(SpanProcessor processor, Resource resource, String socketDir) {
         try {
             Class<?> processorClass = loadUniversalProfilingClass("co.elastic.otel.UniversalProfilingProcessor");
             Method builderMethod = processorClass.getMethod("builder", SpanProcessor.class, Resource.class);
             Object processorBuilder = builderMethod.invoke(null, processor, resource);
+            processorBuilder.getClass()
+                .getMethod("delayActivationAfterProfilerRegistration", boolean.class)
+                .invoke(processorBuilder, false);
             processorBuilder.getClass().getMethod("socketDir", String.class).invoke(processorBuilder, socketDir);
             return (SpanProcessor) processorBuilder.getClass().getMethod("build").invoke(processorBuilder);
         } catch (ReflectiveOperationException e) {

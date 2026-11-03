@@ -15,8 +15,44 @@ esplugin {
 def otelVersion = versions.opentelemetry
 def otelInstrumentationVersion = '2.30.0-alpha'
 def otelContribDiskBufferingVersion = '1.59.0-alpha'
+def universalProfilingVersion = '1.12.0'
+
+configurations {
+  universalProfilingIntegration
+}
+
+def compileUniversalProfilingPatch = tasks.register("compileUniversalProfilingPatch", JavaCompile) {
+  source = fileTree("src/universalProfilingPatch/java")
+  classpath = configurations.universalProfilingIntegration + sourceSets.main.compileClasspath
+  destinationDirectory = layout.buildDirectory.dir("classes/java/universalProfilingPatch")
+}
+
+def universalProfilingJar = tasks.register("universalProfilingJar", Jar) {
+  archiveFileName = "universal-profiling-integration-${universalProfilingVersion}.jar"
+  duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+  from({
+    configurations.universalProfilingIntegration.collect { zipTree(it) }
+  }) {
+    // The upstream agent distribution patches SdkSpan; the standalone SDK uses map-backed storage instead.
+    exclude 'co/elastic/otel/common/SpanValueStorageProvider.class'
+    exclude 'co/elastic/otel/common/SpanValueStorageProvider$*.class'
+    exclude 'io/opentelemetry/**'
+  }
+  from compileUniversalProfilingPatch
+  exclude 'META-INF/*.DSA', 'META-INF/*.RSA', 'META-INF/*.SF', 'module-info.class'
+  manifest {
+    attributes 'Automatic-Module-Name': 'universal.profiling.integration'
+  }
+}
 
 dependencies {
+  universalProfilingIntegration("co.elastic.otel:universal-profiling-integration:${universalProfilingVersion}") {
+    // OTel is already provided by the APM module, and Elasticsearch provides HdrHistogram.
+    exclude group: 'io.opentelemetry'
+    exclude group: 'io.opentelemetry.semconv'
+    exclude group: 'org.hdrhistogram', module: 'HdrHistogram'
+  }
+
   implementation project(":libs:ssl-config")
   implementation "io.opentelemetry:opentelemetry-sdk:${otelVersion}"
   implementation "io.opentelemetry:opentelemetry-sdk-metrics:${otelVersion}"
@@ -36,8 +72,10 @@ dependencies {
 
   implementation "io.opentelemetry:opentelemetry-sdk-common:${otelVersion}"
   implementation "io.opentelemetry:opentelemetry-sdk-trace:${otelVersion}"
-  // Keep the profiling extension off the compile module path: its common dependency contains a split OTel package.
-  runtimeOnly "co.elastic.otel:universal-profiling-integration:1.12.0"
+  // Its dependencies contain split co.elastic.otel packages, so package them as one runtime module.
+  runtimeOnly files(universalProfilingJar)
+  runtimeOnly "io.opentelemetry.semconv:opentelemetry-semconv:1.43.0"
+  runtimeOnly "io.opentelemetry.semconv:opentelemetry-semconv-incubating:1.43.0-alpha"
   runtimeOnly "io.opentelemetry:opentelemetry-exporter-sender-okhttp:${otelVersion}"
   implementation "com.squareup.okhttp3:okhttp-jvm:5.3.2"
   runtimeOnly "io.opentelemetry:opentelemetry-exporter-common:${otelVersion}"

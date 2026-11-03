@@ -28,6 +28,7 @@ import org.elasticsearch.test.MockLog;
 import org.hamcrest.Matcher;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -1301,6 +1302,33 @@ public class ThreadContextTests extends ESTestCase {
             }
             assertSame(parent, io.opentelemetry.context.Context.current());
             assertEquals(List.of("value"), threadContext.getResponseHeaders().get("test"));
+        }
+    }
+
+    public void testTracingContextScopeListenerFollowsActivation() {
+        Context previous = Context.current();
+        Context activated = Context.root()
+            .with(
+                Span.wrap(
+                    SpanContext.create(
+                        "0123456789abcdef0123456789abcdef",
+                        "0123456789abcdef",
+                        TraceFlags.getSampled(),
+                        TraceState.getDefault()
+                    )
+                )
+            );
+        List<Context> observed = new ArrayList<>();
+        TracingContext.setContextScopeListener(observed::add);
+        try {
+            try (var ignored = TracingContext.makeCurrent(activated)) {
+                assertSame(activated, Context.current());
+                assertThat(observed, contains(activated));
+            }
+            assertSame(previous, Context.current());
+            assertThat(observed, contains(activated, previous));
+        } finally {
+            TracingContext.setContextScopeListener(null);
         }
     }
 

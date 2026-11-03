@@ -26,6 +26,7 @@ import org.elasticsearch.telemetry.apm.internal.APMAgentSettings;
 import org.elasticsearch.telemetry.apm.internal.export.TraceSupplier;
 import org.elasticsearch.telemetry.apm.internal.export.otelsdk.OtelSdkExportTracerSupplier;
 import org.elasticsearch.telemetry.apm.internal.export.otelsdk.OtelSdkSettings;
+import org.elasticsearch.telemetry.tracing.TracingContext;
 
 import java.util.List;
 import java.util.Locale;
@@ -61,6 +62,7 @@ public final class APMTracingService extends AbstractLifecycleComponent {
     private volatile Redaction redaction;
     private volatile String nodeName;
     private volatile String clusterName;
+    private boolean profilingContextListenerInstalled;
 
     public APMTracingService(Settings settings, Supplier<MeterProvider> meterProvider) {
         this(settings, new OtelSdkExportTracerSupplier(settings, meterProvider));
@@ -92,6 +94,9 @@ public final class APMTracingService extends AbstractLifecycleComponent {
         }
         if (enabled) {
             supplier.get();
+            installProfilingContextListener();
+        } else {
+            removeProfilingContextListener();
         }
         this.enabled = enabled;
     }
@@ -215,6 +220,7 @@ public final class APMTracingService extends AbstractLifecycleComponent {
     protected void doStart() {
         if (enabled) {
             supplier.get();
+            installProfilingContextListener();
         }
     }
 
@@ -231,10 +237,25 @@ public final class APMTracingService extends AbstractLifecycleComponent {
     protected void doClose() {
         closed = true;
         enabled = false;
+        removeProfilingContextListener();
         try {
             supplier.close();
         } catch (Exception failure) {
             logger.warn("Failed to close tracing during shutdown", failure);
+        }
+    }
+
+    private void installProfilingContextListener() {
+        if (supplier instanceof OtelSdkExportTracerSupplier sdkSupplier && sdkSupplier.hasProfilingContextUpdater()) {
+            TracingContext.setContextScopeListener(sdkSupplier::updateProfilingContext);
+            profilingContextListenerInstalled = true;
+        }
+    }
+
+    private void removeProfilingContextListener() {
+        if (profilingContextListenerInstalled) {
+            TracingContext.setContextScopeListener(null);
+            profilingContextListenerInstalled = false;
         }
     }
 }

@@ -230,7 +230,7 @@ final class PolicyOpenTelemetry implements OpenTelemetry {
 
         @Override
         public Context storeInContext(Context context) {
-            return Span.super.storeInContext(context).with(DEPTH, depth);
+            return delegate.storeInContext(context).with(DEPTH, depth);
         }
 
         @Override

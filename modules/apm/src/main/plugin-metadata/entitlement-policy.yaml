@@ -146,7 +146,7 @@ io.opentelemetry.instrumentation.runtime_telemetry:
 io.opentelemetry.sdk.common:
   - manage_threads
 
-co.elastic.otel:
+universal.profiling.integration:
   - manage_threads # Required by the universal profiling correlation message poller.
   - load_native_libraries # Required to load the JVMTI helper used to publish trace context to the host profiler.
   - files:
